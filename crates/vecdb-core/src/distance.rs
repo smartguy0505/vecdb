@@ -1,17 +1,9 @@
-//! Distance kernels. Every metric returns a distance: smaller means closer.
-//!
-//! These are portable scalar loops shaped for LLVM's auto-vectorizer
-//! (fixed-width chunks, independent accumulators). Measured on an i7-8700,
-//! 128-dim L2 plus top-k with in-cache data: 22 ns per vector with the default
-//! x86-64 target, 15.5 ns with `-C target-cpu=native`. Explicit SIMD with
-//! runtime CPU detection (AVX2/FMA, AVX-512, NEON) is roadmap step 2; these
-//! stay as the reference implementation it is tested against.
+//! Metrics and vector helpers. Every metric returns a distance: smaller means
+//! closer. The arithmetic lives in [`crate::kernels`], which picks the fastest
+//! implementation for the CPU at runtime.
 
 use crate::error::{Error, Result};
-
-/// Number of independent accumulators. 16 f32 = two AVX2 registers or four
-/// SSE/NEON registers, enough to hide add latency.
-const LANES: usize = 16;
+use crate::kernels;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
@@ -76,56 +68,18 @@ impl Metric {
     }
 }
 
+/// Dot product using the process-wide kernel set ([`kernels::best`]).
+/// Panics if the lengths differ. For hot loops, use the batch kernels directly.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let (ac, ar) = a.as_chunks::<LANES>();
-    let (bc, br) = b.as_chunks::<LANES>();
-    let mut acc = [0.0f32; LANES];
-    for (x, y) in ac.iter().zip(bc) {
-        for i in 0..LANES {
-            acc[i] += x[i] * y[i];
-        }
-    }
-    let mut tail = 0.0f32;
-    for (x, y) in ar.iter().zip(br) {
-        tail += x * y;
-    }
-    reduce(&acc) + tail
+    (kernels::best().dot)(a, b)
 }
 
+/// Squared Euclidean distance using the process-wide kernel set.
+/// Panics if the lengths differ.
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let (ac, ar) = a.as_chunks::<LANES>();
-    let (bc, br) = b.as_chunks::<LANES>();
-    let mut acc = [0.0f32; LANES];
-    for (x, y) in ac.iter().zip(bc) {
-        for i in 0..LANES {
-            let d = x[i] - y[i];
-            acc[i] += d * d;
-        }
-    }
-    let mut tail = 0.0f32;
-    for (x, y) in ar.iter().zip(br) {
-        let d = x - y;
-        tail += d * d;
-    }
-    reduce(&acc) + tail
-}
-
-#[inline]
-fn reduce(acc: &[f32; LANES]) -> f32 {
-    // Pairwise sum: a little more accurate than a left fold.
-    let mut v = *acc;
-    let mut width = LANES;
-    while width > 1 {
-        width /= 2;
-        for i in 0..width {
-            v[i] += v[i + width];
-        }
-    }
-    v[0]
+    (kernels::best().l2_squared)(a, b)
 }
 
 /// Scales `v` to unit length in place. A zero vector stays zero.
@@ -151,38 +105,6 @@ pub fn check_finite(v: &[f32]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rng::SplitMix64;
-
-    fn naive_dot(a: &[f32], b: &[f32]) -> f64 {
-        a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum()
-    }
-
-    fn naive_l2(a: &[f32], b: &[f32]) -> f64 {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| {
-                let d = x as f64 - y as f64;
-                d * d
-            })
-            .sum()
-    }
-
-    fn close(got: f32, want: f64, scale: f64) -> bool {
-        (got as f64 - want).abs() <= 1e-5 * scale.max(1.0)
-    }
-
-    #[test]
-    fn kernels_match_naive_for_all_lengths() {
-        let mut rng = SplitMix64::new(7);
-        // Covers empty, shorter than one chunk, exact chunks and remainders.
-        for len in 0..=200 {
-            let a: Vec<f32> = (0..len).map(|_| rng.uniform(-2.0, 2.0)).collect();
-            let b: Vec<f32> = (0..len).map(|_| rng.uniform(-2.0, 2.0)).collect();
-            let scale = len as f64 * 4.0;
-            assert!(close(dot(&a, &b), naive_dot(&a, &b), scale), "dot len {len}");
-            assert!(close(l2_squared(&a, &b), naive_l2(&a, &b), scale), "l2 len {len}");
-        }
-    }
 
     #[test]
     fn metric_distances() {

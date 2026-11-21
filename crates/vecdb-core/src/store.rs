@@ -5,6 +5,7 @@
 //! touching the index code.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::distance::check_finite;
 use crate::error::{Error, Result};
@@ -24,6 +25,10 @@ pub trait VectorStore {
     fn id(&self, row: usize) -> u64;
     /// Vector of `row`, `dim()` values. Panics if `row >= len()`.
     fn vector(&self, row: usize) -> &[f32];
+    /// Rows `range` as one contiguous row-major block of
+    /// `range.len() * dim()` values, for batch kernels.
+    /// Panics if the range is out of bounds.
+    fn rows(&self, range: Range<usize>) -> &[f32];
 }
 
 pub(crate) fn check_dim(dim: usize) -> Result<()> {
@@ -130,6 +135,11 @@ impl VectorStore for InMemoryStore {
     #[inline]
     fn vector(&self, row: usize) -> &[f32] {
         &self.data[row * self.dim..(row + 1) * self.dim]
+    }
+
+    #[inline]
+    fn rows(&self, range: Range<usize>) -> &[f32] {
+        &self.data[range.start * self.dim..range.end * self.dim]
     }
 }
 

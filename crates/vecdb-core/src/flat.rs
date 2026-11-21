@@ -1,7 +1,8 @@
 //! Exact (brute-force) index. It is the ground truth every approximate index
 //! is measured against, and the search path for small or still-growing segments.
 
-use crate::distance::{Metric, check_finite, dot, l2_squared, normalize};
+use crate::distance::{Metric, check_finite, normalize};
+use crate::kernels::{self, Kernels};
 use crate::error::{Error, Result};
 use crate::store::{InMemoryStore, VectorStore};
 use crate::topk::{SearchResult, TopK};
@@ -70,28 +71,53 @@ impl<S: VectorStore> FlatIndex<S> {
         if k == 0 || self.is_empty() {
             return Ok(Vec::new());
         }
+        self.search_with(kernels::best(), query, k)
+    }
+
+    /// The search body with an explicit kernel set, so tests can cross-check
+    /// every set. Callers must have validated the query.
+    fn search_with(&self, kern: &Kernels, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         let mut top = TopK::new(k.min(self.len()));
-        // Match on the metric once, outside the loop, so each arm is a
-        // monomorphized scan with the kernel inlined.
         match self.metric {
-            Metric::L2 => self.scan(query, &mut top, l2_squared),
-            Metric::InnerProduct => self.scan(query, &mut top, |a, b| -dot(a, b)),
+            Metric::L2 => self.scan(query, &mut top, kern.l2_squared_batch, |d| d),
+            Metric::InnerProduct => self.scan(query, &mut top, kern.dot_batch, |d| -d),
             Metric::Cosine => {
                 let mut q = query.to_vec();
                 normalize(&mut q);
-                self.scan(&q, &mut top, |a, b| 1.0 - dot(a, b));
+                self.scan(&q, &mut top, kern.dot_batch, |d| 1.0 - d);
             }
         }
         Ok(top.into_sorted())
     }
 
+    /// Computes distances a block of rows at a time with one batch-kernel
+    /// call (the row loop runs inside the SIMD code), then feeds top-k.
     #[inline]
-    fn scan(&self, query: &[f32], top: &mut TopK, dist: impl Fn(&[f32], &[f32]) -> f32) {
-        for row in 0..self.store.len() {
-            top.push(self.store.id(row), dist(query, self.store.vector(row)));
+    fn scan(
+        &self,
+        query: &[f32],
+        top: &mut TopK,
+        batch: fn(&[f32], &[f32], &mut [f32]),
+        to_distance: impl Fn(f32) -> f32,
+    ) {
+        let n = self.store.len();
+        // 256 rows: big enough to amortize the call, small enough that the
+        // output buffer stays on the stack and in L1.
+        let mut buf = [0.0f32; SCAN_BLOCK];
+        let mut start = 0;
+        while start < n {
+            let end = (start + SCAN_BLOCK).min(n);
+            let out = &mut buf[..end - start];
+            batch(query, self.store.rows(start..end), out);
+            for (j, &raw) in out.iter().enumerate() {
+                top.push(self.store.id(start + j), to_distance(raw));
+            }
+            start = end;
         }
     }
 }
+
+const SCAN_BLOCK: usize = 256;
 
 #[cfg(test)]
 mod tests {
@@ -134,22 +160,28 @@ mod tests {
                     let dist = reference_distances(metric, &data, &q);
                     let mut want = dist.clone();
                     want.sort_by(f64::total_cmp);
-                    let got = index.search(&q, k).unwrap();
-                    assert_eq!(got.len(), k);
-                    let mut ids: Vec<u64> = got.iter().map(|r| r.id).collect();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    assert_eq!(ids.len(), k, "duplicate ids in result");
-                    // Compare the i-th result's true distance with the i-th best
-                    // true distance; tolerant of f32 rounding at near-ties.
-                    for (i, r) in got.iter().enumerate() {
-                        let d = dist[r.id as usize];
-                        assert!(
-                            (d - want[i]).abs() <= tol * (1.0 + want[i].abs()),
-                            "{metric:?} dim {dim} rank {i}: got {d}, want {}",
-                            want[i]
-                        );
-                        assert!(((r.distance as f64) - d).abs() <= tol * (1.0 + d.abs()));
+                    // The public path, then every kernel set this CPU can run.
+                    let mut runs = vec![("best", index.search(&q, k).unwrap())];
+                    for kern in crate::kernels::available() {
+                        runs.push((kern.name, index.search_with(kern, &q, k).unwrap()));
+                    }
+                    for (name, got) in runs {
+                        assert_eq!(got.len(), k);
+                        let mut ids: Vec<u64> = got.iter().map(|r| r.id).collect();
+                        ids.sort_unstable();
+                        ids.dedup();
+                        assert_eq!(ids.len(), k, "{name}: duplicate ids in result");
+                        // Compare the i-th result's true distance with the i-th best
+                        // true distance; tolerant of f32 rounding at near-ties.
+                        for (i, r) in got.iter().enumerate() {
+                            let d = dist[r.id as usize];
+                            assert!(
+                                (d - want[i]).abs() <= tol * (1.0 + want[i].abs()),
+                                "{name} {metric:?} dim {dim} rank {i}: got {d}, want {}",
+                                want[i]
+                            );
+                            assert!(((r.distance as f64) - d).abs() <= tol * (1.0 + d.abs()));
+                        }
                     }
                 }
             }

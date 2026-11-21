@@ -13,6 +13,7 @@ pub mod distance;
 pub mod error;
 pub mod flat;
 pub mod format;
+pub mod kernels;
 pub mod rng;
 pub mod store;
 pub mod topk;

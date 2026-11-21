@@ -43,11 +43,14 @@ impl Eq for Entry {}
 pub struct TopK {
     k: usize,
     heap: BinaryHeap<Entry>,
+    /// Distance of the root once the heap is full, +inf before. Lets `push`
+    /// reject most candidates with one float compare.
+    worst: f32,
 }
 
 impl TopK {
     pub fn new(k: usize) -> Self {
-        Self { k, heap: BinaryHeap::with_capacity(k) }
+        Self { k, heap: BinaryHeap::with_capacity(k), worst: f32::INFINITY }
     }
 
     #[inline]
@@ -58,12 +61,26 @@ impl TopK {
         // NaN (possible only from overflow, e.g. inf - inf) ranks last;
         // `+ 0.0` turns -0.0 into 0.0 so equal distances tie on id.
         let distance = if distance.is_nan() { f32::INFINITY } else { distance + 0.0 };
+        if distance > self.worst {
+            return; // fast path: strictly worse than everything kept
+        }
         let entry = Entry(SearchResult { id, distance });
         if self.heap.len() < self.k {
             self.heap.push(entry);
-        } else if let Some(mut worst) = self.heap.peek_mut() {
-            if entry < *worst {
-                *worst = entry; // PeekMut re-sifts on drop
+            if self.heap.len() == self.k {
+                self.worst = self.heap.peek().map_or(f32::INFINITY, |e| e.0.distance);
+            }
+        } else {
+            // Equal distances still reach here: the id decides the tie.
+            let replaced = match self.heap.peek_mut() {
+                Some(mut root) if entry < *root => {
+                    *root = entry; // PeekMut re-sifts on drop
+                    true
+                }
+                _ => false,
+            };
+            if replaced {
+                self.worst = self.heap.peek().map_or(f32::INFINITY, |e| e.0.distance);
             }
         }
     }
@@ -71,7 +88,7 @@ impl TopK {
     /// Distance a candidate must beat to enter, once the heap is full.
     #[inline]
     pub fn threshold(&self) -> Option<f32> {
-        if self.heap.len() == self.k { self.heap.peek().map(|e| e.0.distance) } else { None }
+        if self.k > 0 && self.heap.len() == self.k { Some(self.worst) } else { None }
     }
 
     pub fn len(&self) -> usize {
@@ -116,6 +133,21 @@ mod tests {
             }
             assert_eq!(top.into_sorted(), reference(&cands, k), "trial {trial}");
         }
+    }
+
+    #[test]
+    fn threshold_tracks_the_worst_kept() {
+        let mut top = TopK::new(2);
+        assert_eq!(top.threshold(), None);
+        top.push(1, 5.0);
+        assert_eq!(top.threshold(), None);
+        top.push(2, 3.0);
+        assert_eq!(top.threshold(), Some(5.0));
+        top.push(3, 4.0);
+        assert_eq!(top.threshold(), Some(4.0));
+        top.push(4, 9.0); // rejected by the fast path
+        assert_eq!(top.threshold(), Some(4.0));
+        assert_eq!(TopK::new(0).threshold(), None);
     }
 
     #[test]

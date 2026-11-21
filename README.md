@@ -4,7 +4,7 @@ A vector database written from scratch in Rust, designed for billion-scale
 approximate nearest neighbor search.
 
 Status: step 1 of the roadmap is done (exact search, segment file format,
-benchmark harness).
+benchmark harness); step 2 (SIMD) is done for AVX2/FMA.
 
 ## Goals
 
@@ -22,8 +22,9 @@ benchmark harness).
 ## Layout
 
 ```
-crates/vecdb-core    library: distance kernels, top-k, stores, flat index, file formats
-crates/vecdb-bench   CLI: synthetic data, ground truth, segment build, recall/latency runs
+crates/vecdb-core    library: SIMD distance kernels, top-k, stores, flat index, file formats
+crates/vecdb-bench   CLI: synthetic data, ground truth, segment build, recall/latency runs,
+                     kernel micro-benchmark
 ```
 
 `vecdb-core` has no external dependencies yet.
@@ -34,6 +35,10 @@ crates/vecdb-bench   CLI: synthetic data, ground truth, segment build, recall/la
 cargo test --workspace
 cargo build --release
 ```
+
+Distance kernels are chosen at runtime for the CPU, so a default build is
+portable and still uses AVX2/FMA where available. `VECDB_KERNELS=scalar` (or
+`avx2-fma`) forces a kernel set, so A/B runs can use the same binary.
 
 ## Benchmarks
 
@@ -53,17 +58,38 @@ same flat index. It shows that the segment round trip and tie-breaking are
 deterministic, but it does not independently show correctness. The independent
 check is SIFT1M against its published ground truth.
 
-Baseline (i7-8700, 128-dim L2, one thread, cost of one distance plus top-k):
+Flat search (i7-8700, default release build, 128-dim L2, one thread; cost per
+vector of one distance plus top-k; median of 5 back-to-back runs):
 
 | build | 2k vectors (in cache) | 100k vectors (51 MB, out of cache) |
 |---|---:|---:|
-| default x86-64 (SSE2) | 22 ns | 35 ns |
-| `-C target-cpu=native` (AVX2/FMA) | 15.5 ns | 32 ns |
+| step 1 (commit d4cebe4, auto-vectorized SSE2) | 22.0 ns | 35.3 ns |
+| step 2, `VECDB_KERNELS=scalar` | 20.5 ns | 34.9 ns |
+| step 2, `avx2-fma` (default on this CPU) | 13-14 ns | 29.6 ns |
 
-In cache the scan is compute-bound, and wider SIMD helps (roadmap step 2).
-Out of cache it is memory-bound: about 15 GB/s from one core. One brute-force
-query over 1B x 128 vectors would read 512 GB, which is why billion scale needs
-compression and a graph index, not a faster scan.
+About 1.5 ns of the in-cache gain comes from a faster top-k (a single float
+compare rejects most candidates); the rest is the AVX2/FMA kernel.
+
+Distance kernel alone (`vecdb-bench kernels`, ns per distance, in cache,
+median of 5):
+
+| dim | 32 | 128 | 1024 | 4096 | 8192 |
+|---|---:|---:|---:|---:|---:|
+| L2, `scalar` | 6.7 | 17.5 | 113 | 447 | 1063 |
+| L2, `avx2-fma` | 3.0 | 9.3 | 54 | 212 | 578 |
+| dot, `scalar` | 5.9 | 13.6 | 95 | 384 | 878 |
+| dot, `avx2-fma` | 2.6 | 8.7 | 51 | 208 | 587 |
+
+In cache, AVX2/FMA is 1.8-2.2x faster than the portable kernels for L2 and
+1.5-2.3x for dot product across 32-8192 dims. Out of cache the scan is
+memory-bound (about 15-17 GB/s from one core), so the gain there is small. One brute-force query over 1B x 128 vectors would
+read 512 GB, which is why billion scale needs compression and a graph index,
+not a faster scan.
+
+Cross-check: ground truth computed with `scalar` and searched with `avx2-fma`
+gives recall@10 = 1.0 for L2, cosine and inner product at 128, 1024 and 8192
+dims. The two sets add floats in a different order, so a near-tie could
+differ in the last bit on other data; that is expected, not a bug.
 
 ## Designing for billions
 
@@ -134,8 +160,11 @@ Within a shard:
 
 1. ✅ Exact search: distance kernels, top-k, flat index, segment format v1
    (checksummed, atomic writes), dataset I/O, recall harness
-2. SIMD kernels (AVX2/FMA, AVX-512, NEON) with runtime CPU detection, plus a
-   micro-benchmark suite at 32-8192 dimensions
+2. ◐ SIMD kernels with runtime CPU detection and a micro-benchmark at 32-8192
+   dims: AVX2/FMA done. Still to do once there is hardware to test on: AVX-512
+   and NEON (the portable kernels should auto-vectorize to NEON on aarch64, but
+   that has not been built or tested yet), and batch kernels that score several
+   rows per query load
 3. Quantization: PQ with per-collection code size, ADC search with lookup
    tables; f16/bf16/int8 storage for full vectors; measure recall against bytes
    per vector
