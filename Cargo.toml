@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/vecdb-core", "crates/vecdb-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only" # keeps perf/flamegraph usable
+
+[profile.test]
+opt-level = 1 # distance-heavy tests are slow at opt-level 0

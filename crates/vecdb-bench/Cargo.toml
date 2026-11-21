@@ -1,0 +1,10 @@
+[package]
+name = "vecdb-bench"
+description = "Dataset tools and recall/latency benchmarks for vecdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+vecdb-core = { path = "../vecdb-core" }

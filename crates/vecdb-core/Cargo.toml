@@ -1,0 +1,9 @@
+[package]
+name = "vecdb-core"
+description = "Storage, distance kernels and indexes for vecdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
