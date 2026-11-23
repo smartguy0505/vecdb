@@ -9,6 +9,7 @@
 
 pub mod crc32c;
 pub mod dataset;
+pub mod disk;
 pub mod distance;
 pub mod error;
 pub mod flat;
@@ -22,6 +23,7 @@ pub mod rng;
 pub mod store;
 pub mod topk;
 
+pub use disk::{DiskIndex, DiskOpenOptions, DiskSearchParams, DiskSearchStats, DiskWriteOptions, IoMode, Layout};
 pub use distance::Metric;
 pub use error::{Error, Result};
 pub use flat::FlatIndex;

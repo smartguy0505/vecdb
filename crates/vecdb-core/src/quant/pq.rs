@@ -91,6 +91,33 @@ impl ProductQuantizer {
         Ok(Self { dim, offsets, codebooks })
     }
 
+    /// Rebuilds a quantizer from its dimension, its number of subspaces and
+    /// the centroids returned by [`codebooks`](Self::codebooks), e.g. when
+    /// loading an index from disk.
+    pub fn from_parts(dim: usize, m: usize, codebooks: Vec<f32>) -> Result<Self> {
+        check_dim(dim)?;
+        if m == 0 || m > dim {
+            return Err(Error::InvalidArgument(format!("PQ m = {m} must be in 1..={dim}")));
+        }
+        if codebooks.len() != KSUB * dim {
+            return Err(Error::InvalidArgument(format!(
+                "PQ codebooks hold {} values, expected {}",
+                codebooks.len(),
+                KSUB * dim
+            )));
+        }
+        if !codebooks.iter().all(|x| x.is_finite()) {
+            return Err(Error::NonFiniteValue);
+        }
+        Ok(Self { dim, offsets: subspace_offsets(dim, m), codebooks })
+    }
+
+    /// All centroids: subspace `i` holds `KSUB` rows of its width, row-major,
+    /// one subspace after another (`KSUB * dim` values in all).
+    pub fn codebooks(&self) -> &[f32] {
+        &self.codebooks
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
     }

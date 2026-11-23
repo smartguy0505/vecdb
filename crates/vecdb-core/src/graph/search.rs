@@ -13,11 +13,12 @@ use super::visited::VisitedSet;
 pub(crate) struct Candidate {
     pub dist: f32,
     pub node: u32,
-    expanded: bool,
+    pub expanded: bool,
 }
 
+/// Candidate order: by distance, ties by node id (so results are deterministic).
 #[inline]
-fn order(a_dist: f32, a_node: u32, b_dist: f32, b_node: u32) -> Ordering {
+pub(crate) fn order(a_dist: f32, a_node: u32, b_dist: f32, b_node: u32) -> Ordering {
     a_dist.total_cmp(&b_dist).then(a_node.cmp(&b_node))
 }
 

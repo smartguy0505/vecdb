@@ -6,4 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[dependencies]
+# Linux-only: O_DIRECT and io_uring for the SSD index (src/disk/io.rs).
+# Other platforms use positioned reads.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.15"
+libc = "0.2.186"

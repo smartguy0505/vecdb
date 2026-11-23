@@ -104,7 +104,7 @@ fn align_up(x: u64, a: u64) -> u64 {
     x.div_ceil(a) * a
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
+pub(crate) fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
     PathBuf::from(s)
@@ -170,7 +170,7 @@ fn write_to<S: VectorStore>(tmp: &Path, metric: Metric, store: &S) -> Result<()>
     Ok(())
 }
 
-fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),

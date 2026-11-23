@@ -1,7 +1,9 @@
 //! CRC-32C (Castagnoli), used for on-disk checksums.
 //!
-//! Chosen over IEEE CRC-32 because x86 (SSE4.2) and ARMv8 compute it in hardware;
-//! a hardware path can replace this table version later without a format change.
+//! Chosen over IEEE CRC-32 because x86 (SSE4.2) and ARMv8 compute it in hardware.
+//! x86_64 uses the SSE4.2 instruction when the CPU has it (about 8 bytes per
+//! 3 cycles, which matters because the SSD index checks every record it
+//! reads); other CPUs use the table below. Both give identical values.
 
 const POLY: u32 = 0x82F6_3B78; // reflected Castagnoli polynomial
 
@@ -41,16 +43,22 @@ impl Crc32c {
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        let mut c = self.state;
-        for &b in data {
-            c = TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-        }
-        self.state = c;
+        self.state = match crate::kernels::crc32c_update(self.state, data) {
+            Some(c) => c,
+            None => update_table(self.state, data),
+        };
     }
 
     pub fn finalize(&self) -> u32 {
         !self.state
     }
+}
+
+fn update_table(mut c: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        c = TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    c
 }
 
 pub fn crc32c(data: &[u8]) -> u32 {
@@ -68,6 +76,21 @@ mod tests {
         // Standard CRC-32C check value.
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
         assert_eq!(crc32c(b""), 0);
+    }
+
+    #[test]
+    fn hardware_matches_table() {
+        let data: Vec<u8> = (0..4099u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for len in [0usize, 1, 7, 8, 9, 63, 64, 776, 4096, 4099] {
+            for start in [0usize, 1, 3] {
+                if start + len > data.len() {
+                    continue;
+                }
+                let part = &data[start..start + len];
+                let table = !update_table(!0, part);
+                assert_eq!(crc32c(part), table, "len {len} start {start}");
+            }
+        }
     }
 
     #[test]

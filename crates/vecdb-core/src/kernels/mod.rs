@@ -52,6 +52,19 @@ pub fn prefetch<T>(data: &[T]) {
     let _ = data;
 }
 
+/// Updates a raw CRC-32C register in hardware (SSE4.2 on x86_64), or returns
+/// `None` where no hardware path exists; `crc32c.rs` then uses its table.
+#[inline]
+pub(crate) fn crc32c_update(state: u32, data: &[u8]) -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    return x86::crc32c_update(state, data);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (state, data);
+        None
+    }
+}
+
 impl std::fmt::Debug for Kernels {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Kernels").field("name", &self.name).finish()

@@ -14,11 +14,12 @@
 //! Identical vectors share one graph node. Without that, copies of a vector
 //! prune each other (distance 0) and most of them become unreachable.
 //!
-//! Scope for now: batch build only, no inserts, deletes or persistence.
+//! Scope for now: batch build only, no inserts or deletes. A built graph is
+//! saved as an SSD index with [`DiskIndex::write`](crate::disk::DiskIndex::write).
 
 mod build;
-mod search;
-mod visited;
+pub(crate) mod search;
+pub(crate) mod visited;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -237,6 +238,11 @@ impl GraphIndex {
     }
 
     /// PQ bytes per vector, if PQ is trained.
+    /// The trained quantizer and the codes of every node, if PQ is trained.
+    pub(crate) fn pq_parts(&self) -> Option<(&ProductQuantizer, &[u8])> {
+        self.pq.as_ref().map(|(pq, codes)| (pq, codes.as_slice()))
+    }
+
     pub fn pq_code_size(&self) -> Option<usize> {
         self.pq.as_ref().map(|(pq, _)| pq.code_size())
     }
@@ -314,7 +320,7 @@ impl GraphIndex {
     }
 
     #[inline]
-    fn row(&self, node: u32) -> &[f32] {
+    pub(crate) fn row(&self, node: u32) -> &[f32] {
         &self.data[node as usize * self.dim..][..self.dim]
     }
 

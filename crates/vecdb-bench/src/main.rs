@@ -12,6 +12,7 @@ use vecdb_core::format::{read_flat_segment, write_flat_segment};
 use vecdb_core::kernels::{self, Kernels};
 use vecdb_core::rng::SplitMix64;
 use vecdb_core::quant::{Codec, PqParams};
+use vecdb_core::disk::{DiskIndex, DiskOpenOptions, DiskSearchParams, DiskWriteOptions, IoMode, Layout, SearchContext};
 use vecdb_core::{FlatIndex, GraphIndex, GraphParams, Metric, Navigation, PqIndex, SearchResult};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -41,6 +42,16 @@ commands:
                Vamana graph: build once, then recall, distances, hops, QPS (--threads)
                and 1-thread latency per search list size L; with --pq-m, also
                PQ-guided search (codes steer, expanded nodes re-scored exactly)
+  disk-build   --base F --out PREFIX --pq-m M [--metric l2] [--layout auto] [--codec f32]
+               [--degree 64] [--build-l 100] [--alpha 1.2] [--passes 1] [--threads 4]
+               [--iters 15] [--max-train 65536] [--limit N]
+               build the graph and PQ once, then write PREFIX.<layout>.<codec>.vdx for
+               every --layout (auto, inline, separate) and --codec (f32, f16, bf16) listed
+  disk-search  --index FILE --query F --gt G [--k 10] [--l 20,40,80,160] [--w 1,2,4,8]
+               [--rerank 0] [--threads 4] [--cache 0] [--io auto] [--direct true]
+               [--nq N] [--warmup 200] [--verify false]
+               open an SSD index in a fresh process and search it: recall, reads,
+               rounds, 1-thread latency and QPS (--threads) per beam width W and L
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
@@ -71,6 +82,8 @@ fn run() -> AnyResult<()> {
         "kernels" => kernel_bench(&args),
         "pq" => pq_bench(&args),
         "graph" => graph_bench(&args),
+        "disk-build" => disk_build(&args),
+        "disk-search" => disk_search(&args),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
@@ -752,5 +765,267 @@ fn graph_bench(a: &Args) -> AnyResult<()> {
     }
     println!("latency: 1 thread; dist/q: distance computations that steer the search (PQ for nav pq);");
     println!("hops/q: nodes expanded (a disk index reads one block per hop)");
+    Ok(())
+}
+
+fn disk_build(a: &Args) -> AnyResult<()> {
+    a.allow(&[
+        "base", "out", "metric", "layout", "codec", "degree", "build-l", "alpha", "passes", "threads", "pq-m", "iters",
+        "max-train", "limit",
+    ])?;
+    let metric = a.metric()?;
+    let threads: usize = a.num("threads", 4)?;
+    let out = a.req_path("out")?;
+    let layouts: Vec<String> = parse_list(a, "layout", "auto")?;
+    let layouts: Vec<Option<Layout>> = layouts
+        .iter()
+        .map(|s| match s.as_str() {
+            "auto" => Ok(None),
+            s => Layout::parse(s).map(Some).ok_or_else(|| format!("unknown layout {s:?} (auto, inline, separate)")),
+        })
+        .collect::<Result<_, _>>()?;
+    let codecs: Vec<String> = parse_list(a, "codec", "f32")?;
+    let codecs: Vec<Codec> = codecs
+        .iter()
+        .map(|s| Codec::parse(s).ok_or_else(|| format!("unknown codec {s:?}")))
+        .collect::<Result<_, _>>()?;
+    let m: usize = a.opt_num("pq-m")?.ok_or("--pq-m is required")?;
+    let params = GraphParams {
+        max_degree: a.num("degree", 64)?,
+        build_list: a.num("build-l", 100)?,
+        alpha: a.num("alpha", 1.2)?,
+        passes: a.num("passes", 1)?,
+        seed: 0x5eed,
+        threads,
+    };
+    let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
+    let (n, dim) = (base.len(), base.dim);
+    println!("data     {n} x {dim} ({}), kernels {}", metric.name(), kernels::best().name);
+    let ids: Vec<u64> = (0..n as u64).collect();
+    let t0 = Instant::now();
+    let mut index = GraphIndex::build(metric, dim, &ids, base.data, &params)?;
+    println!(
+        "graph    R {}, build L {}, alpha {}, passes {}, {threads} threads: built in {:.1} s; {} nodes, mean degree {:.1}, {} reachable",
+        params.max_degree,
+        params.build_list,
+        params.alpha,
+        params.passes,
+        t0.elapsed().as_secs_f64(),
+        index.nodes(),
+        index.mean_degree(),
+        index.reachable()
+    );
+    let t0 = Instant::now();
+    let pq = PqParams { m, iters: a.num("iters", 15)?, max_train: a.num("max-train", 65_536)?, seed: 0x5eed, threads };
+    index.train_pq(&pq)?;
+    println!("pq       {m} B/vector, trained and encoded in {:.1} s", t0.elapsed().as_secs_f64());
+    for layout in &layouts {
+        for &codec in &codecs {
+            let chosen = layout.unwrap_or_else(|| Layout::auto(dim, codec, params.max_degree));
+            let name = format!("{}.{}.{}.vdx", out.display(), chosen.name(), codec.name());
+            let t0 = Instant::now();
+            let rep = DiskIndex::write(&index, &name, &DiskWriteOptions { layout: Some(chosen), codec })?;
+            println!(
+                "wrote    {name}: {:.2} GB in {:.1} s; SSD {:.0} B/node, RAM {:.1} B/vector",
+                rep.file_bytes as f64 / 1e9,
+                t0.elapsed().as_secs_f64(),
+                rep.ssd_bytes_per_node,
+                rep.ram_bytes as f64 / n as f64
+            );
+        }
+    }
+    Ok(())
+}
+
+/// (VmRSS, VmHWM) of this process in bytes.
+fn memory_usage() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map_or(0, |kb| kb * 1024)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+/// (user, system) CPU seconds used by this process so far, all threads
+/// included, from /proc/self/stat (USER_HZ is 100 on Linux).
+fn cpu_seconds() -> (f64, f64) {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let tick = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 100.0;
+    (tick(11), tick(12))
+}
+
+/// Bytes this process has caused to be read from storage (/proc/self/io).
+fn storage_read_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("read_bytes:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+thread_local! {
+    static DISK_CTX: std::cell::RefCell<Option<SearchContext>> = const { std::cell::RefCell::new(None) };
+}
+
+fn disk_search(a: &Args) -> AnyResult<()> {
+    a.allow(&[
+        "index", "query", "gt", "k", "l", "w", "rerank", "threads", "cache", "io", "direct", "nq", "warmup", "verify",
+    ])?;
+    let k: usize = a.num("k", 10)?;
+    let threads: usize = a.num("threads", 4)?;
+    let ls: Vec<usize> = parse_list(a, "l", "20,40,80,160")?;
+    let ws: Vec<usize> = parse_list(a, "w", "1,2,4,8")?;
+    let reranks: Vec<usize> = parse_list(a, "rerank", "0")?;
+    let io_name = a.map.get("io").map(String::as_str).unwrap_or("auto");
+    let io = IoMode::parse(io_name).ok_or_else(|| format!("unknown --io {io_name:?} (auto, uring, pread)"))?;
+    let direct: bool = a.num("direct", true)?;
+    let path = a.req_path("index")?;
+
+    let (rss0, _) = memory_usage();
+    let t0 = Instant::now();
+    let mut index = DiskIndex::open(&path, &DiskOpenOptions { direct, io })?;
+    let open_s = t0.elapsed().as_secs_f64();
+    let (rss1, _) = memory_usage();
+    let (ram, _) = index.ram_bytes();
+    let n = index.len();
+    println!(
+        "index    {}: {} vectors ({} nodes) x {} ({}), {} layout, {} vectors, PQ {} B, R {}; {:.2} GB on SSD",
+        path.display(),
+        n,
+        index.nodes(),
+        index.dim(),
+        index.metric().name(),
+        index.layout().name(),
+        index.codec().name(),
+        index.pq_code_size(),
+        index.max_degree(),
+        index.file_bytes() as f64 / 1e9
+    );
+    let probe = index.context()?;
+    println!(
+        "open     {open_s:.2} s; RAM: index {:.1} MB ({:.1} B/vector), process RSS +{:.1} MB; reads: {} B graph blocks{}, {}, {}",
+        ram as f64 / 1e6,
+        ram as f64 / n as f64,
+        rss1.saturating_sub(rss0) as f64 / 1e6,
+        index.block_bytes(),
+        if index.vector_block_bytes() > 0 { format!(" + {} B vector blocks", index.vector_block_bytes()) } else { String::new() },
+        probe.io_backend(),
+        if index.is_direct() { "O_DIRECT" } else { "BUFFERED (page cache: latency below is NOT the SSD's)" }
+    );
+    drop(probe);
+    if a.num("verify", false)? {
+        let t0 = Instant::now();
+        index.verify()?;
+        println!("verify   every record and vector checked in {:.1} s", t0.elapsed().as_secs_f64());
+    }
+    let cache: usize = a.num("cache", 0)?;
+    if cache > 0 {
+        let t0 = Instant::now();
+        let got = index.cache_hot_nodes(cache)?;
+        println!(
+            "cache    {got} nodes nearest the entry, {:.1} MB, loaded in {:.1} s",
+            index.ram_bytes().1 as f64 / 1e6,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    let queries = load_vectors(&a.req_path("query")?, a.opt_num("nq")?)?;
+    check_query_dim(&queries, index.dim())?;
+    let gt = load_gt(&a.req_path("gt")?, queries.len(), k)?;
+    let index = &index;
+
+    let counters: [AtomicUsize; 6] = Default::default(); // reads, bytes, rounds, hops, cache hits, pq dists
+    let run = |p: &DiskSearchParams, qs: &Vecs<f32>, t: usize| {
+        let search = |q: &[f32]| {
+            DISK_CTX.with_borrow_mut(|slot| {
+                if slot.is_none() {
+                    *slot = Some(index.context()?);
+                }
+                let (res, st) = index.search_with(slot.as_mut().expect("set above"), q, k, p)?;
+                for (c, v) in counters.iter().zip([st.reads, st.read_bytes, st.rounds, st.expanded, st.cache_hits, st.pq_distances]) {
+                    c.fetch_add(v, Relaxed);
+                }
+                Ok(res)
+            })
+        };
+        run_queries(&search, qs, t)
+    };
+
+    // Warm-up: touch the PQ codes and ids once (they are in RAM, but cold).
+    let warm = a.num("warmup", 200usize)?.min(queries.len());
+    if warm > 0 {
+        let wq = Vecs { dim: queries.dim, data: queries.data[..warm * queries.dim].to_vec() };
+        run(&DiskSearchParams { l: ls[0], beam_width: ws[0], rerank: 0 }, &wq, threads)?;
+    }
+    println!(
+        "{:>3} {:>4} {:>6} {:>9} {:>7} {:>7} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:>7} {:>7} {:>9} {:>6}",
+        "W",
+        "L",
+        "rerank",
+        format!("recall@{k}"),
+        "reads/q",
+        "KB/q",
+        "rounds/q",
+        "hops/q",
+        "cache/q",
+        "mean ms",
+        "p50 ms",
+        "p99 ms",
+        "usr us",
+        "sys us",
+        format!("QPS {threads}t"),
+        "dev/app"
+    );
+    for &w in &ws {
+        for &l in &ls {
+            for &rerank in &reranks {
+                if rerank > 0 && index.layout() == Layout::Inline {
+                    continue;
+                }
+                let p = DiskSearchParams { l, beam_width: w, rerank };
+                counters.iter().for_each(|c| c.store(0, Relaxed));
+                let dev0 = storage_read_bytes();
+                let (u0, s0) = cpu_seconds();
+                let single = run(&p, &queries, 1)?;
+                let (u1, s1) = cpu_seconds();
+                let dev = storage_read_bytes() - dev0;
+                let per_q_us = |x: f64| x * 1e6 / queries.len() as f64;
+                let c: Vec<f64> = counters.iter().map(|c| c.load(Relaxed) as f64 / queries.len() as f64).collect();
+                let app_bytes = c[1] * queries.len() as f64;
+                let qps = if threads > 1 { run(&p, &queries, threads)?.qps() } else { single.qps() };
+                let mean = single.latencies.iter().map(Duration::as_secs_f64).sum::<f64>() / queries.len() as f64 * 1e3;
+                println!(
+                    "{:>3} {:>4} {:>6} {:>9.4} {:>7.1} {:>7.0} {:>8.1} {:>7.1} {:>7.1} {:>8.3} {:>8.3} {:>8.3} {:>7.0} {:>7.0} {:>9.0} {:>6.2}",
+                    w,
+                    l,
+                    if index.layout() == Layout::Inline { "-".to_string() } else if rerank == 0 { "all".to_string() } else { rerank.to_string() },
+                    recall(&single.results, &gt, k),
+                    c[0],
+                    c[1] / 1024.0,
+                    c[2],
+                    c[3],
+                    c[4],
+                    mean,
+                    single.pct_ms(50.0),
+                    single.pct_ms(99.0),
+                    per_q_us(u1 - u0),
+                    per_q_us(s1 - s0),
+                    qps,
+                    if app_bytes > 0.0 { dev as f64 / app_bytes } else { 0.0 }
+                );
+            }
+        }
+    }
+    let (_, hwm) = memory_usage();
+    println!("latency: 1 thread; reads/q and KB/q: blocks read from the file per query; rounds/q: batches waited on");
+    println!("usr/sys us: CPU time per query in user space / in the kernel during the 1-thread run (10 ms ticks)");
+    println!("dev/app: bytes the kernel read from storage / bytes the index asked for (about 1.0 = reads hit the SSD)");
+    println!("peak RSS {:.1} MB", hwm as f64 / 1e6);
     Ok(())
 }

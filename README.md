@@ -6,7 +6,11 @@ approximate nearest neighbor search.
 Status: steps 1-4 are done: exact search, the segment file format and
 benchmark harness; SIMD kernels (AVX2/FMA); quantization (PQ, plus
 f16/bf16/int8 storage for re-ranking); and an in-memory graph index (Vamana)
-with a search-time recall/latency knob.
+with a search-time recall/latency knob. Step 5, the SSD index, is partly
+done. Search works and is measured at 1M scale: PQ codes in RAM, graph and
+full vectors on SSD, read with direct I/O and io_uring. Two gaps remain: the
+index must still be built in RAM, and the 100M-vectors-per-node target has
+not been attempted.
 
 ## Goals
 
@@ -26,12 +30,15 @@ with a search-time recall/latency knob.
 ```
 crates/vecdb-core    library: SIMD distance kernels, top-k, stores, flat index,
                      k-means, product quantization, vector codecs, PQ index,
-                     graph index (Vamana), file formats
+                     graph index (Vamana), SSD index, file formats
 crates/vecdb-bench   CLI: synthetic data, ground truth, segment build, recall/latency runs,
-                     kernel micro-benchmark
+                     SSD index build and search, kernel micro-benchmark
 ```
 
-`vecdb-core` has no external dependencies yet.
+`vecdb-core` depends only on the standard library, plus `io-uring` and `libc`
+on Linux (for the SSD index's reads). On other platforms the SSD index is
+written to fall back to positioned reads through the page cache; that path
+has not been built or tested outside Linux yet.
 
 ## Build and test
 
@@ -337,6 +344,203 @@ $B graph --base emb1024/base.fvecs --query emb1024/query.fvecs --gt emb1024/gt.i
       --metric l2 --threads 6 --pq-m 128 --l 20,40,80,160   # also: --metric cosine / ip with gt-cos / gt-ip
 ```
 
+## SSD index (step 5)
+
+`DiskIndex` is the DiskANN design. PQ codes in RAM steer a beam search over
+a Vamana graph stored on SSD, and full vectors give the exact distances. It
+is written from a built `GraphIndex` (`DiskIndex::write`) and opened in any
+process (`DiskIndex::open`).
+
+- **RAM holds only** the PQ codebooks, the PQ codes (`m` bytes per vector)
+  and the ids (8 bytes per vector, plus 8 per node when identical vectors
+  were merged). Optionally it also caches the nodes nearest the entry point.
+  Everything else is read on demand, one block per expanded node.
+- **File:** one file in 4 KB sectors. Each node's record is its full vector,
+  its degree and its neighbor list, followed by a CRC-32C. Records are packed
+  into one-sector blocks (five per sector for SIFT), or into multi-sector
+  blocks for long vectors (GIST: 8 KB; 8192 dims: 36 KB). The header and the
+  RAM sections are checksummed too. Writes are atomic (temp file, fsync,
+  rename).
+- **Every record read is verified** (checksum, degree, neighbor ids), so a
+  damaged file gives `Error::Corrupt` instead of a panic or a silently wrong
+  answer. `verify()` scans the whole file. The CRC uses the SSE4.2
+  instruction where available.
+- **Search:**
+  1. Keep the `L` best candidates by PQ distance.
+  2. Each round, read the blocks of up to `W` (beam width) unexpanded
+     candidates together.
+  3. Score each expanded node exactly from its block, and add its
+     neighbors by PQ distance.
+
+  `L` trades recall for latency; `W` trades extra reads for fewer rounds.
+  With `W = 1` this is exactly step 4's PQ-guided search, which a test
+  checks.
+- **I/O:** `O_DIRECT` on Linux, so latency is the SSD's and a large index does
+  not evict the page cache. Reads go through io_uring, so the `W` reads of a
+  round are in flight together. Where io_uring is unavailable, or on other
+  platforms, it falls back to positioned reads. One `SearchContext` (ring
+  plus buffers) per thread.
+- **Vectors on SSD** can be stored as `f32`, `f16` or `bf16`.
+- **Two layouts, chosen by record size:**
+  - `inline`: the vector sits in the node's block. Used while a record fits
+    in 4 sectors (16 KB: up to about 4,000 f32 dimensions).
+  - `separate`: the graph and the vectors are stored apart, navigation reads
+    only neighbor lists, and the `rerank` best candidates by PQ distance get
+    their vectors read at the end. Used beyond that.
+
+  The cutoff comes from the measurements below.
+- **Not yet:**
+  - **Building larger than RAM:** `DiskIndex::write` needs the whole graph
+    and all vectors in memory. A partitioned build is next.
+  - **Inserts and deletes:** step 6.
+  - **Overlapping CPU work with reads:** see below.
+
+Results: recall@10 against the published or exact ground truth, single
+thread, beam width `W`, from a fresh process with direct I/O. In every run
+the kernel read the bytes the index asked for (the `dev/app` column in the
+logs is 1.00), so these are SSD reads, not page-cache hits. Hardware: two
+Samsung PM981 NVMe drives in RAID 0 in a shared desktop-class machine
+(i7-8700, 6 cores). The machine was heavily loaded (load average about 20
+on 12 hardware threads) and the benchmark ran at the lowest CPU priority, so
+CPU time is inflated and p99 is noisy. Reads were capped at 100k IOPS, which
+single-thread runs do not reach.
+
+**SIFT1M, inline f32** (0.85 GB file; RAM 47.5 B/vector; 1,000 queries).
+With `W = 1`, recall and nodes expanded equal step 4's PQ-guided search on
+all 10,000 queries: 0.9616 / 44.9 at L 40 and 0.9910 / 84.5 at L 80.
+
+| W | L | recall | reads/q | rounds/q | p50 / p99 ms | CPU per query, user + kernel |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 40 | 0.957 | 45 | 45 | 4.4 / 7.4 | 0.55 + 0.56 ms |
+| 1 | 80 | 0.990 | 85 | 85 | 8.2 / 12.1 | 1.00 + 1.02 ms |
+| 4 | 40 | 0.961 | 54 | 15 | 2.2 / 5.6 | 0.52 + 0.48 ms |
+| 4 | 80 | 0.991 | 93 | 24 | 3.6 / 7.6 | 0.83 + 0.77 ms |
+| 4 | 160 | 0.998 | 172 | 44 | 6.5 / 10.8 | 1.36 + 1.47 ms |
+| 8 | 40 | 0.965 | 68 | 10 | 2.1 / 5.7 | 0.60 + 0.52 ms |
+| 8 | 80 | 0.992 | 105 | 15 | 3.2 / 7.2 | 0.92 + 0.80 ms |
+| 8 | 160 | 0.998 | 183 | 24 | 5.2 / 10.1 | 1.37 + 1.37 ms |
+
+Caching the 100,000 nodes nearest the entry point (81 MB of RAM) cuts reads
+by 18-40% (more at small L). At `W = 8` it gives 1.4 / 2.5 / 4.3 ms p50 at
+L 40 / 80 / 160.
+With positioned reads instead of io_uring, `W = 4` at L 80 takes 9.0 ms: the
+four reads of a round then run one after another.
+
+**GIST1M** (960 dims, 1,000 queries; RAM 135 B/vector). With `W = 1`, L 160
+gives 0.9588 recall and 164.3 nodes expanded, equal to step 4's PQ-guided
+search.
+
+| file | W | L | recall | reads/q | KB/q | p50 / p99 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| inline f32 (8 KB blocks, 8.2 GB) | 4 | 80 | 0.897 | 94 | 752 | 5.5 / 10.4 |
+| | 4 | 160 | 0.959 | 172 | 1,376 | 10.0 / 52.5 |
+| | 4 | 320 | 0.985 | 331 | 2,644 | 18.1 / 27.2 |
+| | 8 | 160 | 0.961 | 183 | 1,463 | 8.4 / 14.9 |
+| | 8 | 320 | 0.985 | 340 | 2,721 | 15.4 / 24.1 |
+| inline f16 (4 KB blocks, 4.2 GB) | 4 | 160 | 0.959 | 172 | 688 | 8.5 / 15.5 |
+| | 4 | 320 | 0.984 | 331 | 1,322 | 16.0 / 23.4 |
+| separate f32, re-rank all | 4 | 160 | 0.959 | 344 | 1,376 | 9.9 / 17.4 |
+| separate f32, re-rank 50 | 4 | 160 | 0.878 | 222 | 888 | 8.5 / 14.8 |
+| separate f32, re-rank 130 | 4 | 320 | 0.972 | 461 | 1,842 | 16.4 / 24.7 |
+
+**Higher dimensions** (synthetic, as in step 3: 64-dim intrinsic structure
+plus noise; `W = 4`; PQ trained with 15 k-means iterations):
+
+| data | file | L | recall | reads/q | KB/q | p50 ms |
+|---|---|---:|---:|---:|---:|---:|
+| 2048 dims, 50k vectors, PQ 256 B | inline f32 (12 KB blocks) | 80 | 0.941 | 88 | 1,050 | 7.0 |
+| | | 160 | 0.985 | 165 | 1,985 | 12.4 |
+| | separate f32, re-rank all | 160 | 0.985 | 331 | 1,985 | 12.6 |
+| | separate f32, re-rank 130 | 160 | 0.984 | 295 | 1,702 | 11.9 |
+| | separate f32, re-rank 100 | 160 | 0.983 | 265 | 1,462 | 11.8 |
+| | separate f32, re-rank 50 | 160 | 0.962 | 215 | 1,062 | 10.3 |
+| 8192 dims, 20k vectors, PQ 512 B | inline f32 (36 KB blocks) | 80 | 0.957 | 87 | 3,115 | 15.7 |
+| | | 160 | 0.991 | 165 | 5,940 | 24.6 |
+| | inline f16 (20 KB blocks) | 160 | 0.991 | 165 | 3,300 | 25.1 |
+| | separate f32, re-rank all | 80 | 0.957 | 173 | 3,115 | 13.8 |
+| | separate f32, re-rank all | 160 | 0.991 | 330 | 5,940 | 21.3 |
+| | separate f32, re-rank 100 | 160 | 0.977 | 265 | 3,860 | 18.2 |
+| | separate f32, re-rank 50 | 160 | 0.910 | 215 | 2,260 | 16.6 |
+
+What this shows:
+
+- **The disk search is the step 4 search, read from SSD.** At `W = 1` it
+  matches step 4's PQ-guided recall and nodes expanded exactly on SIFT1M,
+  GIST1M and the 8192-dim set (0.992 and 161.9 at L 160, when built with
+  step 4's PQ settings: `--iters 10`). Latency is then about one read per hop: 76 µs of SSD time (the
+  drives' own counters) plus about 25 µs of CPU.
+- **The beam width is the main latency knob after `L`.** `W = 4` cuts SIFT1M
+  at L 80 from 8.2 to 3.6 ms for 10% more reads. `W = 8` gains less (3.2 ms).
+- **CPU, not the SSD, now limits wide beams.** Each read costs 16-25 µs of
+  CPU, about half of it in the kernel. At `W = 8` that is about half the
+  query time.
+  - Part of the user-space cost comes from the thread sleeping during every
+    read: SIFT1M at `W = 1` spends 12.7 µs of user CPU per hop with direct
+    I/O, against 7.1 µs when the same reads come from the page cache without
+    sleeping. Most likely other processes evict its caches while it sleeps;
+    hardware counters would confirm it.
+  - Kernel time per read is the same with io_uring and positioned reads,
+    and with or without the IOPS cap. It is therefore spent in the shared
+    block-I/O and wake-up path.
+  - Ideas to try:
+    - process each block while the round's other reads are still in
+      flight;
+    - io_uring registered buffers and files (a hypothesis for cutting the
+      kernel cost, not yet measured);
+    - lighter per-hop work.
+- **The better layout depends on how many sectors a vector spans.**
+  - **960 dims (2-sector records):** inline needs fewer reads and fewer
+    bytes at equal recall.
+  - **2048 dims (3 sectors):** about a tie. Separate re-ranking 100-130
+    nodes reads 14-26% fewer bytes in 60-80% more reads, at about the
+    same recall and latency.
+  - **8192 dims (9 sectors):** separate is faster: 13.8 vs 15.7 ms at the
+    same recall and bytes (L 80), and 21.3 vs 24.6 ms at L 160.
+
+  Hence the 4-sector cutoff, which falls between measured points (nothing
+  between 2048 and 8192 dims was tested). Separate needs re-ranking of
+  about 0.8 x L nodes to stay within 0.01 recall of re-ranking all.
+  Re-ranking only 50 loses up to 0.08, because PQ orders the candidates too
+  coarsely to pick the final ones. The default (`rerank = 0`) re-ranks
+  every expanded node, so the separate layout never returns lower recall
+  than inline.
+- **f16 storage halves SSD bytes per query at no measurable recall cost**
+  (GIST1M 0.959 either way; 8192 dims 0.991 either way). At 8192 dims it is
+  not yet faster, because f16 is decoded in software; F16C decoding is a
+  step 3 follow-up.
+- **RAM is codes plus ids:** 47.5 B/vector for SIFT1M, 135 B for GIST1M. At
+  8192 dims and 20k vectors it is 939 B, of which 419 B is the shared PQ
+  codebook (8 MB) spread over few vectors. The search process's RSS grows by
+  exactly that.
+- **Against the proposed targets** (recall@10 >= 0.95 at single-digit-ms
+  p99, single thread):
+  - SIFT1M meets them: 0.961 at 5.6 ms p99 (`W = 4`, L 40).
+  - GIST1M, 2048 and 8192 dims do not on this machine: p99 is 15-22 ms at
+    recall >= 0.95. Part of that is the loaded box (CPU time is inflated).
+    The rest needs the CPU work above, and f16 with hardware decoding.
+- **Not shown here:** 100M or more vectors, and many threads. 100M vectors
+  needs the partitioned build and a dedicated machine. Multi-thread QPS on
+  this shared RAID would mostly measure the IOPS cap.
+
+Commands (`S`, `G` as above; `--layout auto` is the default):
+
+```
+$B synth --out emb2048 --dim 2048 --n 50000 --nq 200 --intrinsic 64 --noise 0.05 --seed 23
+$B groundtruth --base emb2048/base.fvecs --query emb2048/query.fvecs --out emb2048/gt.ivecs --k 10
+$B disk-build --base emb2048/base.fvecs --out emb2048 --pq-m 256 --threads 6 --layout inline,separate
+$B disk-build --base emb8192/base.fvecs --out emb8192 --pq-m 512 --threads 6 \
+      --layout inline,separate --codec f32,f16
+$B disk-build --base $S/sift_base.fvecs --out sift1m --pq-m 32 --threads 6
+$B disk-search --index sift1m.inline.f32.vdx --query $S/sift_query.fvecs \
+      --gt $S/sift_groundtruth.ivecs --nq 1000 --threads 1 --w 1,4,8 --l 40,80,160
+$B disk-build --base $G/gist_base.fvecs --out gist1m --pq-m 120 --threads 6 \
+      --layout inline,separate --codec f32,f16
+$B disk-search --index gist1m.inline.f16.vdx --query $G/gist_query.fvecs \
+      --gt $G/gist_groundtruth.ivecs --threads 1 --w 4 --l 80,160,320
+$B disk-search --index gist1m.separate.f32.vdx ... --rerank 0,20,50   # 0 = re-rank all
+$B disk-search ... --cache 100000            # keep 100k nodes near the entry in RAM
+```
+
 ## Designing for billions
 
 Raw `f32` vectors cost `n x dim x 4` bytes:
@@ -362,11 +566,13 @@ What the 32-8192 dimension range changes:
 - **Re-ranking with full vectors is required for high recall.** The final
   top-k is recomputed exactly from full vectors, which can be stored as f32,
   f16/bf16 (half the size) or int8 (a quarter).
-- **The disk layout depends on dimension.** DiskANN stores each node's full
+- **Record size grows with dimension.** DiskANN stores each node's full
   vector and neighbor list together in one 4 KB SSD page. With 64 neighbors
-  (256 B), that fits up to about 950 f32 dimensions, or about 1,900 in f16. An
-  8192-dim f32 vector alone is 32 KB, so high-dimension collections keep the
-  graph and the full vectors in separate files.
+  (256 B), that fits up to about 950 f32 dimensions, or about 1,900 in f16.
+  Longer records span several sectors (8 KB for GIST at f32, 36 KB at 8192
+  dims). Storing the graph and the vectors apart pays off once a vector
+  spans several sectors: in step 5 it tied at 2048 dims and was 10-18%
+  faster at 8192.
 - **Distance cost grows linearly with dimension,** so SIMD kernels matter more
   at 4096-8192 dims.
 
@@ -423,8 +629,16 @@ Within a shard:
    construction for inner product with uneven norms, tuning build parameters
    per dataset, inserts and deletes after the build (step 6), saving the
    graph (step 5)
-5. Disk index: PQ in RAM, graph and full vectors on SSD (layout chosen by
-   dimension), re-ranking, io_uring; target 100M vectors on one node
+5. ◐ SSD index. Done: PQ codes in RAM; graph and full vectors on SSD (f32,
+   f16 or bf16; layout chosen by record size); checksummed records; direct
+   I/O; io_uring beam search; hot-node cache. Measured on SIFT1M, GIST1M and
+   2048- and 8192-dim data. Still to do:
+   - a partitioned build for collections larger than RAM (needed for the
+     100M-vectors-per-node target);
+   - processing blocks while the round's other reads are in flight;
+   - io_uring registered buffers;
+   - F16C decoding;
+   - 100M-scale runs on dedicated hardware
 6. Segments, WAL, deletes, compaction, metadata filtering
 7. Server and single-node mode: gRPC/HTTP API, collections, the shard
    interface, concurrent reads and writes

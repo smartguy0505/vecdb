@@ -164,3 +164,29 @@ fn l2_squared_batch(query: &[f32], rows: &[f32], out: &mut [f32]) {
     // SAFETY: as in dot.
     unsafe { l2_batch_avx2(query, rows, out) }
 }
+
+/// CRC-32C register update with the SSE4.2 `crc32` instruction, or `None`
+/// if the CPU lacks SSE4.2. `state` is the raw (pre-inverted) register, as in
+/// the table implementation in `crc32c.rs`.
+pub(super) fn crc32c_update(state: u32, data: &[u8]) -> Option<u32> {
+    if is_x86_feature_detected!("sse4.2") {
+        // SAFETY: SSE4.2 was detected at runtime.
+        Some(unsafe { crc32c_sse42(state, data) })
+    } else {
+        None
+    }
+}
+
+#[target_feature(enable = "sse4.2")]
+fn crc32c_sse42(state: u32, data: &[u8]) -> u32 {
+    let (words, tail) = data.as_chunks::<8>();
+    let mut c = u64::from(state);
+    for w in words {
+        c = _mm_crc32_u64(c, u64::from_le_bytes(*w));
+    }
+    let mut c = c as u32;
+    for &b in tail {
+        c = _mm_crc32_u8(c, b);
+    }
+    c
+}
