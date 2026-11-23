@@ -29,6 +29,21 @@ pub(super) fn avx2_fma() -> Option<&'static Kernels> {
     }
 }
 
+/// Prefetch hint for the first `PREFETCH_BYTES` of `data` (SSE, which every
+/// x86_64 CPU has, so no runtime detection is needed).
+#[inline]
+pub(super) fn prefetch<T>(data: &[T]) {
+    let bytes = std::mem::size_of_val(data).min(super::PREFETCH_BYTES);
+    let p = data.as_ptr().cast::<i8>();
+    let mut off = 0;
+    while off < bytes {
+        // SAFETY: `off < size_of_val(data)`, so the address is inside `data`;
+        // a prefetch is only a hint and cannot fault or change memory.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(p.add(off)) };
+        off += 64;
+    }
+}
+
 /// Horizontal sum of 8 lanes.
 #[inline]
 #[target_feature(enable = "avx2,fma")]

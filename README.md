@@ -3,9 +3,10 @@
 A vector database written from scratch in Rust, designed for billion-scale
 approximate nearest neighbor search.
 
-Status: steps 1-3 are done: exact search, the segment file format and
-benchmark harness; SIMD kernels (AVX2/FMA); and quantization (PQ, plus
-f16/bf16/int8 storage for re-ranking).
+Status: steps 1-4 are done: exact search, the segment file format and
+benchmark harness; SIMD kernels (AVX2/FMA); quantization (PQ, plus
+f16/bf16/int8 storage for re-ranking); and an in-memory graph index (Vamana)
+with a search-time recall/latency knob.
 
 ## Goals
 
@@ -24,7 +25,8 @@ f16/bf16/int8 storage for re-ranking).
 
 ```
 crates/vecdb-core    library: SIMD distance kernels, top-k, stores, flat index,
-                     k-means, product quantization, vector codecs, PQ index, file formats
+                     k-means, product quantization, vector codecs, PQ index,
+                     graph index (Vamana), file formats
 crates/vecdb-bench   CLI: synthetic data, ground truth, segment build, recall/latency runs,
                      kernel micro-benchmark
 ```
@@ -194,6 +196,147 @@ when re-ranking 200 x 8192 dims; F16C hardware conversion would fix that. A
 SIMD "fast-scan" (4-bit PQ) could speed up the code scan severalfold. PQ
 codebooks are not yet saved in the segment format (step 6).
 
+## Graph index (step 4)
+
+`GraphIndex` is a Vamana graph (the graph DiskANN uses) over full vectors in
+memory, searched with a greedy beam search. The search list size `L` is the
+recall/latency knob: a longer list expands more nodes and computes more
+distances. Build parameters: maximum degree `R` (default 64), build list size
+(100) and pruning factor α (1.2).
+
+- **Build** inserts points in random order, in batches that grow from 1 to 2%
+  of the collection (as in ParlayANN). Searches and pruning within a batch run
+  in parallel, and the graph comes out identical for any thread count.
+- **Reachability repair.** Vamana does not guarantee that every node can be
+  reached from the entry point: pruning can remove all of a node's in-edges.
+  On GIST1M that left 2,443 nodes (0.25%) that no search could return. After
+  the build, each unreachable node gets an edge from the nearest reachable
+  node with a free slot; all 982,694 GIST1M nodes are then reachable. (The
+  repair can fail only if every reachable node is already full, which needs
+  a very small `R`.)
+- **Identical vectors share one graph node.** Otherwise copies prune each
+  other (distance 0) and become unreachable. SIFT1M has 14,538 such copies,
+  GIST1M 17,306.
+- **Inner product** links vectors by angle (the cosine distance between
+  rows) and ranks by −dot at search time. It is the weakest metric; see the
+  1024-dim table below.
+- **Two ways to navigate the same graph.** `exact` uses full vectors. `pq`
+  uses PQ codes to steer and computes the exact distance of every expanded
+  node. That is the disk index's search (step 5: codes in RAM, one SSD read
+  per expanded node), run in memory so its recall can be measured before any
+  I/O code exists.
+- **Not yet:** inserts after the build, deletes, saving the graph to disk.
+  Two build passes (`passes = 2`, the original paper's schedule) are
+  implemented but not benchmarked.
+
+Results below are recall@10 and single-thread latency per query (median,
+p99), all in RAM. `dist/q` is distance computations per query (PQ lookups
+for `pq`); `hops/q` is nodes expanded, which becomes SSD reads in step 5.
+Build parameters are the defaults and were not tuned per dataset.
+
+**SIFT1M, L2** (1M x 128, 10,000 queries, published ground truth; exact search
+reaches 0.9994). Built in 2-2.5 min on 6 threads; mean degree 45.5. PQ: 32 B/vector.
+
+| L | recall, full vectors | dist/q | hops/q | p50 / p99 ms | recall, PQ-guided | p50 / p99 ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 0.853 | 719 | 16 | 0.07 / 0.15 | 0.690 | 0.06 / 0.11 |
+| 20 | 0.937 | 1,040 | 25 | 0.12 / 0.22 | 0.873 | 0.09 / 0.16 |
+| 40 | 0.978 | 1,637 | 45 | 0.21 / 0.41 | 0.962 | 0.15 / 0.26 |
+| 80 | 0.9945 | 2,710 | 84 | 0.37 / 0.72 | 0.991 | 0.23 / 0.39 |
+| 160 | 0.9986 | 4,562 | 164 | 0.61 / 1.08 | 0.998 | 0.39 / 0.64 |
+| 320 | 0.9993 | 7,675 | 324 | 1.08 / 2.14 | 0.9992 | 0.72 / 1.26 |
+
+**GIST1M, L2** (1M x 960, 1,000 queries, published ground truth; exact search
+reaches 0.9992). Built in 12-14 min on 6 threads; mean degree 33.4. PQ: 120 B/vector.
+
+| L | recall, full vectors | dist/q | hops/q | p50 / p99 ms | recall, PQ-guided | p50 / p99 ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 0.613 | 891 | 17 | 0.26 / 0.45 | 0.464 | 0.20 / 0.32 |
+| 20 | 0.746 | 1,316 | 27 | 0.43 / 0.83 | 0.629 | 0.28 / 0.44 |
+| 40 | 0.854 | 2,090 | 46 | 0.69 / 1.06 | 0.781 | 0.38 / 0.51 |
+| 80 | 0.927 | 3,544 | 84 | 1.24 / 1.79 | 0.892 | 0.64 / 0.88 |
+| 160 | 0.971 | 6,147 | 164 | 2.16 / 3.23 | 0.959 | 1.06 / 1.47 |
+| 320 | 0.987 | 10,626 | 323 | 3.79 / 6.01 | 0.984 | 1.85 / 3.00 |
+
+**8192 dims, 20k vectors, 100 queries, L2** (synthetic: a 64-dim subspace plus
+noise, as in step 3). Built in 141 s; mean degree 53.7. PQ: 512 B/vector.
+
+| L | recall, full vectors | p50 ms | recall, PQ-guided | p50 ms |
+|---:|---:|---:|---:|---:|
+| 40 | 0.909 | 4.1 | 0.842 | 1.8 |
+| 80 | 0.977 | 7.0 | 0.956 | 2.6 |
+| 160 | 0.998 | 11.3 | 0.992 | 3.8 |
+
+**Metrics, 1024 dims, 100k vectors, 200 queries** (the synthetic set from
+step 3; the same vectors under each metric, full-vector navigation):
+
+| L | L2 | cosine | inner product |
+|---:|---:|---:|---:|
+| 40 | 0.7475 | 0.6965 | 0.6190 |
+| 80 | 0.8830 | 0.8695 | 0.7960 |
+| 160 | 0.9555 | 0.9650 | 0.9300 |
+
+With PQ guidance (128 B) at L 160: 0.9645, 0.9605 and 0.9385. This set needs a
+larger `L` than SIFT1M for the same recall.
+
+**Inner product with uneven norms** is the hard case. Scaling each of those
+vectors by a random factor exp(0.5·N(0,1)) keeps their directions but skews
+their norms; recall then reaches only 0.50 at L 160 and 0.70 at L 320. The
+usual reduction of inner product to L2 (an extra coordinate sqrt(M² − |x|²)
+per vector) did worse on both sets (0.63 at L 160 on the plain set, 0.09 at
+L 320 on the skewed one), although it did better on a small 32-dim test set.
+For normalized embeddings, use cosine (it gives the same ranking as inner
+product). Unnormalized inner-product search needs its own graph construction,
+which is a follow-up.
+
+What this shows, and what it doesn't:
+
+- **The graph replaces the linear scan.** On SIFT1M, recall 0.9945 at L 80
+  touches 2,710 vectors (0.27% of the collection) in about 0.4 ms, where the
+  step 3 code scan took 5-26 ms.
+- **Recall at a given L depends heavily on the data.** L 160 gives 0.9986 on
+  SIFT1M but 0.971 on GIST1M, which needs L 320 for 0.987. `L` has to be
+  chosen per collection, or set from a recall target measured on sample
+  queries.
+- **PQ guidance pays off more as dimension grows.** Its distances read `m`
+  bytes instead of the full vector. At the same `L` it is about 1.5x faster
+  on SIFT, 2x on GIST and 2.5-3x at 8192 dims, with somewhat lower recall
+  that a larger `L` buys back. For example, on GIST PQ-guided L 320 beats
+  full-vector L 160 on both recall (0.984 against 0.971) and latency (1.8
+  against 2.2 ms).
+- **What step 5 has to serve from SSD:** about 85 node reads per query at
+  L 80 and 165 at L 160. That takes several reads in flight per step (beam
+  width) to stay within milliseconds. At 8192 dims each full vector is 32 KB,
+  so the disk index should re-score only the final candidates (as step 3
+  does) rather than every expanded node.
+- **Latency is noisy.** This is a shared desktop-class machine (i7-8700, 6
+  cores) running other work. Between identical runs, median latency moved by
+  a few percent, and p99 and multi-threaded QPS by up to 40%. Recall is
+  deterministic. Nothing here is a billion-vector or SSD number.
+- **Build time** is the cost: about 2.5 min for SIFT1M and 12-14 min for
+  GIST1M on 6 threads, and 141 s for just 20k vectors at 8192 dims. Large
+  collections are built per segment (steps 5-6).
+
+Prefetching the first cache line of each neighbor's vector before computing
+the distances cut median latency by about 7% on SIFT1M. That was measured in
+one process on one graph, alternating prefetch off and on; whole-vector
+prefetch gained less.
+
+Commands for these runs (`B=target/release/vecdb-bench`, `S=` the SIFT1M
+directory, `G=` the GIST1M directory):
+
+```
+$B graph --base $S/sift_base.fvecs --query $S/sift_query.fvecs --gt $S/sift_groundtruth.ivecs \
+      --threads 6 --pq-m 32 --l 10,20,40,80,160,320
+$B graph --base $G/gist_base.fvecs --query $G/gist_query.fvecs --gt $G/gist_groundtruth.ivecs \
+      --threads 6 --pq-m 120 --l 10,20,40,80,160,320
+$B graph --base emb8192/base.fvecs --query emb8192/query.fvecs --gt emb8192/gt.ivecs \
+      --threads 6 --pq-m 512 --iters 10 --l 10,20,40,80,160
+$B groundtruth --base emb1024/base.fvecs --query emb1024/query.fvecs --out emb1024/gt-ip.ivecs --k 10 --metric ip
+$B graph --base emb1024/base.fvecs --query emb1024/query.fvecs --gt emb1024/gt.ivecs \
+      --metric l2 --threads 6 --pq-m 128 --l 20,40,80,160   # also: --metric cosine / ip with gt-cos / gt-ip
+```
+
 ## Designing for billions
 
 Raw `f32` vectors cost `n x dim x 4` bytes:
@@ -273,8 +416,13 @@ Within a shard:
    full vectors, re-ranking, and recall measured against bytes per vector on
    SIFT1M and 1024/8192-dim data. Follow-ups: F16C decoding, 4-bit fast-scan,
    persisting codebooks
-4. Vamana graph in memory: build, beam search, a search-time recall/latency
-   knob; recall vs QPS on SIFT1M and a high-dimension dataset
+4. ✅ Vamana graph in memory: parallel build (same graph for any thread
+   count), beam search with the list size `L` as the recall/latency knob,
+   PQ-guided search, identical-vector merging, reachability repair; recall
+   and latency on SIFT1M, GIST1M and 8192-dim data. Follow-ups: a graph
+   construction for inner product with uneven norms, tuning build parameters
+   per dataset, inserts and deletes after the build (step 6), saving the
+   graph (step 5)
 5. Disk index: PQ in RAM, graph and full vectors on SSD (layout chosen by
    dimension), re-ranking, io_uring; target 100M vectors on one node
 6. Segments, WAL, deletes, compaction, metadata filtering

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use vecdb_core::dataset::{self, Vecs};
@@ -11,7 +12,7 @@ use vecdb_core::format::{read_flat_segment, write_flat_segment};
 use vecdb_core::kernels::{self, Kernels};
 use vecdb_core::rng::SplitMix64;
 use vecdb_core::quant::{Codec, PqParams};
-use vecdb_core::{FlatIndex, Metric, PqIndex, SearchResult};
+use vecdb_core::{FlatIndex, GraphIndex, GraphParams, Metric, Navigation, PqIndex, SearchResult};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -34,6 +35,12 @@ commands:
                [--codecs f32,f16,bf16,sq8] [--k 10] [--threads 4] [--limit N] [--nq N]
                [--max-train 65536] [--iters 25]
                product quantization: recall and speed per code size, re-rank depth, codec
+  graph        --base F --query F --gt G [--metric l2] [--k 10] [--l 10,20,40,80,160]
+               [--degree 64] [--build-l 100] [--alpha 1.2] [--passes 1] [--threads 4]
+               [--pq-m M] [--iters 15] [--max-train 65536] [--limit N] [--nq N]
+               Vamana graph: build once, then recall, distances, hops, QPS (--threads)
+               and 1-thread latency per search list size L; with --pq-m, also
+               PQ-guided search (codes steer, expanded nodes re-scored exactly)
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
@@ -63,6 +70,7 @@ fn run() -> AnyResult<()> {
         "search" => search(&args),
         "kernels" => kernel_bench(&args),
         "pq" => pq_bench(&args),
+        "graph" => graph_bench(&args),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
@@ -628,5 +636,121 @@ fn pq_bench(a: &Args) -> AnyResult<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn graph_bench(a: &Args) -> AnyResult<()> {
+    a.allow(&[
+        "base", "query", "gt", "metric", "k", "l", "degree", "build-l", "alpha", "passes", "threads", "pq-m", "iters",
+        "max-train", "limit", "nq",
+    ])?;
+    let metric = a.metric()?;
+    let k: usize = a.num("k", 10)?;
+    let threads: usize = a.num("threads", 4)?;
+    let ls: Vec<usize> = parse_list(a, "l", "10,20,40,80,160")?;
+    let params = GraphParams {
+        max_degree: a.num("degree", 64)?,
+        build_list: a.num("build-l", 100)?,
+        alpha: a.num("alpha", 1.2)?,
+        passes: a.num("passes", 1)?,
+        seed: 0x5eed,
+        threads,
+    };
+    let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
+    let queries = load_vectors(&a.req_path("query")?, a.opt_num("nq")?)?;
+    check_query_dim(&queries, base.dim)?;
+    let gt = load_gt(&a.req_path("gt")?, queries.len(), k)?;
+    let ids: Vec<u64> = (0..base.len() as u64).collect();
+    println!(
+        "data     {} x {} ({}), {} queries, k {k}, kernels {}",
+        base.len(),
+        base.dim,
+        metric.name(),
+        queries.len(),
+        kernels::best().name
+    );
+    let t0 = Instant::now();
+    // The index takes the vectors over: one copy in memory.
+    let mut index = GraphIndex::build(metric, base.dim, &ids, base.data, &params)?;
+    println!(
+        "graph    R {}, build L {}, alpha {}, passes {}, {threads} threads: built in {:.1} s",
+        params.max_degree,
+        params.build_list,
+        params.alpha,
+        params.passes,
+        t0.elapsed().as_secs_f64()
+    );
+    println!(
+        "         {} nodes ({} identical vectors merged), mean degree {:.1}, {} reachable from the entry",
+        index.nodes(),
+        index.len() - index.nodes(),
+        index.mean_degree(),
+        index.reachable()
+    );
+    let mut navs = vec![Navigation::Exact];
+    if let Some(m) = a.opt_num::<usize>("pq-m")? {
+        let t0 = Instant::now();
+        index.train_pq(&PqParams {
+            m,
+            iters: a.num("iters", 15)?,
+            max_train: a.num("max-train", 65_536)?,
+            seed: 0x5eed,
+            threads,
+        })?;
+        println!("pq       {m} B/vector, trained and encoded in {:.1} s", t0.elapsed().as_secs_f64());
+        navs.push(Navigation::Pq);
+    }
+    let (graph_b, vec_b, pq_b) = index.memory();
+    let per = |b: usize| b as f64 / index.len() as f64;
+    println!(
+        "memory   B/vector: graph {:.0}, full vectors {:.0}, PQ codes {:.0}",
+        per(graph_b),
+        per(vec_b),
+        per(pq_b)
+    );
+    // Warm-up: page everything in once before timing.
+    let _ = run_queries(&|q: &[f32]| index.search(q, k, ls[0]), &queries, threads)?;
+    println!(
+        "{:>5} {:>5} {:>9} {:>8} {:>7} {:>10} {:>8} {:>8}",
+        "nav",
+        "L",
+        format!("recall@{k}"),
+        "dist/q",
+        "hops/q",
+        format!("QPS {threads}t"),
+        "p50 ms",
+        "p99 ms"
+    );
+    for &nav in &navs {
+        for &l in &ls {
+            let (dists, hops) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let search = |q: &[f32]| {
+                let (res, st) = index.search_with(q, k, l, nav)?;
+                dists.fetch_add(st.distances, Relaxed);
+                hops.fetch_add(st.expanded, Relaxed);
+                Ok(res)
+            };
+            let single = run_queries(&search, &queries, 1)?;
+            let nq = queries.len() as f64;
+            let (d, h) = (dists.load(Relaxed) as f64 / nq, hops.load(Relaxed) as f64 / nq);
+            let multi = if threads > 1 { run_queries(&search, &queries, threads)?.qps() } else { single.qps() };
+            println!(
+                "{:>5} {:>5} {:>9.4} {:>8.0} {:>7.1} {:>10.0} {:>8.3} {:>8.3}",
+                match nav {
+                    Navigation::Exact => "exact",
+                    Navigation::Pq => "pq",
+                },
+                l,
+                recall(&single.results, &gt, k),
+                d,
+                h,
+                multi,
+                single.pct_ms(50.0),
+                single.pct_ms(99.0)
+            );
+        }
+    }
+    println!("latency: 1 thread; dist/q: distance computations that steer the search (PQ for nav pq);");
+    println!("hops/q: nodes expanded (a disk index reads one block per hop)");
     Ok(())
 }
