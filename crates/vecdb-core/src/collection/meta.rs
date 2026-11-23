@@ -95,6 +95,10 @@ impl Attrs {
         &self.entries
     }
 
+    pub(crate) fn from_entries(entries: Vec<(String, Value)>) -> Self {
+        Self { entries }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

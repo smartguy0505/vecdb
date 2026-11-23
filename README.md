@@ -10,9 +10,9 @@ with a search-time recall/latency knob. Step 5, the SSD index, works and is
 measured at 1M scale: PQ codes in RAM, graph and full vectors on SSD, read
 with direct I/O and io_uring, and a partitioned build that needs RAM for one
 partition rather than the whole collection. The 100M-vectors-per-node target
-has not been attempted yet: it needs a dedicated machine. Step 6 is under
-way: collections with a write-ahead log, segments, deletes, compaction and
-crash recovery work; attribute filters are next.
+has not been attempted yet: it needs a dedicated machine. Step 6 is done:
+collections with a write-ahead log, segments, deletes, compaction, crash
+recovery and attribute filters.
 
 ## Goals
 
@@ -682,6 +682,11 @@ let mut c = Collection::create("data/docs", cfg, OpenOptions::default())?;
 c.upsert(42, &vector, &Attrs::new().keyword("lang", "en").int("year", 2024))?;
 c.delete(7)?;
 let hits = c.search(&query, 10, &SearchOptions::default())?;
+let filtered = SearchOptions {
+    filter: Some(Filter::and([Filter::keyword_in("lang", &["en", "de"]), Filter::range("year", 2020..)])),
+    ..Default::default()
+};
+let recent = c.search(&query, 10, &filtered)?;
 c.maintain()?; // the index builds and compactions that are due
 ```
 
@@ -691,7 +696,8 @@ c.maintain()?; // the index builds and compactions that are due
       wal-<gen>.log       writes since the last flush
       seg-<id>.flat       sealed segment: ids + vectors, searched exactly in RAM
       seg-<id>.vdx        sealed segment: SSD index (step 5)
-      seg-<id>.attrs      attributes per row, when the collection declares fields
+      seg-<id>.attrs      attributes, when the collection declares fields: rows,
+                          and the column index that filters read
       seg-<id>.del-<gen>  tombstones: the segment's deleted rows
 ```
 
@@ -742,9 +748,10 @@ c.maintain()?; // the index builds and compactions that are due
   the segment list while a writer works.
 - **RAM per row of an SSD segment**, beyond the index: 4 bytes for the
   id lookup (positions sorted by id) and 1 bit of tombstone. Flat and
-  growing segments hold their vectors. With fields declared, every segment
-  also keeps each row's attributes in RAM as written (field names
-  included): a provisional format that the filter indexes are to replace.
+  growing segments hold their vectors. With fields declared, every sealed
+  segment also holds its attribute columns: 12 bytes per integer value
+  (measured), and 4 bytes per keyword value plus each distinct keyword once
+  (see Filters below).
 
 The tests check the engine against a plain `HashMap` reference:
 - random upserts, deletes, flushes and reopens, with exact search results
@@ -832,8 +839,166 @@ Direct I/O here is capped at 100,000 reads/s, as in step 5.
   concurrently, with their reads in flight together, to scan in parallel,
   and to build indexes in the background.
 
-Not yet: attribute filters (the rows already store attributes), group
-commit, and inserting into an SSD index in place instead of rebuilding it.
+### Filters
+
+A search can carry a filter on the collection's declared fields (see the
+example above).
+
+- **Model.** Fields are integers or keywords, declared per collection; a row
+  may hold several values for a field. Conditions are `Eq` and `In`
+  (integers and keywords) and `Range` (integers, inclusive), combined with
+  `And`, `Or` and `Not`. A row matches a condition when any of its values
+  does. A row with no value for the field matches no condition on it, and
+  so matches its `Not`. An empty `In` or `Or` matches nothing, an empty
+  `And` everything. An unknown field, a value of the wrong type, or a tree
+  deeper than 32 is an error, not an empty result.
+- **Storage.** The WAL keeps attributes as written, with field names;
+  everywhere else rows are encoded with field numbers. A sealed segment's
+  `.attrs` file holds its rows, each with its own checksum, and a column
+  index: per keyword field, the distinct keywords with sorted position
+  lists; per integer field, the values sorted with their positions. Only
+  the columns are loaded into RAM: 12 bytes per integer value, 4 bytes per
+  keyword value plus each distinct keyword once. `get` reads its row from
+  the file. The growing segment keeps columns of its own, added to row by
+  row.
+- **Evaluation.** Per segment, the filter becomes a bitmap of matching
+  positions, less the deleted ones. When a field holds one value per row
+  and most rows match, the bitmap starts full and the other rows are
+  cleared, so the work follows the smaller side. A filter matching every
+  row then costs about what no filter costs on SIFT1M at L 40: a mean of
+  0.29 against 0.27 ms per query over four interleaved pairs (each run
+  0.23-0.34 ms). Before this path it cost 3.09 against 0.48 ms (measured
+  under heavier load).
+- **RAM segments** score only the matching rows, row by row in blocks where
+  few match.
+- **An SSD segment is searched one of two ways** (`FilterMode`):
+  - *walk*: the graph search, returning only matching rows, with L scaled
+    by 1 / (fraction matching), up to 16x;
+  - *scan*: no graph. PQ distances to every matching row, from the codes in
+    RAM, then the best L read from SSD and scored exactly.
+- **`Auto`, the default, chooses per segment:**
+  - it scans when fewer than 1/16 of the rows match;
+  - otherwise it compares the walk's expected rounds (about L' / W + 4, at
+    the scaled L') times what a round costs in scanned rows with the
+    number of matching rows. A round is worth 3,500 rows with direct I/O
+    and 400 from the page cache; both constants were measured, below;
+  - it falls back to the scan when a walk expands fewer than L/2 matching
+    nodes, as happens when the matches lie away from the query.
+
+Tests:
+- random filter trees over random multi-valued rows, and over rows with one
+  value per field, evaluated by the growing segment's columns and by the
+  columns written to a file and read back, against a direct evaluation
+  (`Filter::matches`) row by row;
+- filtered search on growing and flat segments equal to the reference over
+  random writes, deletes, flushes and reopens;
+- SSD segments in each mode and both layouts: no match, fewer matches than
+  k, one matching row among identical vectors, deletes, every row matching
+  (the same results as no filter), recall at 5% matching, and a reopen;
+- damaged attribute files, invalid filters, and a WAL whose attributes do
+  not fit the fields;
+- the walk-or-scan choice at the measured points.
+
+Results on SIFT1M: one SSD segment of 1M rows, `W = 4`, k = 10, 1 thread,
+300 queries (200 with direct I/O, capped at 100,000 reads/s). Two integer
+labels per row: `u`, uniform in 0..1000 and unrelated to the vector, and
+`p`, the row's bucket (0..1000) by the rank of its projection onto a fixed
+random direction. Filters are ranges matching a given fraction of rows:
+- on `u`: matches spread over the space;
+- on `p`, from one end: matches in one slab of the space, away from most
+  queries (the hard case for a walk);
+- on `p`, around each query's own bucket ("near"): matches near the query.
+
+Recall@10 is against exact search over the matching rows. Without a filter,
+L 40 gives 0.964 recall in about 0.25 ms from the page cache and 2.2 ms with
+direct I/O.
+
+Uniform labels, L 40, recall@10 / mean ms:
+
+| matching | walk, page cache | scan, page cache | auto, page cache | walk, direct | scan, direct | auto, direct |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.1% | 0.068 / 2.10 | 1.000 / 0.15 | 1.000 / 0.14 | 0.065 / 24.2 | 1.000 / 0.57 | 1.000 / 0.49 |
+| 1% | 0.599 / 2.09 | 0.997 / 0.49 | 0.997 / 0.50 | 0.616 / 20.7 | 0.999 / 0.83 | 0.999 / 1.03 |
+| 5% | 0.991 / 2.15 | 0.997 / 1.95 | 0.997 / 1.95 | 0.991 / 22.8 | 0.998 / 2.64 | |
+| 10% | 0.989 / 1.61 | 0.991 / 3.44 | 0.989 / 1.57 | 0.991 / 13.7 | 0.995 / 3.75 | 0.995 / 3.82 |
+| 20% | 0.988 / 1.00 | 0.990 / 6.11 | 0.988 / 1.10 | 0.990 / 7.94 | 0.991 / 6.63 | 0.990 / 7.69 |
+| 50% | 0.976 / 0.87 | 0.986 / 14.2 | 0.976 / 0.98 | 0.981 / 4.09 | 0.988 / 15.1 | 0.981 / 3.82 |
+
+(The direct 5% row is from the calibration run: the same code before the
+final constants, at a load average of 5-10.)
+
+Matches in one slab (L 40, recall@10 / mean ms; auto's share of queries
+that fell back to a scan in brackets):
+
+| matching | far slab: walk | far slab: auto | near slab: walk | near slab: auto |
+|---|---:|---:|---:|---:|
+| page cache, 1% | 0.177 / 2.05 | 0.998 / 0.46 (scan) | 0.803 / 2.16 | 0.998 / 0.63 (scan) |
+| page cache, 10% | 0.455 / 1.48 | 0.992 / 3.58 (65%) | 0.993 / 1.49 | 0.995 / 1.52 (2%) |
+| page cache, 20% | 0.566 / 0.99 | 0.990 / 4.50 (57%) | 0.991 / 1.01 | 0.993 / 1.06 (1%) |
+| page cache, 50% | 0.792 / 0.93 | 0.975 / 5.27 (32%) | 0.989 / 1.10 | 0.989 / 1.22 (0%) |
+| direct, 10% | 0.401 / 14.9 | 0.993 / 3.63 (scan) | 0.995 / 13.8 | 0.992 / 4.09 (scan) |
+| direct, 20% | 0.523 / 7.90 | 0.990 / 12.1 (63%) | 0.995 / 7.77 | 0.997 / 7.60 (1%) |
+| direct, 50% | 0.773 / 4.28 | 0.980 / 11.0 (35%) | 0.994 / 4.12 | 0.994 / 4.25 (0%) |
+
+(The near-slab 50% times are means of three interleaved runs of walk and
+auto. A single run had shown auto at 1.83 and 4.73 ms; the interleaved runs
+put it within noise of the walk it chose.)
+
+What this shows:
+- **Neither way works alone.**
+  - The walk fails on selective filters. Below about 5% matching, it
+    cannot reach enough matching nodes (recall 0.07 at 0.1%, even at 16x
+    L), and it takes the most rounds there (164 at L 40).
+  - The scan's cost grows with the matching rows, at about 30-40 ns per
+    row from RAM: 14 ms for 500,000 rows. So it loses once many rows
+    match.
+- **With direct I/O the scan wins up to about 20% matching.** It waits on
+  the SSD one to three times; the walk waits 50 to 160 times. From the page
+  cache the scan wins up to about 5-10%.
+- **Auto chose the faster way at every measured point with uniform or
+  query-near labels, except one:** 20% matching, direct I/O, L 40. There
+  it walked for both label kinds, 16% slower than a scan.
+- **At the same L, the scan's recall is higher:** at L 40 about 0.99 up to
+  20% matching and 0.98-0.99 at 50%, against 0.964 for an unfiltered walk.
+  It re-ranks the L nearest by PQ among all matching rows.
+- **When the matches lie away from the query, the walk fails at every
+  selectivity** (0.79 recall at 50%). The fallback restores 0.975-0.99, at
+  the cost of a walk and a scan for those queries. At 20% from the page
+  cache that is 4.5 ms, against 1.0 ms for uniform labels.
+- **Two integer fields cost 24 MB of RAM for 1M rows** (12 bytes per
+  value). Ingest with them ran at 248,000 rows/s, against 310,000 without
+  attributes, in interleaved pairs. The difference is WAL encoding and the
+  growing segment's columns.
+- **Profiling found the scan's cost was in finding nodes, not distances.**
+  A position's node was found by stepping through the 8 MB id table, a
+  cache miss per step. Now it comes from the short list of nodes that hold
+  identical vectors (SIFT1M has 14,538 duplicate rows), and PQ codes are
+  fetched ahead. Measured back to back under the same load, the last of
+  these changes took the scan at 5% matching from 8.2 to 4.1 ms, and at
+  0.1% from 0.71 to 0.24 ms (the first version took about 1.8 ms there).
+
+Limits:
+- **Calibration.** The constants come from one dataset (128 dimensions,
+  32-byte codes) on one machine, one thread. The machine (6 cores, 12
+  threads) was shared and heavily loaded during the first runs. The tables
+  above are from a quieter period, at a load average of 2-7.
+- **Only integer range filters were benchmarked.** Keyword filters and
+  `In`, `And`, `Or` and `Not` trees are tested for correctness against the
+  reference, not for speed.
+- **Bitmap per segment and query.** It costs the segment's positions / 8
+  bytes per filter term, 12.5 MB at 100M rows, and time in proportion to
+  the matches. Sorted position lists for selective terms, and checking the
+  filter per expanded node for walks, are the next step for large
+  segments.
+- **Keyword dictionary in RAM.** It is kept per segment, so keywords unique
+  to each row (ids, say) cost their bytes plus 20 bytes each.
+- **The graph does not know the labels.** A filter whose matches lie away
+  from the query is detected only after a walk, by the fallback. Per-label
+  entry points or label-aware edges (as in Filtered-DiskANN) would avoid
+  the wasted walk.
+
+Not yet: group commit, and inserting into an SSD index in place instead of
+rebuilding it.
 
 Commands (`B`, `S` as above):
 
@@ -843,6 +1008,11 @@ $B coll-ingest ... --durability sync --batch 100 --secs 5
 $B coll-ingest ... --index-mb 128 --max-ssd 16 --maintain true
 $B coll-search --from sift1m --dir work --base $S/sift_base.fvecs --query $S/sift_query.fvecs \
    --l 40,80,160 --delete 0,0.1,0.3,0.5 --adapt both --compact true --direct false
+$B coll-ingest --base $S/sift_base.fvecs --dir sift1m-labels --pq-m 32 --labels true --optimize true
+$B coll-filter --dir sift1m-labels --base $S/sift_base.fvecs --query $S/sift_query.fvecs --l 40,160 \
+   --filter u,p,near --select 0.001,0.01,0.05,0.1,0.2,0.5 --mode graph,scan,auto --direct false
+$B coll-filter --dir sift1m-labels --base $S/sift_base.fvecs --query $S/sift_query.fvecs --l 40 \
+   --filter none,u,none,u --select 1.0 --mode graph --direct false   # overhead of a filter
 ```
 
 ## Designing for billions
@@ -909,7 +1079,9 @@ Within a shard:
   object storage).
 - **Read path:** the growing segment is searched by brute force. Sealed
   segments use PQ distances in RAM to walk the graph on SSD, then re-rank the
-  candidates with full vectors. The per-segment top-k lists are then merged.
+  candidates with full vectors. Under a selective filter a segment skips the
+  graph: PQ distances to its matching rows, then the best re-ranked. The
+  per-segment top-k lists are then merged.
 - **Deletes:** a tombstone bitmap per segment, with compaction to reclaim space.
 
 ## Roadmap
@@ -944,11 +1116,18 @@ Within a shard:
    - io_uring registered buffers;
    - F16C decoding;
    - more even partitions (split the largest k-means clusters)
-6. ◐ Collections. Done: WAL with point-in-time recovery, growing and sealed
+6. ✅ Collections: WAL with point-in-time recovery, growing and sealed
    segments, manifest commits, tombstones per row position, index builds and
-   compaction from live rows, crash-state and model tests; ingest, delete
-   and multi-segment search measured on SIFT1M. Still to do: attribute
-   filters
+   compaction from live rows, crash-state and model tests; attribute filters
+   (integer and keyword fields; eq, in, range, and, or, not) with a column
+   index per segment and a walk-or-scan choice per SSD segment; ingest,
+   delete, multi-segment and filtered search measured on SIFT1M.
+   Follow-ups:
+   - background builds and group commit (step 7);
+   - filters evaluated lazily, or as sorted lists, instead of a bitmap per
+     segment (needed for segments of 100M rows);
+   - a graph that knows the labels (per-label entry points or edges), for
+     filters whose matches lie away from the query
 7. Server and single-node mode: gRPC/HTTP API, collections, the shard
    interface, concurrent reads and writes
 8. Distributed mode: remote shards, query nodes, metadata service,

@@ -66,15 +66,26 @@ commands:
   coll-ingest  --base F --dir D [--metric l2] [--batch 1000] [--durability buffered|sync]
                [--seal-mb 32] [--index-mb 64] [--max-ssd 8] [--pq-m M] [--threads 6]
                [--build-mem 2] [--maintain false] [--optimize false] [--secs S] [--limit N]
+               [--labels false]
                create a collection in D and upsert F (ids = row numbers) through the WAL:
                rows/s and batch latency; --maintain runs index builds as they fall due,
-               --optimize merges everything into one SSD index at the end; then reopen
+               --optimize merges everything into one SSD index at the end; then reopen.
+               --labels adds int fields u (uniform 0..999) and p (bucket of a random
+               projection) for coll-filter
   coll-search  --from D0 --dir D --base F --query Q [--k 10] [--l 40,80,160] [--w 4]
                [--nq 1000] [--delete 0,0.1,0.3] [--seed 1] [--adapt true|false|both]
                [--compact false]
                copy collection D0 to D, delete random rows in stages (cumulative
                fractions), and measure recall against exact search over the live rows,
                reads and 1-thread latency; --compact runs maintain() after the last stage
+  coll-filter  --dir D --base F --query Q [--k 10] [--l 40,80,160] [--w 4] [--nq 300]
+               [--filter u,p,near] [--select 0.001,0.01,0.05,0.2,0.5] [--mode graph,scan,auto]
+               [--warm true] [--direct true]
+               search a collection made with --labels under range filters matching the
+               given fraction of rows: u = uniform labels, p = one slab of the projection
+               (matches far from most queries), near = a slab around each query's own
+               projection, none = no filter (the baseline); recall against exact search
+               over the matching rows
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
@@ -110,6 +121,7 @@ fn run() -> AnyResult<()> {
         "disk-search" => disk_search(&args),
         "coll-ingest" => coll::ingest(&args),
         "coll-search" => coll::search(&args),
+        "coll-filter" => coll::filter(&args),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }

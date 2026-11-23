@@ -5,7 +5,11 @@ use std::time::Instant;
 
 use vecdb_core::collection::NO_ATTRS;
 use vecdb_core::disk::IoMode;
-use vecdb_core::{Collection, CollectionConfig, Durability, FlatIndex, OpenOptions, SearchOptions, WriteOp};
+use vecdb_core::rng::SplitMix64;
+use vecdb_core::{
+    Attrs, Collection, CollectionConfig, Durability, Field, Filter, FilterMode, FlatIndex, Metric, OpenOptions,
+    SearchOptions, WriteOp,
+};
 
 use super::{AnyResult, Args, load_vectors, memory_usage, parse_list, progress, run_queries};
 use vecdb_core::dataset::Vecs;
@@ -30,7 +34,7 @@ fn open_options(a: &Args) -> AnyResult<OpenOptions> {
 pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     a.allow(&[
         "base", "dir", "metric", "limit", "batch", "durability", "seal-mb", "index-mb", "max-ssd", "pq-m", "threads",
-        "build-mem", "maintain", "optimize", "secs", "direct",
+        "build-mem", "maintain", "optimize", "secs", "direct", "labels",
     ])?;
     let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
     let dir = a.req_path("dir")?;
@@ -42,6 +46,13 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     if let Some(m) = a.opt_num("pq-m")? {
         cfg.index.pq_m = m;
     }
+    let with_labels: bool = a.num("labels", false)?;
+    let labels = if with_labels {
+        cfg.fields = vec![Field::int("u"), Field::int("p")];
+        Some(Labels::new(&base))
+    } else {
+        None
+    };
     let batch: usize = a.num("batch", 1000)?;
     let maintain: bool = a.num("maintain", false)?;
     let secs: f64 = a.num("secs", f64::INFINITY)?;
@@ -62,8 +73,17 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     let mut rows = 0;
     while rows < base.len() && t0.elapsed().as_secs_f64() < secs {
         let end = (rows + batch).min(base.len());
-        let ops: Vec<WriteOp> =
-            (rows..end).map(|i| WriteOp::Upsert { id: i as u64, vector: base.row(i), attrs: &NO_ATTRS }).collect();
+        let attrs: Vec<Attrs> = match &labels {
+            Some(lb) => (rows..end).map(|i| Attrs::new().int("u", lb.u[i]).int("p", lb.p[i])).collect(),
+            None => Vec::new(),
+        };
+        let ops: Vec<WriteOp> = (rows..end)
+            .map(|i| WriteOp::Upsert {
+                id: i as u64,
+                vector: base.row(i),
+                attrs: attrs.get(i - rows).unwrap_or(&NO_ATTRS),
+            })
+            .collect();
         let tb = Instant::now();
         c.write(&ops)?;
         lat.push(tb.elapsed().as_secs_f64() * 1e3);
@@ -120,6 +140,57 @@ fn print_stats(c: &Collection) {
         st.wal_bytes as f64 / 1e6,
         if segs.is_empty() { "none".into() } else { segs.join(", ") }
     );
+    let (bytes, values): (usize, usize) = st.segments.iter().map(|s| (s.attr_bytes, s.attr_values)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    if values > 0 {
+        println!(
+            "attrs    {values} values in sealed segments: {:.1} MB of columns in RAM ({:.2} bytes per value); growing {:.1} MB",
+            bytes as f64 / 1e6,
+            bytes as f64 / values as f64,
+            st.growing_attr_bytes as f64 / 1e6
+        );
+    }
+}
+
+/// Bench labels per row. "u": uniform in 0..1000, unrelated to the vector.
+/// "p": the row's bucket (0..1000) by the rank of its projection onto a
+/// fixed random direction, so rows with nearby "p" lie near each other
+/// along that direction.
+struct Labels {
+    u: Vec<i64>,
+    p: Vec<i64>,
+    dir: Vec<f32>,
+    /// The rows' projections, ascending.
+    sorted: Vec<f32>,
+}
+
+const BUCKETS: i64 = 1000;
+
+impl Labels {
+    fn new(base: &Vecs<f32>) -> Self {
+        let n = base.len();
+        let u = (0..n).map(|i| (SplitMix64::new(i as u64 ^ 0x5eed_0001).next_u64() % BUCKETS as u64) as i64).collect();
+        let mut rng = SplitMix64::new(0x5eed_0002);
+        let dir: Vec<f32> = (0..base.dim).map(|_| rng.uniform(-1.0, 1.0)).collect();
+        let proj: Vec<f32> = (0..n).map(|i| dot(base.row(i), &dir)).collect();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by(|&a, &b| proj[a as usize].total_cmp(&proj[b as usize]).then(a.cmp(&b)));
+        let mut p = vec![0i64; n];
+        for (r, &i) in order.iter().enumerate() {
+            p[i as usize] = r as i64 * BUCKETS / n as i64;
+        }
+        let sorted = order.iter().map(|&i| proj[i as usize]).collect();
+        Self { u, p, dir, sorted }
+    }
+
+    /// The bucket a query falls in.
+    fn bucket(&self, q: &[f32]) -> i64 {
+        let r = self.sorted.partition_point(|&x| x < dot(q, &self.dir));
+        (r as i64 * BUCKETS / self.sorted.len() as i64).min(BUCKETS - 1)
+    }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    (vecdb_core::kernels::best().dot)(a, b)
 }
 
 fn copy_dir(from: &Path, to: &Path) -> AnyResult<()> {
@@ -210,7 +281,7 @@ pub(crate) fn search(a: &Args) -> AnyResult<()> {
         }
         for &ad in &adapt {
             for &l in &ls {
-                let so = SearchOptions { l, beam_width: w, rerank: 0, adapt_l: ad };
+                let so = SearchOptions { l, beam_width: w, rerank: 0, adapt_l: ad, ..Default::default() };
                 let t0 = Instant::now();
                 let mut lat = Vec::with_capacity(queries.len());
                 let (mut hits, mut reads, mut rounds, mut expanded, mut scanned) = (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -244,5 +315,152 @@ pub(crate) fn search(a: &Args) -> AnyResult<()> {
     }
     drop(c);
     std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// One filter of the coll-filter sweep, for one query: buckets `lo..=hi`
+/// of label "u" or "p".
+fn bench_filter(kind: &str, width: i64, q: &[f32], lb: &Labels) -> AnyResult<(&'static str, i64, i64)> {
+    Ok(match kind {
+        // Uniform labels: matches spread over the whole space.
+        "u" => ("u", 0, width - 1),
+        // A fixed slab at one end of the projection: matches far from most
+        // queries (the hard case for a graph walk).
+        "p" => ("p", 0, width - 1),
+        // A slab around the query's own projection: matches near it.
+        "near" => {
+            let lo = (lb.bucket(q) - width / 2).clamp(0, BUCKETS - width);
+            ("p", lo, lo + width - 1)
+        }
+        k => return Err(format!("unknown --filter {k:?} (none, u, p, near)").into()),
+    })
+}
+
+/// coll-filter: searches a collection ingested with --labels under filters
+/// of growing selectivity, in each filter mode, against exact search over
+/// the matching rows.
+pub(crate) fn filter(a: &Args) -> AnyResult<()> {
+    a.allow(&["dir", "base", "query", "k", "l", "w", "nq", "filter", "select", "mode", "threads", "direct", "limit", "warm"])?;
+    let dir = a.req_path("dir")?;
+    let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
+    let queries = load_vectors(&a.req_path("query")?, Some(a.num("nq", 300)?))?;
+    let k: usize = a.num("k", 10)?;
+    let ls: Vec<usize> = parse_list(a, "l", "40,80,160")?;
+    let w: usize = a.num("w", 4)?;
+    let kinds: Vec<String> = parse_list(a, "filter", "u,p,near")?;
+    let selects: Vec<f64> = parse_list(a, "select", "0.001,0.01,0.05,0.2,0.5")?;
+    let modes: Vec<FilterMode> = parse_list::<String>(a, "mode", "graph,scan,auto")?
+        .iter()
+        .map(|m| match m.as_str() {
+            "graph" => Ok(FilterMode::Graph),
+            "scan" => Ok(FilterMode::Scan),
+            "auto" => Ok(FilterMode::Auto),
+            m => Err(format!("unknown --mode {m:?}")),
+        })
+        .collect::<Result<_, _>>()?;
+    let warm: bool = a.num("warm", true)?;
+    let (c, _) = Collection::open(&dir, open_options(a)?)?;
+    print_stats(&c);
+    if c.config().metric != Metric::L2 {
+        return Err("coll-filter computes ground truth for l2 only".into());
+    }
+    let lb = Labels::new(&base);
+    let kern = vecdb_core::kernels::best();
+    let threads: usize = a.num("threads", 6)?;
+    println!("  filter  select  mode     L  recall@{k}  matched/q  reads/q  rounds/q   pq/q  fallback  mean ms  p50 ms  p99 ms");
+    for kind in &kinds {
+        // "none": no filter, the baseline (once, whatever --select says).
+        let none = kind == "none";
+        let selects = if none { vec![1.0] } else { selects.clone() };
+        for &sel in &selects {
+            let width = ((sel * BUCKETS as f64).round() as i64).clamp(1, BUCKETS);
+            let filters: Vec<Option<Filter>> = (0..queries.len())
+                .map(|i| match none {
+                    true => Ok(None),
+                    false => bench_filter(kind, width, queries.row(i), &lb).map(|(f, lo, hi)| Some(Filter::range(f, lo..=hi))),
+                })
+                .collect::<AnyResult<_>>()?;
+            // Exact top-k over the matching rows, per query (threads).
+            let label = if kind == "u" { &lb.u } else { &lb.p };
+            let nq = queries.len();
+            let per = nq.div_ceil(threads);
+            let gt: Vec<Vec<u64>> = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let (filters, label) = (&filters, label);
+                        let base = &base;
+                        let queries = &queries;
+                        s.spawn(move || {
+                            (t * per..((t + 1) * per).min(nq))
+                                .map(|qi| {
+                                    let (min, max) = match &filters[qi] {
+                                        Some(Filter::Range { min, max, .. }) => (*min, *max),
+                                        None => (i64::MIN, i64::MAX),
+                                        Some(_) => unreachable!(),
+                                    };
+                                    let q = queries.row(qi);
+                                    let mut top = vecdb_core::topk::TopK::new(k);
+                                    for (i, &v) in label.iter().enumerate() {
+                                        if (min..=max).contains(&v) {
+                                            top.push(i as u64, (kern.l2_squared)(q, base.row(i)));
+                                        }
+                                    }
+                                    top.into_sorted().into_iter().map(|r| r.id).collect::<Vec<u64>>()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                hs.into_iter().flat_map(|h| h.join().expect("ground truth thread")).collect()
+            });
+            if warm {
+                let l = *ls.iter().max().unwrap_or(&100);
+                for mode in [FilterMode::Graph, FilterMode::Scan] {
+                    for (i, f) in filters.iter().enumerate() {
+                        let so = SearchOptions { l, beam_width: w, filter: f.clone(), filter_mode: mode, ..Default::default() };
+                        c.search_with_stats(queries.row(i), k, &so)?;
+                    }
+                }
+            }
+            for &mode in &modes {
+                for &l in &ls {
+                    let mut lat = Vec::with_capacity(nq);
+                    let (mut hits, mut want_n) = (0usize, 0usize);
+                    let mut tot = vecdb_core::collection::SearchStats::default();
+                    let t0 = Instant::now();
+                    for (i, want) in gt.iter().enumerate() {
+                        let so = SearchOptions { l, beam_width: w, filter: filters[i].clone(), filter_mode: mode, ..Default::default() };
+                        let tq = Instant::now();
+                        let (res, st) = c.search_with_stats(queries.row(i), k, &so)?;
+                        lat.push(tq.elapsed().as_secs_f64() * 1e3);
+                        hits += res.iter().filter(|r| want.contains(&r.id)).count();
+                        want_n += want.len();
+                        tot.matched += st.matched;
+                        tot.reads += st.reads;
+                        tot.rounds += st.rounds;
+                        tot.pq_scanned += st.pq_scanned;
+                        tot.fallbacks += st.fallbacks;
+                    }
+                    let total = t0.elapsed().as_secs_f64();
+                    lat.sort_by(f64::total_cmp);
+                    let pct = |p: f64| lat[((p / 100.0) * (lat.len() - 1) as f64).round() as usize];
+                    let q = nq as f64;
+                    println!(
+                        "  {kind:6}  {sel:6}  {:6} {l:4}  {:9.4}  {:9.0}  {:7.1}  {:8.1}  {:5.0}  {:8.2}  {:7.3}  {:6.3}  {:6.3}",
+                        format!("{mode:?}").to_lowercase(),
+                        hits as f64 / want_n.max(1) as f64,
+                        tot.matched as f64 / q,
+                        tot.reads as f64 / q,
+                        tot.rounds as f64 / q,
+                        tot.pq_scanned as f64 / q,
+                        tot.fallbacks as f64 / q,
+                        total * 1e3 / q,
+                        pct(50.0),
+                        pct(99.0),
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }

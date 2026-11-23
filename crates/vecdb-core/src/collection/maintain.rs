@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::manifest::{SegmentEntry, SegmentKind};
-use super::segment::{AttrTable, Body, Sealed, attrs_name, del_name, disk_name, flat_name};
+use super::columns::AttrWriter;
+use super::segment::{Body, Sealed, attrs_name, del_name, disk_name, flat_name};
 use super::{Collection, CollectionConfig};
 use crate::dataset::VectorSource;
 use crate::disk::{DiskIndex, DiskOpenOptions, DiskWriteOptions, MergePrune, PartitionedBuildParams};
@@ -118,7 +119,6 @@ impl Collection {
             rows.extend((0..s.positions()).filter(|&p| !s.tomb.is_set(p)).map(|p| (j as u32, p as u32)));
         }
         let ids: Vec<u64> = rows.iter().map(|&(j, p)| segs[j as usize].id_at(p as usize)).collect();
-        let attrs_of = |&(j, p): &(u32, u32)| segs[j as usize].attrs.rows.get(p as usize).cloned().unwrap_or_default();
 
         let mut m = self.manifest.clone();
         m.generation += 1;
@@ -130,7 +130,8 @@ impl Collection {
                 let id = m.next_segment;
                 m.next_segment += 1;
                 let src = LiveRows::new(&segs, &rows, cfg.dim)?;
-                let mut attrs = AttrTable::default();
+                // For each position of the new segment, its entry in `rows`.
+                let order: Vec<usize>;
                 let sealed = if rows.len() < MIN_SSD_ROWS {
                     let mut store = InMemoryStore::with_capacity(cfg.dim, rows.len())?;
                     let mut v = vec![0.0f32; cfg.dim];
@@ -141,10 +142,8 @@ impl Collection {
                     let path = self.dir.join(flat_name(id));
                     created.push(path.clone());
                     write_flat_segment(&path, cfg.metric, &store)?;
-                    if !cfg.fields.is_empty() {
-                        attrs.rows = rows.iter().map(attrs_of).collect();
-                    }
-                    Sealed::flat(id, store, AttrTable::default(), vec![path])
+                    order = (0..rows.len()).collect();
+                    Sealed::flat(id, store, None, vec![path])
                 } else {
                     let path = self.dir.join(disk_name(id));
                     created.push(path.clone());
@@ -152,20 +151,36 @@ impl Collection {
                     DiskIndex::build_partitioned(&src, Some(&ids), cfg.metric, &path, &params)?;
                     let index =
                         DiskIndex::open(&path, &DiskOpenOptions { direct: self.opts.direct_io, io: self.opts.io })?;
-                    if !cfg.fields.is_empty() {
-                        // The index orders ids by node: write attributes in its order.
+                    order = if cfg.fields.is_empty() {
+                        Vec::new()
+                    } else {
+                        // The index orders ids by node.
                         let row_of: HashMap<u64, usize> = ids.iter().enumerate().map(|(r, &id)| (id, r)).collect();
-                        attrs.rows = (0..index.len()).map(|p| attrs_of(&rows[row_of[&index.id_at(p)]])).collect();
-                    }
-                    Sealed::disk(id, index, AttrTable::default(), vec![path])
+                        (0..index.len()).map(|p| row_of[&index.id_at(p)]).collect()
+                    };
+                    Sealed::disk(id, index, None, vec![path])
                 };
                 let mut sealed = sealed;
                 if !cfg.fields.is_empty() {
+                    // Rows are copied in each input's file order; only the
+                    // offsets table follows the new positions.
+                    let mut new_pos: Vec<Vec<u32>> = segs.iter().map(|s| vec![u32::MAX; s.positions()]).collect();
+                    for (np, &r) in order.iter().enumerate() {
+                        let (j, p) = rows[r];
+                        new_pos[j as usize][p as usize] = np as u32;
+                    }
                     let ap = self.dir.join(attrs_name(id));
                     created.push(ap.clone());
-                    attrs.write(&ap)?;
+                    let mut w = AttrWriter::create(&ap, &cfg.fields, order.len())?;
+                    for (j, s) in segs.iter().enumerate() {
+                        let a = s.attrs.as_ref().expect("segments of a collection with fields have attributes");
+                        a.for_each_row(|p, row| match new_pos[j][p] {
+                            u32::MAX => Ok(()),
+                            np => w.push(np as usize, row),
+                        })?;
+                    }
+                    sealed.attrs = Some(w.finish()?);
                     sealed.files.push(ap);
-                    sealed.attrs = attrs;
                 }
                 Some(sealed)
             };

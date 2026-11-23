@@ -184,6 +184,8 @@ pub struct DiskIndex {
     /// node has exactly one id (then node `i` holds `ids[i]`).
     id_start: Vec<u64>,
     ids: Vec<u64>,
+    /// The nodes that hold several positions; see [`multi_nodes`].
+    multi: Vec<MultiNode>,
     /// Records of hot nodes, already verified.
     cache: HashMap<u32, Box<[u8]>>,
     io_mode: IoMode,
@@ -253,6 +255,7 @@ impl DiskIndex {
         }
         drop_cache(&meta);
         drop(meta);
+        let multi = multi_nodes(&id_start);
 
         let file = DataFile::open(path, opts.direct)?;
         Ok(Self {
@@ -265,6 +268,7 @@ impl DiskIndex {
             codes,
             id_start,
             ids,
+            multi,
             cache: HashMap::new(),
             io_mode: opts.io,
         })
@@ -333,7 +337,10 @@ impl DiskIndex {
 
     /// RAM held by the index: (codebooks + codes + ids, node cache).
     pub fn ram_bytes(&self) -> (usize, usize) {
-        let base = self.pq.codebooks().len() * 4 + self.codes.len() + (self.ids.len() + self.id_start.len()) * 8;
+        let base = self.pq.codebooks().len() * 4
+            + self.codes.len()
+            + (self.ids.len() + self.id_start.len()) * 8
+            + self.multi.len() * std::mem::size_of::<MultiNode>();
         let cache = self.cache.values().map(|r| r.len() + 32).sum();
         (base, cache)
     }
@@ -363,7 +370,7 @@ impl DiskIndex {
 
     /// The node that holds position `pos`.
     pub fn node_of(&self, pos: usize) -> u32 {
-        if self.id_start.is_empty() { pos as u32 } else { (self.id_start.partition_point(|&s| s as usize <= pos) - 1) as u32 }
+        node_at(&self.multi, pos, 0).0
     }
 
     /// Reads the stored vectors of nodes `first..first + out.len() / dim()`
@@ -472,18 +479,190 @@ impl DiskIndex {
         params: &DiskSearchParams,
         admit: &dyn Fn(usize) -> bool,
     ) -> Result<(Vec<SearchResult>, DiskSearchStats)> {
+        self.with_context(|ctx| self.search_filtered_with(ctx, query, k, params, admit))
+    }
+
+    /// Like [`search_subset_with`](Self::search_subset_with), with a
+    /// context kept per thread.
+    pub fn search_subset(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidates: usize,
+        positions: &mut dyn Iterator<Item = usize>,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<(Vec<SearchResult>, DiskSearchStats)> {
+        self.with_context(|ctx| self.search_subset_with(ctx, query, k, candidates, positions, admit))
+    }
+
+    /// Runs `f` with this thread's search context.
+    fn with_context<T>(&self, f: impl FnOnce(&mut SearchContext) -> Result<T>) -> Result<T> {
         CONTEXT.with_borrow_mut(|slot| {
             if slot.as_ref().is_none_or(|c| c.mode != self.io_mode) {
                 *slot = Some(self.context()?);
             }
             let ctx = slot.as_mut().expect("set above");
-            let result = self.search_filtered_with(ctx, query, k, params, admit);
+            let result = f(ctx);
             if matches!(result, Err(Error::Io(_))) {
                 // Start the next search with a fresh ring and buffers.
                 *slot = None;
             }
             result
         })
+    }
+
+    /// The `k` nearest among the positions `positions` yields (ascending)
+    /// that `admit` accepts, without the graph: for a filter that admits
+    /// few rows. Every node holding such a position is scored by PQ in RAM;
+    /// the `candidates` nearest (at least `k`) are read and scored exactly.
+    /// With no more nodes than that, PQ is skipped and all are read.
+    pub fn search_subset_with(
+        &self,
+        ctx: &mut SearchContext,
+        query: &[f32],
+        k: usize,
+        candidates: usize,
+        positions: &mut dyn Iterator<Item = usize>,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<(Vec<SearchResult>, DiskSearchStats)> {
+        if query.len() != self.dim() {
+            return Err(Error::DimensionMismatch { expected: self.dim(), got: query.len() });
+        }
+        check_finite(query)?;
+        let mut st = DiskSearchStats::default();
+        if k == 0 {
+            return Ok((Vec::new(), st));
+        }
+        let mut q = query.to_vec();
+        if self.metric().needs_normalization() {
+            normalize(&mut q);
+        }
+        let kern = kernels::best();
+        ctx.reader.reserve(self.geo.max_read());
+        ctx.vector.resize(self.dim(), 0.0);
+
+        // The nodes, ascending.
+        let nodes = &mut ctx.fresh;
+        nodes.clear();
+        let mut cursor = 0;
+        for pos in positions {
+            if pos >= self.len() {
+                return Err(Error::InvalidArgument(format!("position {pos} out of range")));
+            }
+            let n;
+            (n, cursor) = node_at(&self.multi, pos, cursor);
+            if nodes.last().is_some_and(|&l| l > n) {
+                return Err(Error::InvalidArgument("positions must ascend".into()));
+            }
+            if nodes.last() != Some(&n) {
+                nodes.push(n);
+            }
+        }
+        st.admitted = nodes.len();
+        let picked = &mut ctx.picked;
+        picked.clear();
+        let cand = candidates.max(k);
+        if nodes.len() > cand {
+            let table = self.pq.distance_table(self.metric(), &q);
+            // Codes of scattered nodes come from RAM: ask for them early.
+            const AHEAD: usize = 8;
+            for (i, &n) in nodes.iter().enumerate() {
+                if let Some(&next) = nodes.get(i + AHEAD) {
+                    kernels::prefetch(self.code(next));
+                }
+                picked.push((table.distance(self.code(n)), n));
+            }
+            st.pq_distances = nodes.len();
+            picked.select_nth_unstable_by(cand - 1, |a, b| order(a.0, a.1, b.0, b.1));
+            picked.truncate(cand);
+            picked.sort_unstable_by_key(|p| p.1);
+        } else {
+            picked.extend(nodes.iter().map(|&n| (0.0, n)));
+        }
+        let mut top = TopK::new(k);
+        self.score_picked(ctx, kern, &q, admit, &mut top, &mut st)?;
+        Ok((top.into_sorted(), st))
+    }
+
+    /// Reads the records (and, separate layout, vectors) of the nodes in
+    /// `ctx.picked` (ascending), up to `DEPTH` reads at a time, nodes that
+    /// share a block with one read, and pushes their admitted ids.
+    fn score_picked(
+        &self,
+        ctx: &mut SearchContext,
+        kern: &Kernels,
+        q: &[f32],
+        admit: &dyn Fn(usize) -> bool,
+        top: &mut TopK,
+        st: &mut DiskSearchStats,
+    ) -> Result<()> {
+        let SearchContext { reader, picked, slots, reqs, vector, .. } = ctx;
+        let separate = self.layout() == Layout::Separate;
+        let vbb = self.geo.vector_block_bytes;
+        let vbase = self.header.sections[VECTORS].offset;
+        let mut i = 0;
+        while i < picked.len() {
+            reqs.clear();
+            slots.clear();
+            let start = i;
+            let (mut last_block, mut last_req) = (u64::MAX, usize::MAX);
+            while i < picked.len() {
+                let node = picked[i].1;
+                let cached = !self.cache.is_empty() && self.cache.contains_key(&node);
+                let block = self.block_offset(node);
+                let need = usize::from(!cached && block != last_block) + usize::from(separate);
+                if reqs.len() + need > DEPTH {
+                    break;
+                }
+                let g = if cached {
+                    usize::MAX
+                } else {
+                    if block != last_block {
+                        last_block = block;
+                        last_req = reqs.len();
+                        reqs.push((block, self.geo.block_bytes));
+                    }
+                    last_req
+                };
+                let v = if separate {
+                    reqs.push((vbase + node as u64 * vbb as u64, vbb));
+                    reqs.len() - 1
+                } else {
+                    usize::MAX
+                };
+                slots.push(g);
+                slots.push(v);
+                i += 1;
+            }
+            if !reqs.is_empty() {
+                reader.read(&self.file, reqs)?;
+                st.rounds += 1;
+                st.reads += reqs.len();
+                st.read_bytes += reqs.iter().map(|r| r.1).sum::<usize>();
+            }
+            for (t, &(_, node)) in picked[start..i].iter().enumerate() {
+                let (g, v) = (slots[2 * t], slots[2 * t + 1]);
+                let rec = match g {
+                    usize::MAX => &self.cache[&node][..],
+                    s => self.record_in(reader.slot(s), node),
+                };
+                let r = self.parse(node, rec)?;
+                let bytes = if separate {
+                    let b = &reader.slot(v)[..self.geo.vector_bytes];
+                    if crc32c(b) != r.vector_crc {
+                        return Err(Error::Corrupt(format!("vector of node {node} failed its checksum")));
+                    }
+                    b
+                } else {
+                    r.vector
+                };
+                decode_vector(self.codec(), bytes, vector);
+                let d = self.exact(kern, q, vector);
+                st.exact_distances += 1;
+                self.positions_of(node).filter(|&p| admit(p)).for_each(|p| top.push(self.ids[p], d));
+            }
+        }
+        Ok(())
     }
 
     /// The `k` nearest vectors found, closest first, with exact distances
@@ -792,6 +971,45 @@ impl DiskIndex {
     }
 }
 
+/// A node that holds several positions (identical vectors): its first
+/// position, how many it holds, and the extra positions (beyond one per
+/// node) of the nodes before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MultiNode {
+    first: u64,
+    count: u64,
+    extra_before: u64,
+}
+
+/// The nodes of id table `start` that hold more than one position. Most
+/// nodes hold one, so this list is short, and a position's node follows
+/// from it without touching the id table (see [`node_at`]).
+fn multi_nodes(start: &[u64]) -> Vec<MultiNode> {
+    let mut out = Vec::new();
+    let mut extra = 0;
+    for w in start.windows(2) {
+        let count = w[1] - w[0];
+        if count > 1 {
+            out.push(MultiNode { first: w[0], count, extra_before: extra });
+            extra += count - 1;
+        }
+    }
+    out
+}
+
+/// The node holding position `pos`, and a cursor for the next lookup:
+/// with ascending positions, pass the cursor back as `from` (0 to start).
+fn node_at(multi: &[MultiNode], pos: usize, from: usize) -> (u32, usize) {
+    let p = pos as u64;
+    let j = from + multi[from..].partition_point(|m| m.first <= p);
+    if j == 0 {
+        return (pos as u32, 0);
+    }
+    let m = multi[j - 1];
+    let node = if p < m.first + m.count { m.first - m.extra_before } else { p - m.extra_before - (m.count - 1) };
+    (node as u32, j - 1)
+}
+
 /// Reads a RAM section and checks its CRC.
 fn read_section(f: &File, h: &Header, i: usize) -> Result<Vec<u8>> {
     let s = h.sections[i];
@@ -809,6 +1027,30 @@ fn read_section(f: &File, h: &Header, i: usize) -> Result<Vec<u8>> {
 
 fn read_u64s(f: &File, h: &Header, i: usize) -> Result<Vec<u64>> {
     Ok(read_section(f, h, i)?.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect())
+}
+
+#[cfg(test)]
+#[test]
+fn positions_map_to_their_nodes() {
+    // Nodes hold 1, 3, 1, 1, 2, 1, 4 and 1 positions.
+    let counts = [1u64, 3, 1, 1, 2, 1, 4, 1];
+    let mut start = vec![0u64];
+    counts.iter().for_each(|c| start.push(start.last().unwrap() + c));
+    let multi = multi_nodes(&start);
+    assert_eq!(multi.len(), 3);
+    let holder = |pos: u64| (0..counts.len()).find(|&i| (start[i]..start[i + 1]).contains(&pos)).unwrap() as u32;
+    let total = *start.last().unwrap() as usize;
+    // Every position from a fresh cursor, and an ascending walk with one.
+    let mut cursor = 0;
+    for pos in 0..total {
+        assert_eq!(node_at(&multi, pos, 0).0, holder(pos as u64), "pos {pos}");
+        let n;
+        (n, cursor) = node_at(&multi, pos, cursor);
+        assert_eq!(n, holder(pos as u64), "pos {pos} from the cursor");
+    }
+    // No identical vectors: position = node.
+    assert!(multi_nodes(&[]).is_empty());
+    assert_eq!(node_at(&[], 12, 0).0, 12);
 }
 
 /// A fresh directory for one test's files (removed first if it exists).

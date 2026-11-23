@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::bytes::{Dec, Enc, write_file};
-use super::meta::Attrs;
+use super::columns::{ColumnBuilder, SegmentAttrs};
+use super::meta::Field;
 use crate::disk::DiskIndex;
 use crate::distance::Metric;
 use crate::error::{Error, Result};
@@ -115,56 +116,10 @@ impl Tombstones {
     }
 }
 
-/// Attributes per position, as stored in `seg-*.attrs`. Kept only when the
-/// collection declares fields.
-#[derive(Default)]
-pub(crate) struct AttrTable {
-    pub rows: Vec<Attrs>,
-}
-
-const ATTR_MAGIC: [u8; 8] = *b"VECDBATR";
-const ATTR_VERSION: u32 = 1;
-
-impl AttrTable {
-    pub fn write(&self, path: &Path) -> Result<()> {
-        let mut e = Enc::default();
-        e.buf.extend_from_slice(&ATTR_MAGIC);
-        e.u32(ATTR_VERSION);
-        e.u64(self.rows.len() as u64);
-        for a in &self.rows {
-            e.u32(a.encoded_len() as u32);
-            a.encode(&mut e);
-        }
-        e.crc();
-        write_file(path, &e.buf, false)
-    }
-
-    pub fn read(path: &Path, positions: usize) -> Result<Self> {
-        let bytes = std::fs::read(path)?;
-        let mut d = Dec::checked(&bytes, "attribute file")?;
-        if d.take(8)? != ATTR_MAGIC {
-            return Err(d.corrupt("bad magic"));
-        }
-        let version = d.u32()?;
-        if version != ATTR_VERSION {
-            return Err(Error::Unsupported(format!("attribute file version {version}")));
-        }
-        if d.u64()? != positions as u64 {
-            return Err(d.corrupt("row count does not match the segment"));
-        }
-        let mut rows = Vec::with_capacity(positions);
-        for _ in 0..positions {
-            let n = d.u32()? as usize;
-            rows.push(Attrs::decode(d.take(n)?)?);
-        }
-        d.done()?;
-        Ok(Self { rows })
-    }
-}
-
 /// Exact distances from a prepared query to `rows` (row-major, prepared),
 /// a block at a time with the batch kernels; calls `push(row, distance)`
-/// for every row `admit` accepts.
+/// for every row `admit` accepts. Blocks where few rows are admitted (a
+/// selective filter) are scored row by row. Returns the rows scored.
 pub(crate) fn scan(
     kern: &Kernels,
     metric: Metric,
@@ -172,15 +127,34 @@ pub(crate) fn scan(
     rows: &[f32],
     admit: impl Fn(usize) -> bool,
     mut push: impl FnMut(usize, f32),
-) {
+) -> usize {
     const BLOCK: usize = 256;
+    /// Below this many admitted rows a block is scored row by row.
+    const SPARSE: usize = BLOCK / 8;
     let dim = q.len();
     let n = rows.len() / dim;
     let mut out = [0.0f32; BLOCK];
+    let finish = |raw: f32| match metric {
+        Metric::L2 => raw,
+        Metric::InnerProduct => -raw,
+        Metric::Cosine => 1.0 - raw,
+    };
+    let mut scored = 0;
     let mut start = 0;
     while start < n {
         let end = (start + BLOCK).min(n);
-        if (start..end).any(&admit) {
+        let admitted = (start..end).filter(|&r| admit(r)).count();
+        if admitted == 0 {
+        } else if admitted < SPARSE {
+            for r in (start..end).filter(|&r| admit(r)) {
+                let v = &rows[r * dim..(r + 1) * dim];
+                let raw = match metric {
+                    Metric::L2 => (kern.l2_squared)(q, v),
+                    Metric::InnerProduct | Metric::Cosine => (kern.dot)(q, v),
+                };
+                push(r, finish(raw));
+            }
+        } else {
             let o = &mut out[..end - start];
             match metric {
                 Metric::L2 => (kern.l2_squared_batch)(q, &rows[start * dim..end * dim], o),
@@ -188,17 +162,14 @@ pub(crate) fn scan(
             }
             for (j, &raw) in o.iter().enumerate() {
                 if admit(start + j) {
-                    let d = match metric {
-                        Metric::L2 => raw,
-                        Metric::InnerProduct => -raw,
-                        Metric::Cosine => 1.0 - raw,
-                    };
-                    push(start + j, d);
+                    push(start + j, finish(raw));
                 }
             }
         }
+        scored += admitted;
         start = end;
     }
+    scored
 }
 
 /// The growing segment: new rows in RAM, searched exactly. Deleted and
@@ -208,8 +179,13 @@ pub(crate) struct Growing {
     pub ids: Vec<u64>,
     /// Prepared vectors, row-major.
     pub data: Vec<f32>,
-    /// Per row, when the collection has fields.
-    pub attrs: Vec<Attrs>,
+    /// Encoded attributes (see `columns`): row `r` is
+    /// `attr_bytes[attr_off[r]..attr_off[r + 1]]`. Kept only when the
+    /// collection has fields, as is the column index.
+    attr_bytes: Vec<u8>,
+    attr_off: Vec<usize>,
+    pub cols: Option<ColumnBuilder>,
+    fields: Vec<Field>,
     dead: Vec<bool>,
     dead_count: usize,
     /// Live id -> row.
@@ -217,16 +193,32 @@ pub(crate) struct Growing {
 }
 
 impl Growing {
-    pub fn new(dim: usize) -> Self {
+    pub fn new(dim: usize, fields: &[Field]) -> Self {
         Self {
             dim,
             ids: Vec::new(),
             data: Vec::new(),
-            attrs: Vec::new(),
+            attr_bytes: Vec::new(),
+            attr_off: vec![0],
+            cols: (!fields.is_empty()).then(|| ColumnBuilder::new(fields)),
+            fields: fields.to_vec(),
             dead: Vec::new(),
             dead_count: 0,
             rows: HashMap::new(),
         }
+    }
+
+    /// Encoded attributes of `row` (empty without fields).
+    pub fn attrs(&self, row: usize) -> &[u8] {
+        if self.cols.is_none() {
+            return &[];
+        }
+        &self.attr_bytes[self.attr_off[row]..self.attr_off[row + 1]]
+    }
+
+    /// RAM held by attributes and their index.
+    pub fn attr_ram(&self) -> usize {
+        self.attr_bytes.capacity() + self.attr_off.capacity() * 8 + self.cols.as_ref().map_or(0, |c| c.ram_bytes())
     }
 
     /// Rows, live or dead.
@@ -252,14 +244,18 @@ impl Growing {
         self.dead[row]
     }
 
-    /// Appends a row; the id must not be live here.
-    pub fn push(&mut self, id: u64, prepared: &[f32], attrs: Option<Attrs>) {
+    /// Appends a row; the id must not be live here. `attrs` is the row's
+    /// encoded attributes (ignored without fields).
+    pub fn push(&mut self, id: u64, prepared: &[f32], attrs: &[u8]) {
         debug_assert!(!self.rows.contains_key(&id));
-        self.rows.insert(id, self.ids.len());
+        let row = self.ids.len();
+        self.rows.insert(id, row);
         self.ids.push(id);
         self.data.extend_from_slice(prepared);
-        if let Some(a) = attrs {
-            self.attrs.push(a);
+        if let Some(cols) = &mut self.cols {
+            cols.add(row, attrs, &self.fields).expect("rows are encoded by encode_row");
+            self.attr_bytes.extend_from_slice(attrs);
+            self.attr_off.push(self.attr_bytes.len());
         }
         self.dead.push(false);
     }
@@ -292,18 +288,19 @@ pub(crate) struct Sealed {
     pub id: u64,
     pub body: Body,
     pub tomb: Tombstones,
-    pub attrs: AttrTable,
+    /// When the collection has fields.
+    pub attrs: Option<SegmentAttrs>,
     /// The files that make up the segment (not its tombstone file).
     pub files: Vec<PathBuf>,
 }
 
 impl Sealed {
-    pub fn flat(id: u64, store: InMemoryStore, attrs: AttrTable, files: Vec<PathBuf>) -> Self {
+    pub fn flat(id: u64, store: InMemoryStore, attrs: Option<SegmentAttrs>, files: Vec<PathBuf>) -> Self {
         let tomb = Tombstones::new(store.len());
         Self { id, body: Body::Flat(store), tomb, attrs, files }
     }
 
-    pub fn disk(id: u64, index: DiskIndex, attrs: AttrTable, files: Vec<PathBuf>) -> Self {
+    pub fn disk(id: u64, index: DiskIndex, attrs: Option<SegmentAttrs>, files: Vec<PathBuf>) -> Self {
         let mut by_id: Vec<u32> = (0..index.len() as u32).collect();
         by_id.sort_unstable_by_key(|&p| index.id_at(p as usize));
         let tomb = Tombstones::new(index.len());
@@ -338,6 +335,16 @@ impl Sealed {
             }
         };
         (!self.tomb.is_set(pos)).then_some(pos)
+    }
+
+    /// Positions not deleted, as a bitmap of `positions()` bits.
+    pub fn remove_deleted(&self, b: &mut super::bitmap::Bitmap) {
+        b.and_not_words(self.tomb.words.iter().map(|w| w.load(Ordering::Relaxed)));
+    }
+
+    /// RAM held by the attribute columns.
+    pub fn attr_ram(&self) -> usize {
+        self.attrs.as_ref().map_or(0, |a| a.columns.ram_bytes())
     }
 
     /// Bytes of RAM beyond the index itself: tombstones and the id lookup.

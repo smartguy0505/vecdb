@@ -8,7 +8,8 @@
 //!       wal-<gen>.log            writes since the last flush
 //!       seg-<id>.flat            sealed segment: ids + prepared vectors, searched exactly
 //!       seg-<id>.vdx             sealed segment: SSD index (PQ in RAM, graph + vectors on SSD)
-//!       seg-<id>.attrs           attributes per row (when the collection declares fields)
+//!       seg-<id>.attrs           attributes: rows, and the column index filters read
+//!                                (when the collection declares fields)
 //!       seg-<id>.del-<gen>       tombstones: the segment's deleted rows
 //! ```
 //!
@@ -30,6 +31,18 @@
 //! **Read path.** A search runs on every segment and merges the top-k lists.
 //! Every segment returns exact distances, so they compare directly.
 //!
+//! **Filters.** A search may carry a [`Filter`] on the declared fields.
+//! Each segment keeps a column index of its attributes in RAM (keyword
+//! postings, sorted integer values; see `columns`), and evaluates the
+//! filter to a bitmap of matching positions, less its deleted ones. RAM
+//! segments then score only those rows. An SSD segment either walks its
+//! graph returning only matching rows, with the candidate list scaled by
+//! 1 / (fraction matching), or scans: PQ distances to every matching row
+//! from the codes in RAM, then the best `l` re-ranked from SSD
+//! ([`FilterMode`]). `Auto` picks by the number of matching rows, and falls
+//! back to the scan when a walk meets too few matching nodes, as it does
+//! when the matches lie away from the query.
+//!
 //! **Crash safety.** Files are written under new names, fsynced, then
 //! committed by renaming the manifest into place; the old WAL is removed only
 //! after that. Opening replays the WAL on top of the manifest's state and
@@ -40,7 +53,10 @@
 //! `Arc` and only their tombstones change (atomically), so a later version
 //! can search a snapshot of the segment list while a writer works.
 
+mod bitmap;
 mod bytes;
+mod columns;
+pub mod filter;
 mod maintain;
 mod manifest;
 pub mod meta;
@@ -61,9 +77,13 @@ use crate::quant::Codec;
 use crate::store::{VectorStore, check_dim};
 use crate::topk::{SearchResult, TopK};
 use manifest::{MANIFEST, Manifest, SegmentEntry, SegmentKind};
-use segment::{AttrTable, Body, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
+use bitmap::Bitmap;
+use columns::{AttrWriter, SegmentAttrs, decode_row, encode_row};
+use filter::Compiled;
+use segment::{Body, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
 use wal::{LoggedOp, Wal, wal_name};
 
+pub use filter::Filter;
 pub use maintain::{JobReport, MIN_SSD_ROWS};
 pub use meta::{Attrs, Field, FieldType, NO_ATTRS, Value};
 pub use wal::ReplayReport;
@@ -222,20 +242,41 @@ pub enum WriteOp<'a> {
 #[derive(Clone, Debug)]
 pub struct SearchOptions {
     /// Candidate list size per SSD segment (raised for segments with many
-    /// deleted rows).
+    /// deleted or filtered-out rows); also the rows re-ranked exactly when
+    /// a filter scans a segment.
     pub l: usize,
     pub beam_width: usize,
     /// Separate layout: vectors re-ranked per segment; 0 = all expanded.
     pub rerank: usize,
-    /// Scale `l` by 1 / (fraction of a segment's rows not deleted), up to
-    /// 8x: deleted nodes still take places in the candidate list.
+    /// Scale `l` by 1 / (fraction of a segment's rows that can be
+    /// returned: not deleted, and matching the filter), up to 8x for
+    /// deletes and 16x under a filter: the other nodes still take places in
+    /// the candidate list. Off, the walk keeps `l` (and `Auto` still picks
+    /// between walk and scan as if it were on).
     pub adapt_l: bool,
+    /// Only rows that match.
+    pub filter: Option<Filter>,
+    /// How SSD segments are searched under a filter.
+    pub filter_mode: FilterMode,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
-        Self { l: 100, beam_width: 4, rerank: 0, adapt_l: true }
+        Self { l: 100, beam_width: 4, rerank: 0, adapt_l: true, filter: None, filter_mode: FilterMode::Auto }
     }
+}
+
+/// How an SSD segment is searched under a filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterMode {
+    /// Whichever is expected to be cheaper, with a scan when the walk
+    /// finds too few matching rows.
+    Auto,
+    /// The graph walk, returning only matching rows.
+    Graph,
+    /// PQ distances to every matching row (codes in RAM), then the best
+    /// `l` re-ranked exactly from SSD.
+    Scan,
 }
 
 /// Counters for one search, summed over segments.
@@ -248,6 +289,16 @@ pub struct SearchStats {
     pub reads: usize,
     pub rounds: usize,
     pub expanded: usize,
+    /// With a filter: live rows that match it.
+    pub matched: usize,
+    /// SSD segments searched by the graph walk and by a scan (a fallback
+    /// counts as both).
+    pub graph_segments: usize,
+    pub scan_segments: usize,
+    /// Walks that found too few matching rows and fell back to a scan.
+    pub fallbacks: usize,
+    /// Rows scored by PQ in scans.
+    pub pq_scanned: usize,
 }
 
 /// One segment, for [`Collection::stats`].
@@ -260,6 +311,9 @@ pub struct SegmentInfo {
     pub deleted: usize,
     /// RAM for its tombstones and id lookup (beyond the index itself).
     pub lookup_bytes: usize,
+    /// RAM for its attribute columns, and the values they hold.
+    pub attr_bytes: usize,
+    pub attr_values: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -268,6 +322,8 @@ pub struct CollectionStats {
     pub live: usize,
     pub growing_rows: usize,
     pub growing_live: usize,
+    /// RAM for the growing segment's attributes and their index.
+    pub growing_attr_bytes: usize,
     pub segments: Vec<SegmentInfo>,
     pub wal_bytes: u64,
     /// Sequence number the next write gets.
@@ -290,6 +346,7 @@ struct State {
     sealed: Vec<Arc<Sealed>>,
     next_seq: u64,
     scratch: Vec<f32>,
+    row_buf: Vec<u8>,
 }
 
 impl State {
@@ -312,7 +369,8 @@ impl State {
         false
     }
 
-    fn upsert(&mut self, id: u64, vector: &[f32], attrs: Option<Attrs>) {
+    /// `attrs` must already be valid for the collection's fields.
+    fn upsert(&mut self, id: u64, vector: &[f32], attrs: &Attrs) {
         self.delete(id);
         let mut v = std::mem::take(&mut self.scratch);
         v.clear();
@@ -320,16 +378,19 @@ impl State {
         if self.config.metric.needs_normalization() {
             normalize(&mut v);
         }
-        self.growing.push(id, &v, attrs);
+        let mut row = std::mem::take(&mut self.row_buf);
+        row.clear();
+        if !self.config.fields.is_empty() {
+            encode_row(attrs, &self.config.fields, &mut row);
+        }
+        self.growing.push(id, &v, &row);
         self.scratch = v;
+        self.row_buf = row;
     }
 
     fn apply(&mut self, op: &WriteOp) {
         match *op {
-            WriteOp::Upsert { id, vector, attrs } => {
-                let a = (!self.config.fields.is_empty()).then(|| attrs.clone());
-                self.upsert(id, vector, a);
-            }
+            WriteOp::Upsert { id, vector, attrs } => self.upsert(id, vector, attrs),
             WriteOp::Delete { id } => {
                 self.delete(id);
             }
@@ -382,7 +443,14 @@ impl Collection {
         let wal = Wal::create(dir, 1, config.dim)?;
         sync_parent_dir(wal.path())?;
         manifest.write(dir)?;
-        let state = State { growing: Growing::new(config.dim), config, sealed: Vec::new(), next_seq: 1, scratch: Vec::new() };
+        let state = State {
+            growing: Growing::new(config.dim, &config.fields),
+            config,
+            sealed: Vec::new(),
+            next_seq: 1,
+            scratch: Vec::new(),
+            row_buf: Vec::new(),
+        };
         Ok(Self { dir: dir.to_path_buf(), _lock: lock, opts, manifest, wal, state })
     }
 
@@ -398,19 +466,21 @@ impl Collection {
             sealed.push(Arc::new(load_segment(dir, &config, e, &opts)?));
         }
         let mut state = State {
-            growing: Growing::new(config.dim),
+            growing: Growing::new(config.dim, &config.fields),
             config,
             sealed,
             next_seq: manifest.flushed_seq + 1,
             scratch: Vec::new(),
+            row_buf: Vec::new(),
         };
         let fields = state.config.fields.clone();
         let (wal, replay) =
             Wal::replay(dir, manifest.wal_gen, state.config.dim, state.next_seq, |seq, op| {
                 match op {
                     LoggedOp::Upsert { id, vector, attrs } => {
-                        let a = if fields.is_empty() { None } else { Some(Attrs::decode(attrs)?) };
-                        state.upsert(id, vector, a);
+                        let a = Attrs::decode(attrs)?;
+                        a.validate(&fields).map_err(|e| Error::Corrupt(format!("WAL write {seq}: {e}")))?;
+                        state.upsert(id, vector, &a);
                     }
                     LoggedOp::Delete { id } => {
                         state.delete(id);
@@ -460,12 +530,15 @@ impl Collection {
                 rows: s.positions(),
                 deleted: s.tomb.count(),
                 lookup_bytes: s.lookup_bytes(),
+                attr_bytes: s.attr_ram(),
+                attr_values: s.attrs.as_ref().map_or(0, |a| a.columns.values()),
             })
             .collect();
         CollectionStats {
             live: self.len(),
             growing_rows: self.state.growing.rows(),
             growing_live: self.state.growing.live(),
+            growing_attr_bytes: self.state.growing.attr_ram(),
             segments,
             wal_bytes: self.wal.bytes(),
             next_seq: self.state.next_seq,
@@ -520,12 +593,17 @@ impl Collection {
     /// stored: unit length for cosine, rounded by f16 / bf16 storage.
     pub fn get(&self, id: u64) -> Result<Option<(Vec<f32>, Attrs)>> {
         let g = &self.state.growing;
+        let fields = &self.state.config.fields;
         if let Some(r) = g.row_of(id) {
-            return Ok(Some((g.vector(r).to_vec(), g.attrs.get(r).cloned().unwrap_or_default())));
+            let attrs = if fields.is_empty() { Attrs::default() } else { decode_row(g.attrs(r), fields)? };
+            return Ok(Some((g.vector(r).to_vec(), attrs)));
         }
         for s in self.state.sealed.iter().rev() {
             let Some(pos) = s.find(id) else { continue };
-            let attrs = s.attrs.rows.get(pos).cloned().unwrap_or_default();
+            let attrs = match &s.attrs {
+                Some(a) => a.row(pos, fields)?,
+                None => Attrs::default(),
+            };
             let v = match &s.body {
                 Body::Flat(store) => store.vector(pos).to_vec(),
                 Body::Disk { index, .. } => {
@@ -566,36 +644,63 @@ impl Collection {
         }
         let kern = kernels::best();
         let mut top = TopK::new(k);
+        let filter = match &opts.filter {
+            None => None,
+            Some(f) => match f.compile(&cfg.fields)? {
+                Compiled::All => None,
+                Compiled::Nothing => return Ok((Vec::new(), st)),
+                c => Some(c),
+            },
+        };
 
         let g = &self.state.growing;
         if g.live() > 0 {
             st.segments += 1;
-            st.scanned += g.live();
-            segment::scan(kern, cfg.metric, &q, &g.data, |r| !g.is_dead(r), |r, d| top.push(g.ids[r], d));
+            let push = |r: usize, d: f32| top.push(g.ids[r], d);
+            match &filter {
+                None => st.scanned += segment::scan(kern, cfg.metric, &q, &g.data, |r| !g.is_dead(r), push),
+                Some(c) => {
+                    let m = c.eval(g.cols.as_ref().expect("a filter with fields"));
+                    let n = segment::scan(kern, cfg.metric, &q, &g.data, |r| m.get(r) && !g.is_dead(r), push);
+                    st.scanned += n;
+                    st.matched += n;
+                }
+            }
         }
         for s in &self.state.sealed {
             if s.live() == 0 {
                 continue;
             }
             st.segments += 1;
+            let matching = filter.as_ref().map(|c| {
+                let mut m = c.eval(&s.attrs.as_ref().expect("a filter with fields").columns);
+                s.remove_deleted(&mut m);
+                m
+            });
+            if let Some(m) = &matching {
+                let n = m.count();
+                st.matched += n;
+                if n == 0 {
+                    continue;
+                }
+            }
             match &s.body {
                 Body::Flat(store) => {
-                    st.scanned += s.live();
-                    let admit = |p: usize| !s.tomb.is_set(p);
-                    segment::scan(kern, cfg.metric, &q, store.raw_vectors(), admit, |p, d| top.push(store.id(p), d));
+                    let push = |p: usize, d: f32| top.push(store.id(p), d);
+                    st.scanned += match &matching {
+                        None => segment::scan(kern, cfg.metric, &q, store.raw_vectors(), |p| !s.tomb.is_set(p), push),
+                        Some(m) => segment::scan(kern, cfg.metric, &q, store.raw_vectors(), |p| m.get(p), push),
+                    };
                 }
                 Body::Disk { index, .. } => {
-                    let live = if opts.adapt_l { s.live() as f64 / s.positions() as f64 } else { 1.0 };
-                    let params = DiskSearchParams {
-                        l: boosted_l(opts.l.max(k), live),
-                        beam_width: opts.beam_width,
-                        rerank: opts.rerank,
+                    let res = match &matching {
+                        None => {
+                            let live = s.live() as f64 / s.positions() as f64;
+                            self.search_graph(index, query, k, opts, live, &|p| !s.tomb.is_set(p), &mut st)?
+                        }
+                        Some(m) => self.search_disk_filtered(index, query, k, opts, m, &mut st)?,
                     };
-                    let (res, ds) = index.search_filtered(query, k, &params, &|p| !s.tomb.is_set(p))?;
                     res.iter().for_each(|r| top.push(r.id, r.distance));
-                    st.reads += ds.reads;
-                    st.rounds += ds.rounds;
-                    st.expanded += ds.expanded;
                 }
             }
         }
@@ -620,17 +725,24 @@ impl Collection {
         let result = (|| -> Result<(Option<Sealed>, Wal)> {
             // 1. The growing segment's live rows, as a flat segment.
             let fresh = if self.state.growing.live() > 0 {
-                let (store, attrs) = live_rows(&self.state.growing, self.state.config.dim)?;
+                let g = &self.state.growing;
+                let (store, live) = live_rows(g, self.state.config.dim)?;
                 let id = m.next_segment;
                 m.next_segment += 1;
                 let path = self.dir.join(flat_name(id));
                 created.push(path.clone());
                 write_flat_segment(&path, self.state.config.metric, &store)?;
                 let mut files = vec![path];
-                if !self.state.config.fields.is_empty() {
+                let mut attrs = None;
+                let fields = &self.state.config.fields;
+                if !fields.is_empty() {
                     let ap = self.dir.join(attrs_name(id));
                     created.push(ap.clone());
-                    attrs.write(&ap)?;
+                    let mut w = AttrWriter::create(&ap, fields, live.len())?;
+                    for (pos, &r) in live.iter().enumerate() {
+                        w.push(pos, g.attrs(r))?;
+                    }
+                    attrs = Some(w.finish()?);
                     files.push(ap);
                 }
                 m.segments.push(SegmentEntry {
@@ -687,7 +799,7 @@ impl Collection {
         if let Some(s) = fresh {
             self.state.sealed.push(Arc::new(s));
         }
-        self.state.growing = Growing::new(self.state.config.dim);
+        self.state.growing = Growing::new(self.state.config.dim, &self.state.config.fields);
         if let Err(e) = durable {
             // A crash could bring back the old manifest, which does not know
             // the new WAL: take no writes that would go there.
@@ -701,27 +813,121 @@ impl Collection {
     }
 }
 
+impl Collection {
+    /// The graph walk over one SSD segment, `admitted` of whose rows can be
+    /// returned.
+    #[allow(clippy::too_many_arguments)]
+    fn search_graph(
+        &self,
+        index: &DiskIndex,
+        query: &[f32],
+        k: usize,
+        opts: &SearchOptions,
+        admitted: f64,
+        admit: &dyn Fn(usize) -> bool,
+        st: &mut SearchStats,
+    ) -> Result<Vec<SearchResult>> {
+        let params = DiskSearchParams {
+            l: if opts.adapt_l { boosted_l(opts.l.max(k), admitted, MAX_BOOST) } else { opts.l.max(k) },
+            beam_width: opts.beam_width,
+            rerank: opts.rerank,
+        };
+        let (res, ds) = index.search_filtered(query, k, &params, admit)?;
+        st.reads += ds.reads;
+        st.rounds += ds.rounds;
+        st.expanded += ds.expanded;
+        Ok(res)
+    }
+
+    /// One SSD segment under a filter that `matching` (live positions) holds.
+    fn search_disk_filtered(
+        &self,
+        index: &DiskIndex,
+        query: &[f32],
+        k: usize,
+        opts: &SearchOptions,
+        matching: &Bitmap,
+        st: &mut SearchStats,
+    ) -> Result<Vec<SearchResult>> {
+        let n = matching.count();
+        let admit = |p: usize| matching.get(p);
+        let l = opts.l.max(k);
+        let scan = match opts.filter_mode {
+            FilterMode::Scan => true,
+            FilterMode::Graph => false,
+            FilterMode::Auto => prefer_scan(n, index.len(), l, opts.beam_width, index.is_direct()),
+        };
+        if !scan {
+            st.graph_segments += 1;
+            let params = DiskSearchParams {
+                l: if opts.adapt_l { boosted_l(l, n as f64 / index.len() as f64, MAX_FILTER_BOOST) } else { l },
+                beam_width: opts.beam_width,
+                rerank: opts.rerank,
+            };
+            let (res, ds) = index.search_filtered(query, k, &params, &admit)?;
+            st.reads += ds.reads;
+            st.rounds += ds.rounds;
+            st.expanded += ds.expanded;
+            // The walk should meet about `l` matching nodes; far fewer means
+            // the matches lie away from its path (or the boost was capped).
+            if opts.filter_mode == FilterMode::Graph || ds.admitted * 2 >= l.min(n) {
+                return Ok(res);
+            }
+            st.fallbacks += 1;
+        }
+        st.scan_segments += 1;
+        let (res, ds) = index.search_subset(query, k, l, &mut matching.ones(), &admit)?;
+        st.reads += ds.reads;
+        st.rounds += ds.rounds;
+        st.pq_scanned += ds.pq_distances;
+        Ok(res)
+    }
+}
+
+/// Largest factor the candidate list of a walk is scaled by for deleted rows.
+const MAX_BOOST: f64 = 8.0;
+/// The same for a filter. `Auto` scans a segment where fewer than 1 / this
+/// of the rows match, as the walk could not be scaled enough.
+const MAX_FILTER_BOOST: f64 = 16.0;
+/// Rows a filtered scan scores in the time of one round of a walk (one
+/// read latency plus its CPU). Measured on SIFT1M (128 dimensions, 32-byte
+/// PQ codes), 1 thread: a round took about 140 µs with direct I/O (reads
+/// capped at 100,000 per second) and 16 µs from the page cache; a scan
+/// about 40 ns per matching row (bitmap, PQ distance, code fetch).
+const SCAN_ROWS_PER_ROUND_DIRECT: f64 = 3500.0;
+const SCAN_ROWS_PER_ROUND_CACHED: f64 = 400.0;
+
+/// Whether a filtered SSD segment with `matching` of its `positions` rows
+/// is cheaper to scan than to walk with beam width `width`: the walk takes
+/// about L / W + 4 rounds at its scaled L, the scan time grows with the
+/// rows it scores.
+fn prefer_scan(matching: usize, positions: usize, l: usize, width: usize, direct: bool) -> bool {
+    let f = matching as f64 / positions as f64;
+    if f < 1.0 / MAX_FILTER_BOOST {
+        return true;
+    }
+    let rounds = boosted_l(l, f, MAX_FILTER_BOOST) as f64 / width.max(1) as f64 + 4.0;
+    let per_round = if direct { SCAN_ROWS_PER_ROUND_DIRECT } else { SCAN_ROWS_PER_ROUND_CACHED };
+    (matching as f64) < rounds * per_round
+}
+
 /// Candidate list size for an SSD segment where only `admitted` of the
 /// rows can be returned: the walk passes through rejected nodes, so it
 /// needs a longer list to expand as many returnable ones.
-fn boosted_l(l: usize, admitted: f64) -> usize {
-    const MAX_BOOST: f64 = 8.0;
-    let boost = (1.0 / admitted.max(1e-9)).min(MAX_BOOST);
+fn boosted_l(l: usize, admitted: f64, max_boost: f64) -> usize {
+    let boost = (1.0 / admitted.max(1e-9)).min(max_boost);
     (l as f64 * boost).ceil() as usize
 }
 
 /// The growing segment's live rows, copied (it stays intact if the flush
-/// fails).
-fn live_rows(g: &Growing, dim: usize) -> Result<(crate::store::InMemoryStore, AttrTable)> {
+/// fails), and their rows in the growing segment.
+fn live_rows(g: &Growing, dim: usize) -> Result<(crate::store::InMemoryStore, Vec<usize>)> {
     let mut store = crate::store::InMemoryStore::with_capacity(dim, g.live())?;
-    let mut attrs = AttrTable::default();
-    for r in (0..g.rows()).filter(|&r| !g.is_dead(r)) {
+    let live: Vec<usize> = (0..g.rows()).filter(|&r| !g.is_dead(r)).collect();
+    for &r in &live {
         store.push(g.ids[r], g.vector(r))?;
-        if let Some(a) = g.attrs.get(r) {
-            attrs.rows.push(a.clone());
-        }
     }
-    Ok((store, attrs))
+    Ok((store, live))
 }
 
 fn lock_dir(dir: &Path) -> Result<File> {
@@ -744,7 +950,7 @@ fn load_segment(dir: &Path, cfg: &CollectionConfig, e: &SegmentEntry, opts: &Ope
             if metric != cfg.metric || store.dim() != cfg.dim {
                 return Err(mismatch("metric or dimension"));
             }
-            Sealed::flat(e.id, store, AttrTable::default(), vec![path])
+            Sealed::flat(e.id, store, None, vec![path])
         }
         SegmentKind::Disk => {
             let path = dir.join(disk_name(e.id));
@@ -752,7 +958,7 @@ fn load_segment(dir: &Path, cfg: &CollectionConfig, e: &SegmentEntry, opts: &Ope
             if index.metric() != cfg.metric || index.dim() != cfg.dim {
                 return Err(mismatch("metric or dimension"));
             }
-            Sealed::disk(e.id, index, AttrTable::default(), vec![path])
+            Sealed::disk(e.id, index, None, vec![path])
         }
     };
     if s.positions() as u64 != e.positions {
@@ -760,7 +966,7 @@ fn load_segment(dir: &Path, cfg: &CollectionConfig, e: &SegmentEntry, opts: &Ope
     }
     if !cfg.fields.is_empty() {
         let path = dir.join(attrs_name(e.id));
-        s.attrs = AttrTable::read(&path, s.positions())?;
+        s.attrs = Some(SegmentAttrs::open(&path, &cfg.fields, s.positions())?);
         s.files.push(path);
     }
     if e.del_gen != 0 {

@@ -25,8 +25,8 @@ pub mod store;
 pub mod topk;
 
 pub use collection::{
-    Attrs, Collection, CollectionConfig, Durability, Field, FieldType, IndexConfig, OpenOptions, SearchOptions, Value,
-    WriteOp,
+    Attrs, Collection, CollectionConfig, Durability, Field, FieldType, Filter, FilterMode, IndexConfig, OpenOptions,
+    SearchOptions, Value, WriteOp,
 };
 pub use dataset::{VectorFile, VectorSource};
 pub use disk::{

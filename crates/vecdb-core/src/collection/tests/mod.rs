@@ -824,3 +824,5 @@ fn damage_is_found_past_buffered_records() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+mod filters;
