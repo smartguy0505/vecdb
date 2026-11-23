@@ -34,4 +34,25 @@ impl SplitMix64 {
         assert!(n > 0, "below(0)");
         self.next_u64() % n
     }
+
+    /// Standard normal sample (Box-Muller).
+    pub fn gaussian(&mut self) -> f32 {
+        // 1 - u keeps the log argument in (0, 1].
+        let u1 = 1.0 - (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        let u2 = (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
+    }
+
+    /// `count` distinct indices from `0..n` in random order (partial
+    /// Fisher-Yates). Panics if `count > n`.
+    pub fn sample_indices(&mut self, n: usize, count: usize) -> Vec<usize> {
+        assert!(count <= n, "sample_indices: count {count} > n {n}");
+        let mut idx: Vec<usize> = (0..n).collect();
+        for i in 0..count {
+            let j = i + self.below((n - i) as u64) as usize;
+            idx.swap(i, j);
+        }
+        idx.truncate(count);
+        idx
+    }
 }

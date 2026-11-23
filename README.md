@@ -3,8 +3,9 @@
 A vector database written from scratch in Rust, designed for billion-scale
 approximate nearest neighbor search.
 
-Status: step 1 of the roadmap is done (exact search, segment file format,
-benchmark harness); step 2 (SIMD) is done for AVX2/FMA.
+Status: steps 1-3 are done: exact search, the segment file format and
+benchmark harness; SIMD kernels (AVX2/FMA); and quantization (PQ, plus
+f16/bf16/int8 storage for re-ranking).
 
 ## Goals
 
@@ -22,7 +23,8 @@ benchmark harness); step 2 (SIMD) is done for AVX2/FMA.
 ## Layout
 
 ```
-crates/vecdb-core    library: SIMD distance kernels, top-k, stores, flat index, file formats
+crates/vecdb-core    library: SIMD distance kernels, top-k, stores, flat index,
+                     k-means, product quantization, vector codecs, PQ index, file formats
 crates/vecdb-bench   CLI: synthetic data, ground truth, segment build, recall/latency runs,
                      kernel micro-benchmark
 ```
@@ -54,9 +56,11 @@ The reader also loads the standard datasets: SIFT1M and GIST1M (`.fvecs` /
 `.ivecs`) and BIGANN/SIFT1B (`.bvecs`).
 
 The `recall@10 = 1.0` from that run is a self-check: `groundtruth` uses the
-same flat index. It shows that the segment round trip and tie-breaking are
-deterministic, but it does not independently show correctness. The independent
-check is SIFT1M against its published ground truth.
+same flat index. The independent check is SIFT1M against its published ground
+truth. There, exact flat search gives recall@1 = 0.990, @10 = 0.9994 and
+@100 = 0.9999. `vecdb-bench search` checks every difference and reports 0 real
+misses: all of them are exact distance ties (SIFT values are integers) broken
+in a different order.
 
 Flat search (i7-8700, default release build, 128-dim L2, one thread; cost per
 vector of one distance plus top-k; median of 5 back-to-back runs):
@@ -90,6 +94,105 @@ Cross-check: ground truth computed with `scalar` and searched with `avx2-fma`
 gives recall@10 = 1.0 for L2, cosine and inner product at 128, 1024 and 8192
 dims. The two sets add floats in a different order, so a near-tie could
 differ in the last bit on other data; that is expected, not a bug.
+
+## Quantization (step 3)
+
+PQ splits each vector into `m` parts and stores each part as a 1-byte
+centroid id, so a vector costs `m` bytes in RAM, whatever its dimension. A
+search scans the codes with a per-query lookup table, then re-ranks the best
+candidates with full vectors. Full vectors can be stored as `f32`, `f16`,
+`bf16` or `sq8` (int8).
+
+All numbers below are recall@10 against exact ground truth, with re-ranking
+from `f32` unless a codec is named. The 1024- and 8192-dim sets are synthetic
+and small (vectors from a 64-dim subspace plus noise); real embeddings must
+be measured.
+
+**SIFT1M, L2** (1M x 128, 1000 queries, published ground truth; exact search
+reaches 0.9994 because of ties):
+
+| PQ bytes/vector | no re-rank | re-rank 50 | re-rank 200 |
+|---:|---:|---:|---:|
+| 8 | 0.313 | 0.644 | 0.886 |
+| 16 | 0.534 | 0.900 | 0.990 |
+| 32 | 0.707 | 0.989 | 0.9993 |
+| 64 | 0.868 | 0.9994 | 0.9994 |
+
+**Collection size matters.** The same settings on the first 100k SIFT vectors
+compared with all 1M:
+
+| PQ bytes, re-rank | 100k vectors | 1M vectors |
+|---|---:|---:|
+| 16 B, re-rank 50 | 0.963 | 0.900 |
+| 16 B, re-rank 200 | 0.998 | 0.990 |
+| 32 B, re-rank 50 | 0.997 | 0.989 |
+| 32 B, re-rank 200 | 1.000 | 0.9993 |
+
+At a fixed code size and re-rank depth, recall falls as the collection grows.
+The settings needed at 100M-1B vectors are not measured yet.
+
+**1024 dims, 100k vectors, 200 queries:**
+
+| PQ bytes/vector | L2, no re-rank | L2, re-rank 50 | L2, re-rank 200 | cosine, re-rank 50 | cosine, re-rank 200 |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 0.258 | 0.567 | 0.834 | | |
+| 64 | 0.387 | 0.749 | 0.949 | 0.936 | 0.9995 |
+| 128 | 0.540 | 0.935 | 0.9995 | 0.994 | 1.000 |
+| 256 | 0.815 | 1.000 | 1.000 | | |
+
+**8192 dims, 20k vectors, 100 queries, L2** (k-means `--iters 10`):
+
+| PQ bytes/vector | no re-rank | re-rank 50 | re-rank 200 |
+|---:|---:|---:|---:|
+| 256 | 0.462 | 0.828 | 0.984 |
+| 512 | 0.518 | 0.903 | 0.999 |
+
+**Re-ranking codecs**, re-rank 200:
+- 1024 dims, 128 B, L2: `f32` 0.9995, `f16` 0.999, `bf16` 0.999, `sq8` 0.992.
+- 1024 dims, cosine: `f16` equals `f32`; `sq8` gives 0.994.
+- 8192 dims: `f16` and `sq8` equal `f32`.
+- SIFT: `f16` and `bf16` are lossless because its values are small integers;
+  `sq8` gives 0.989.
+
+What this shows, and what it doesn't:
+
+- **Re-ranking is what delivers high recall.** PQ alone reached 0.26-0.87 here.
+- **Recall at a given setting depends on collection size, metric and data.**
+  Re-ranking 200 candidates is 0.02% of SIFT1M but 1% of the 8192-dim set,
+  and cosine did better than L2 on the same 1024-dim vectors. So none of
+  these numbers can be carried to a billion vectors; the parameters for
+  billion-scale shards have to be measured at that scale.
+- **RAM:** PQ codes cost `m` GB per billion vectors (for example, 128 GB for
+  128-byte codes, against 4 TB for raw 1024-dim f32).
+- **Speed:** the code scan is linear, about 0.4 ns per code byte plus 1.5 ns
+  per vector, so 5-26 ms per query at 1M vectors. That is too slow for low
+  latency on its own; the graph index (step 4) uses the same codes on a small
+  fraction of the vectors. QPS in `vecdb-bench pq` output is noisy, and the
+  first row of each `m` runs cold.
+
+Commands for these runs (`B=target/release/vecdb-bench`, `S=` the SIFT1M
+directory):
+
+```
+$B pq --base $S/sift_base.fvecs --query $S/sift_query.fvecs --gt $S/sift_groundtruth.ivecs \
+      --nq 1000 --m 8,16,32,64 --rerank 0,10,50,200
+$B groundtruth --base $S/sift_base.fvecs --limit 100000 --query $S/sift_query.fvecs --out gt100k.ivecs --k 10
+$B pq --base $S/sift_base.fvecs --limit 100000 --query $S/sift_query.fvecs --gt gt100k.ivecs \
+      --nq 1000 --m 16,32 --rerank 0,50,200 --codecs f32
+$B synth --out emb1024 --dim 1024 --n 100000 --nq 200 --intrinsic 64 --noise 0.05 --seed 21
+$B groundtruth --base emb1024/base.fvecs --query emb1024/query.fvecs --out emb1024/gt.ivecs --k 10 [--metric cosine]
+$B pq --base emb1024/base.fvecs --query emb1024/query.fvecs --gt emb1024/gt.ivecs [--metric cosine] \
+      --m 32,64,128,256 --rerank 0,50,200
+$B synth --out emb8192 --dim 8192 --n 20000 --nq 100 --intrinsic 64 --noise 0.05 --seed 22
+$B groundtruth --base emb8192/base.fvecs --query emb8192/query.fvecs --out emb8192/gt.ivecs --k 10
+$B pq --base emb8192/base.fvecs --query emb8192/query.fvecs --gt emb8192/gt.ivecs \
+      --m 256,512 --rerank 0,50,200 --codecs f32,f16,sq8 --iters 10
+```
+
+Known follow-ups: `f16` decoding is scalar, which costs about 3 ms per query
+when re-ranking 200 x 8192 dims; F16C hardware conversion would fix that. A
+SIMD "fast-scan" (4-bit PQ) could speed up the code scan severalfold. PQ
+codebooks are not yet saved in the segment format (step 6).
 
 ## Designing for billions
 
@@ -165,9 +268,11 @@ Within a shard:
    and NEON (the portable kernels should auto-vectorize to NEON on aarch64, but
    that has not been built or tested yet), and batch kernels that score several
    rows per query load
-3. Quantization: PQ with per-collection code size, ADC search with lookup
-   tables; f16/bf16/int8 storage for full vectors; measure recall against bytes
-   per vector
+3. ✅ Quantization: PQ with per-collection code size (k-means codebooks,
+   uneven subspace splits, ADC lookup tables), `f16`/`bf16`/`sq8` storage for
+   full vectors, re-ranking, and recall measured against bytes per vector on
+   SIFT1M and 1024/8192-dim data. Follow-ups: F16C decoding, 4-bit fast-scan,
+   persisting codebooks
 4. Vamana graph in memory: build, beam search, a search-time recall/latency
    knob; recall vs QPS on SIFT1M and a high-dimension dataset
 5. Disk index: PQ in RAM, graph and full vectors on SSD (layout chosen by

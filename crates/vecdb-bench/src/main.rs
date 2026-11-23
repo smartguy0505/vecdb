@@ -10,7 +10,8 @@ use vecdb_core::dataset::{self, Vecs};
 use vecdb_core::format::{read_flat_segment, write_flat_segment};
 use vecdb_core::kernels::{self, Kernels};
 use vecdb_core::rng::SplitMix64;
-use vecdb_core::{FlatIndex, Metric, SearchResult, VectorStore};
+use vecdb_core::quant::{Codec, PqParams};
+use vecdb_core::{FlatIndex, Metric, PqIndex, SearchResult};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -19,14 +20,20 @@ vecdb-bench <command> [--flag value]...
 
 commands:
   synth        --out DIR [--dim 128] [--n 100000] [--nq 1000] [--seed 42]
-               write DIR/base.fvecs and DIR/query.fvecs (uniform random)
-  groundtruth  --base F --query F --out gt.ivecs [--k 100] [--metric l2] [--threads 4]
+               [--intrinsic R [--noise 0.05]]
+               write DIR/base.fvecs and DIR/query.fvecs: uniform random, or with
+               --intrinsic, embedding-like data from an R-dim subspace plus noise
+  groundtruth  --base F --query F --out gt.ivecs [--k 100] [--metric l2] [--threads 4] [--limit N]
                exact k-NN with the flat index (base ids = row numbers)
   build        --base F --out seg.vdb [--metric l2] [--limit N]
                write a flat segment file
   search       (--base F | --segment S) --query F [--gt gt.ivecs] [--k 10]
                [--metric l2] [--threads 4] [--limit N] [--nq N]
                run queries; print QPS, latency percentiles and recall@k
+  pq           --base F --query F --gt G [--metric l2] [--m 8,16,32] [--rerank 0,10,100]
+               [--codecs f32,f16,bf16,sq8] [--k 10] [--threads 4] [--limit N] [--nq N]
+               [--max-train 65536] [--iters 25]
+               product quantization: recall and speed per code size, re-rank depth, codec
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
@@ -55,6 +62,7 @@ fn run() -> AnyResult<()> {
         "build" => build(&args),
         "search" => search(&args),
         "kernels" => kernel_bench(&args),
+        "pq" => pq_bench(&args),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
@@ -121,15 +129,40 @@ impl Args {
 }
 
 fn synth(a: &Args) -> AnyResult<()> {
-    a.allow(&["out", "dim", "n", "nq", "seed"])?;
+    a.allow(&["out", "dim", "n", "nq", "seed", "intrinsic", "noise"])?;
     let out = a.req_path("out")?;
     let dim: usize = a.num("dim", 128)?;
     let n: usize = a.num("n", 100_000)?;
     let nq: usize = a.num("nq", 1_000)?;
     let mut rng = SplitMix64::new(a.num("seed", 42)?);
     std::fs::create_dir_all(&out)?;
-    let base: Vec<f32> = (0..n * dim).map(|_| rng.uniform(-1.0, 1.0)).collect();
-    let query: Vec<f32> = (0..nq * dim).map(|_| rng.uniform(-1.0, 1.0)).collect();
+    let intrinsic: usize = a.num("intrinsic", 0)?;
+    let (base, query) = if intrinsic == 0 {
+        // Uniform in [-1, 1): no structure; the worst case for quantization.
+        let base: Vec<f32> = (0..n * dim).map(|_| rng.uniform(-1.0, 1.0)).collect();
+        let query: Vec<f32> = (0..nq * dim).map(|_| rng.uniform(-1.0, 1.0)).collect();
+        (base, query)
+    } else {
+        // Embedding-like: x = A z / sqrt(r) + noise, z ~ N(0, I_r), r = intrinsic.
+        let noise: f32 = a.num("noise", 0.05)?;
+        let mat: Vec<f32> = (0..dim * intrinsic).map(|_| rng.gaussian()).collect();
+        let scale = 1.0 / (intrinsic as f32).sqrt();
+        let mut gen_rows = |rows: usize| -> Vec<f32> {
+            let mut out = Vec::with_capacity(rows * dim);
+            let mut z = vec![0.0f32; intrinsic];
+            for _ in 0..rows {
+                z.iter_mut().for_each(|v| *v = rng.gaussian());
+                for d in 0..dim {
+                    let x = vecdb_core::distance::dot(&mat[d * intrinsic..(d + 1) * intrinsic], &z);
+                    out.push(x * scale + noise * rng.gaussian());
+                }
+            }
+            out
+        };
+        let base = gen_rows(n);
+        let query = gen_rows(nq);
+        (base, query)
+    };
     dataset::write_fvecs(&out.join("base.fvecs"), dim, &base)?;
     dataset::write_fvecs(&out.join("query.fvecs"), dim, &query)?;
     println!("wrote {n} base + {nq} query vectors, dim {dim}, to {}", out.display());
@@ -159,15 +192,12 @@ struct RunStats {
     wall: Duration,
 }
 
-fn run_queries<S: VectorStore + Sync>(
-    index: &FlatIndex<S>,
-    queries: &Vecs<f32>,
-    k: usize,
-    threads: usize,
-) -> AnyResult<RunStats> {
-    if queries.dim != index.dim() {
-        return Err(format!("query dim {} != index dim {}", queries.dim, index.dim()).into());
-    }
+/// Runs every query through `search` on `threads` threads; records each
+/// query's latency and the wall time of the whole run.
+fn run_queries<F>(search: &F, queries: &Vecs<f32>, threads: usize) -> AnyResult<RunStats>
+where
+    F: Fn(&[f32]) -> vecdb_core::Result<Vec<SearchResult>> + Sync,
+{
     let nq = queries.len();
     let threads = threads.clamp(1, nq.max(1));
     let per_thread = nq.div_ceil(threads);
@@ -180,7 +210,7 @@ fn run_queries<S: VectorStore + Sync>(
                     (lo..hi)
                         .map(|i| {
                             let t0 = Instant::now();
-                            let r = index.search(queries.row(i), k)?;
+                            let r = search(queries.row(i))?;
                             Ok((r, t0.elapsed()))
                         })
                         .collect()
@@ -201,12 +231,32 @@ fn run_queries<S: VectorStore + Sync>(
     Ok(RunStats { results, latencies, wall })
 }
 
+impl RunStats {
+    fn qps(&self) -> f64 {
+        self.results.len() as f64 / self.wall.as_secs_f64()
+    }
+
+    /// Latency percentile in milliseconds.
+    fn pct_ms(&self, p: f64) -> f64 {
+        let mut lat = self.latencies.clone();
+        lat.sort_unstable();
+        lat[((p / 100.0) * (lat.len() - 1) as f64).round() as usize].as_secs_f64() * 1e3
+    }
+}
+
+fn check_query_dim(queries: &Vecs<f32>, dim: usize) -> AnyResult<()> {
+    if queries.dim != dim {
+        return Err(format!("query dim {} != index dim {dim}", queries.dim).into());
+    }
+    Ok(())
+}
+
 fn groundtruth(a: &Args) -> AnyResult<()> {
-    a.allow(&["base", "query", "out", "k", "metric", "threads"])?;
+    a.allow(&["base", "query", "out", "k", "metric", "threads", "limit"])?;
     let out = a.req_path("out")?;
     let k: usize = a.num("k", 100)?;
     let metric = a.metric()?;
-    let base = load_vectors(&a.req_path("base")?, None)?;
+    let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
     let queries = load_vectors(&a.req_path("query")?, None)?;
     if base.len() < k {
         return Err(format!("base has {} vectors, fewer than k = {k}", base.len()).into());
@@ -215,7 +265,8 @@ fn groundtruth(a: &Args) -> AnyResult<()> {
         return Err("ivecs ids are i32; base too large".into());
     }
     let index = index_from_base(&base, metric)?;
-    let stats = run_queries(&index, &queries, k, a.num("threads", 4)?)?;
+    check_query_dim(&queries, index.dim())?;
+    let stats = run_queries(&|q: &[f32]| index.search(q, k), &queries, a.num("threads", 4)?)?;
     let ids: Vec<i32> = stats.results.iter().flatten().map(|r| r.id as i32).collect();
     dataset::write_ivecs(&out, k, &ids)?;
     println!(
@@ -267,7 +318,8 @@ fn search(a: &Args) -> AnyResult<()> {
     };
     let load_time = t0.elapsed();
     let queries = load_vectors(&a.req_path("query")?, a.opt_num("nq")?)?;
-    let stats = run_queries(&index, &queries, k, threads)?;
+    check_query_dim(&queries, index.dim())?;
+    let stats = run_queries(&|q: &[f32]| index.search(q, k), &queries, threads)?;
     let nq = queries.len();
 
     println!(
@@ -279,36 +331,117 @@ fn search(a: &Args) -> AnyResult<()> {
         load_time.as_secs_f64()
     );
     println!("queries  {nq}, k {k}, threads {}", threads.clamp(1, nq));
-    let mut lat = stats.latencies.clone();
-    lat.sort_unstable();
-    let pct = |p: f64| lat[((p / 100.0) * (lat.len() - 1) as f64).round() as usize].as_secs_f64() * 1e3;
     println!(
         "speed    {:.1} QPS; latency ms p50 {:.3}  p95 {:.3}  p99 {:.3}  max {:.3}",
-        nq as f64 / stats.wall.as_secs_f64(),
-        pct(50.0),
-        pct(95.0),
-        pct(99.0),
-        pct(100.0)
+        stats.qps(),
+        stats.pct_ms(50.0),
+        stats.pct_ms(95.0),
+        stats.pct_ms(99.0),
+        stats.pct_ms(100.0)
     );
 
     if let Some(gt_path) = a.path("gt") {
-        let gt = dataset::read_ivecs(&gt_path, Some(nq))?;
-        if gt.len() < nq || gt.dim < k {
-            return Err(format!(
-                "ground truth has {} rows x {} ids; need {nq} x {k}",
-                gt.len(),
-                gt.dim
-            )
-            .into());
-        }
-        let mut hits = 0usize;
-        for (i, res) in stats.results.iter().enumerate() {
-            let truth = &gt.row(i)[..k];
-            hits += res.iter().filter(|r| truth.contains(&(r.id as i32))).count();
-        }
-        println!("recall   recall@{k} = {:.4}", hits as f64 / (nq * k) as f64);
+        let gt = load_gt(&gt_path, nq, k)?;
+        println!("recall   recall@{k} = {:.4}", recall(&stats.results, &gt, k));
+        let metric = index.metric();
+        let m = explain_misses(&stats.results, &gt, k, &queries, metric, |id| index.store().get(id));
+        m.print();
     }
     Ok(())
+}
+
+fn load_gt(path: &Path, nq: usize, k: usize) -> AnyResult<Vecs<i32>> {
+    let gt = dataset::read_ivecs(path, Some(nq))?;
+    if gt.len() < nq || gt.dim < k {
+        return Err(format!("ground truth has {} rows x {} ids; need {nq} x {k}", gt.len(), gt.dim).into());
+    }
+    Ok(gt)
+}
+
+fn recall(results: &[Vec<SearchResult>], gt: &Vecs<i32>, k: usize) -> f64 {
+    let mut hits = 0usize;
+    for (i, res) in results.iter().enumerate() {
+        let truth = &gt.row(i)[..k];
+        hits += res.iter().filter(|r| truth.contains(&(r.id as i32))).count();
+    }
+    hits as f64 / (results.len() * k).max(1) as f64
+}
+
+/// Exact distance in f64. Cosine normalizes both sides, so it is correct
+/// whether or not `v` is stored normalized.
+fn exact_distance(metric: Metric, q: &[f32], v: &[f32]) -> f64 {
+    let dot: f64 = q.iter().zip(v).map(|(&a, &b)| a as f64 * b as f64).sum();
+    match metric {
+        Metric::L2 => q.iter().zip(v).map(|(&a, &b)| (a as f64 - b as f64).powi(2)).sum(),
+        Metric::InnerProduct => -dot,
+        Metric::Cosine => {
+            let nq = q.iter().map(|&a| a as f64 * a as f64).sum::<f64>().sqrt();
+            let nv = v.iter().map(|&b| b as f64 * b as f64).sum::<f64>().sqrt();
+            if nq == 0.0 || nv == 0.0 { 1.0 } else { 1.0 - dot / (nq * nv) }
+        }
+    }
+}
+
+#[derive(Default)]
+struct MissReport {
+    queries: usize,
+    tie_only: usize,
+    real: usize,
+    unknown: usize,
+}
+
+impl MissReport {
+    fn print(&self) {
+        if self.queries == 0 {
+            println!("misses   none");
+            return;
+        }
+        println!(
+            "misses   {} queries miss a true neighbor: {} only at exact ties with the k-th result, \
+             {} real (a closer vector was skipped){}",
+            self.queries,
+            self.tie_only,
+            self.real,
+            if self.unknown > 0 { format!(", {} unknown ids", self.unknown) } else { String::new() }
+        );
+    }
+}
+
+/// For each query that misses a ground-truth neighbor, decides whether the
+/// miss is a tie (the missed vector is no closer than our farthest result,
+/// by exact f64 distance) or a real miss.
+fn explain_misses<'a>(
+    results: &[Vec<SearchResult>],
+    gt: &Vecs<i32>,
+    k: usize,
+    queries: &Vecs<f32>,
+    metric: Metric,
+    vector_of: impl Fn(u64) -> Option<&'a [f32]>,
+) -> MissReport {
+    let mut rep = MissReport::default();
+    for (i, res) in results.iter().enumerate() {
+        let truth = &gt.row(i)[..k];
+        let ours: Vec<u64> = res.iter().map(|r| r.id).collect();
+        let missing: Vec<u64> =
+            truth.iter().map(|&t| t as u64).filter(|t| !ours.contains(t)).collect();
+        if missing.is_empty() {
+            continue;
+        }
+        rep.queries += 1;
+        let q = queries.row(i);
+        let dist = |id: u64| vector_of(id).map(|v| exact_distance(metric, q, v));
+        let farthest_ours = ours.iter().filter_map(|&id| dist(id)).fold(f64::NEG_INFINITY, f64::max);
+        let mut real = false;
+        for id in missing {
+            match dist(id) {
+                None => rep.unknown += 1,
+                Some(d) if d < farthest_ours - 1e-5 * farthest_ours.abs().max(1e-12) => real = true,
+                Some(_) => {}
+            }
+        }
+        if real { rep.real += 1 } else { rep.tie_only += 1 }
+    }
+    rep
 }
 
 const DEFAULT_DIMS: &str = "32,64,128,256,512,768,1024,1536,2048,4096,8192";
@@ -403,6 +536,96 @@ fn kernel_bench(a: &Args) -> AnyResult<()> {
                 batch_ns.push(b);
             }
             println!(" {:>7.2}x", batch_ns[0] / batch_ns[batch_ns.len() - 1]);
+        }
+    }
+    Ok(())
+}
+
+fn parse_list<T: FromStr>(a: &Args, key: &str, default: &str) -> AnyResult<Vec<T>>
+where
+    T::Err: Display,
+{
+    a.map
+        .get(key)
+        .map(String::as_str)
+        .unwrap_or(default)
+        .split(',')
+        .map(|v| v.trim().parse::<T>().map_err(|e| format!("--{key} {v:?}: {e}").into()))
+        .collect()
+}
+
+fn pq_bench(a: &Args) -> AnyResult<()> {
+    a.allow(&[
+        "base", "query", "gt", "metric", "m", "rerank", "codecs", "k", "threads", "limit", "nq", "max-train",
+        "iters",
+    ])?;
+    let metric = a.metric()?;
+    let k: usize = a.num("k", 10)?;
+    let threads: usize = a.num("threads", 4)?;
+    let ms: Vec<usize> = parse_list(a, "m", "8,16,32")?;
+    let reranks: Vec<usize> = parse_list(a, "rerank", "0,10,100")?;
+    let codecs: Vec<Codec> = parse_list::<String>(a, "codecs", "f32,f16,bf16,sq8")?
+        .iter()
+        .map(|c| Codec::parse(c).ok_or_else(|| format!("unknown codec {c:?} (f32, f16, bf16, sq8)")))
+        .collect::<Result<_, _>>()?;
+    let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
+    let queries = load_vectors(&a.req_path("query")?, a.opt_num("nq")?)?;
+    check_query_dim(&queries, base.dim)?;
+    let gt = load_gt(&a.req_path("gt")?, queries.len(), k)?;
+    let ids: Vec<u64> = (0..base.len() as u64).collect();
+    println!(
+        "data     {} x {} ({}), {} queries, k {k}, threads {threads}, kernels {}",
+        base.len(),
+        base.dim,
+        metric.name(),
+        queries.len(),
+        kernels::best().name
+    );
+    println!(
+        "{:>4} {:>8} {:>8} {:>7} {:>6} {:>9} {:>10} {:>9} {:>8}",
+        "m", "PQ B/vec", "build s", "rerank", "codec", "full B/v", "recall@k", "QPS", "p50 ms"
+    );
+    for &m in &ms {
+        let params = PqParams {
+            m,
+            iters: a.num("iters", 25)?,
+            max_train: a.num("max-train", 65_536)?,
+            seed: 0x5eed,
+            threads,
+        };
+        let t0 = Instant::now();
+        let mut index = PqIndex::build(metric, base.dim, &ids, &base.data, &params, None)?;
+        let build_s = t0.elapsed().as_secs_f64();
+        let mut first = true;
+        let mut row = |rerank: usize, codec: Option<Codec>, index: &PqIndex| -> AnyResult<()> {
+            let stats = run_queries(&|q: &[f32]| index.search(q, k, rerank), &queries, threads)?;
+            let (codec_name, full_b) = match index.full_vectors() {
+                Some((c, b)) if codec.is_some() => (c.name().to_string(), b.to_string()),
+                _ => ("-".to_string(), "-".to_string()),
+            };
+            println!(
+                "{:>4} {:>8} {:>8} {:>7} {:>6} {:>9} {:>10.4} {:>9.1} {:>8.3}",
+                if first { m.to_string() } else { String::new() },
+                if first { index.code_size().to_string() } else { String::new() },
+                if first { format!("{build_s:.1}") } else { String::new() },
+                rerank,
+                codec_name,
+                full_b,
+                recall(&stats.results, &gt, k),
+                stats.qps(),
+                stats.pct_ms(50.0)
+            );
+            first = false;
+            Ok(())
+        };
+        if reranks.contains(&0) {
+            row(0, None, &index)?;
+        }
+        for &codec in &codecs {
+            index.set_full_vectors(&base.data, Some(codec))?;
+            for &r in reranks.iter().filter(|&&r| r > 0) {
+                row(r, Some(codec), &index)?;
+            }
         }
     }
     Ok(())
