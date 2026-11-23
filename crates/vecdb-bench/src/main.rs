@@ -1,5 +1,7 @@
 //! vecdb-bench: dataset tools and the recall/latency harness.
 
+mod coll;
+
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -61,6 +63,18 @@ commands:
                [--nq N] [--warmup 200] [--verify false]
                open an SSD index in a fresh process and search it: recall, reads,
                rounds, 1-thread latency and QPS (--threads) per beam width W and L
+  coll-ingest  --base F --dir D [--metric l2] [--batch 1000] [--durability buffered|sync]
+               [--seal-mb 32] [--index-mb 64] [--max-ssd 8] [--pq-m M] [--threads 6]
+               [--build-mem 2] [--maintain false] [--optimize false] [--secs S] [--limit N]
+               create a collection in D and upsert F (ids = row numbers) through the WAL:
+               rows/s and batch latency; --maintain runs index builds as they fall due,
+               --optimize merges everything into one SSD index at the end; then reopen
+  coll-search  --from D0 --dir D --base F --query Q [--k 10] [--l 40,80,160] [--w 4]
+               [--nq 1000] [--delete 0,0.1,0.3] [--seed 1] [--adapt true|false|both]
+               [--compact false]
+               copy collection D0 to D, delete random rows in stages (cumulative
+               fractions), and measure recall against exact search over the live rows,
+               reads and 1-thread latency; --compact runs maintain() after the last stage
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
@@ -94,6 +108,8 @@ fn run() -> AnyResult<()> {
         "graph" => graph_bench(&args),
         "disk-build" => disk_build(&args),
         "disk-search" => disk_search(&args),
+        "coll-ingest" => coll::ingest(&args),
+        "coll-search" => coll::search(&args),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }

@@ -10,7 +10,9 @@ with a search-time recall/latency knob. Step 5, the SSD index, works and is
 measured at 1M scale: PQ codes in RAM, graph and full vectors on SSD, read
 with direct I/O and io_uring, and a partitioned build that needs RAM for one
 partition rather than the whole collection. The 100M-vectors-per-node target
-has not been attempted yet: it needs a dedicated machine.
+has not been attempted yet: it needs a dedicated machine. Step 6 is under
+way: collections with a write-ahead log, segments, deletes, compaction and
+crash recovery work; attribute filters are next.
 
 ## Goals
 
@@ -30,9 +32,11 @@ has not been attempted yet: it needs a dedicated machine.
 ```
 crates/vecdb-core    library: SIMD distance kernels, top-k, stores, flat index,
                      k-means, product quantization, vector codecs, PQ index,
-                     graph index (Vamana), SSD index, file formats
+                     graph index (Vamana), SSD index, collections (WAL,
+                     segments, deletes, compaction), file formats
 crates/vecdb-bench   CLI: synthetic data, ground truth, segment build, recall/latency runs,
-                     SSD index build and search, kernel micro-benchmark
+                     SSD index build and search, collection ingest and search,
+                     kernel micro-benchmark
 ```
 
 `vecdb-core` depends only on the standard library, plus `io-uring` and `libc`
@@ -666,6 +670,181 @@ $B disk-build ... --partitions 1          # = the in-memory build, byte for byte
 $B disk-build ... --merge random --part-degree 43   # DiskANN's merge
 ```
 
+## Collections (step 6)
+
+A `Collection` is the storage engine of one shard: a directory of immutable
+segment files plus a write-ahead log (WAL), tied together by a manifest.
+
+```rust
+let mut cfg = CollectionConfig::new(768, Metric::Cosine);
+cfg.fields = vec![Field::keyword("lang"), Field::int("year")];
+let mut c = Collection::create("data/docs", cfg, OpenOptions::default())?;
+c.upsert(42, &vector, &Attrs::new().keyword("lang", "en").int("year", 2024))?;
+c.delete(7)?;
+let hits = c.search(&query, 10, &SearchOptions::default())?;
+c.maintain()?; // the index builds and compactions that are due
+```
+
+```
+<dir>/MANIFEST            which files make up the collection (replaced atomically)
+      LOCK                held while a process has the collection open
+      wal-<gen>.log       writes since the last flush
+      seg-<id>.flat       sealed segment: ids + vectors, searched exactly in RAM
+      seg-<id>.vdx        sealed segment: SSD index (step 5)
+      seg-<id>.attrs      attributes per row, when the collection declares fields
+      seg-<id>.del-<gen>  tombstones: the segment's deleted rows
+```
+
+- **Write path.** A batch of upserts and deletes is checked, appended to the
+  WAL as one checksummed record (fsynced with `Durability::Sync`), then
+  applied. An upsert deletes the id's current row, wherever it is, and
+  appends the new row to the growing segment, which lives in RAM and is
+  searched exactly. Once it holds `seal_bytes` of vectors, a flush seals it.
+  The flush writes the live rows as a flat segment file and the tombstones of
+  every segment that gained deletes, starts a new WAL, and commits all of it
+  with a new manifest.
+- **Deletes** are tombstones per row position in a segment, not per id, so a
+  deleted row never hides a later insert of the same id. Identical vectors
+  share one graph node in an SSD index but keep their own positions, ids,
+  attributes and tombstones.
+- **Index builds and compaction** (`maintain`) replace sealed segments with
+  one new segment built from their live rows, through the partitioned
+  build. The flat segments become an SSD index once they hold `index_bytes`
+  of live vectors. An SSD segment with 20% of its rows deleted is rebuilt
+  without them, and the two smallest SSD segments are merged while there are
+  more than `max_indexed_segments`. Rows are read back as stored, already
+  prepared for the metric, and never normalized again. Rebuilding unchanged
+  rows therefore writes the same file byte for byte (a test checks f32, f16
+  and bf16), and rows do not drift over repeated compactions. For cosine,
+  `get` returns the stored unit-length vector.
+- **Search** runs on every segment and merges the top-k lists: every segment
+  returns exact distances. Deleted rows are skipped when results are
+  collected, but the graph walk still passes through them. So the
+  candidate list size L of an SSD segment is scaled by 1 / (its live
+  fraction), up to 8x.
+- **Crash safety.** New files are written under new names and fsynced, then
+  committed by renaming the manifest into place; old files are removed only
+  after that. Opening replays the WAL on top of the manifest and removes
+  files of ours that no manifest refers to; it leaves other files alone.
+  WAL recovery is point-in-time: replay stops at the first record that is
+  incomplete or fails its checksum, and the log is cut there. After a crash
+  that is the batch being written. Records written without an fsync
+  (`Buffered`) can also reach the disk out of order, so a bad record
+  followed by good ones does not prove damage. A good record written with
+  `Sync` after a bad one does: its fsync made the bad record durable before
+  it was damaged. Then opening fails rather than dropping acknowledged
+  writes, and names the byte to cut the log at. A failed fsync poisons the
+  log until the collection is reopened. The WAL is also rotated once it
+  reaches twice `seal_bytes`, so a workload of deletes alone flushes too.
+- **One writer.** Writes take `&mut self`, searches `&self`, and nothing runs
+  in the background yet. Sealed segments are shared through `Arc` and only
+  their tombstones change (atomically), so step 7 can search a snapshot of
+  the segment list while a writer works.
+- **RAM per row of an SSD segment**, beyond the index: 4 bytes for the
+  id lookup (positions sorted by id) and 1 bit of tombstone. Flat and
+  growing segments hold their vectors. With fields declared, every segment
+  also keeps each row's attributes in RAM as written (field names
+  included): a provisional format that the filter indexes are to replace.
+
+The tests check the engine against a plain `HashMap` reference:
+- random upserts, deletes, flushes and reopens, with exact search results
+  compared after every step;
+- the WAL cut at every byte offset, keeping exactly the whole batches before
+  the cut;
+- the two directory states a crash can leave around the manifest commit, for
+  both a flush and an index build, each opening to the same rows;
+- that each id is live in at most one place.
+
+Results on SIFT1M (ids = row numbers, one process, this loaded machine).
+Ingest, with the growing segment sealed at 64 MiB:
+
+| durability | batch | rows/s | batch latency p50 / p99 |
+|---|---:|---:|---:|
+| buffered | 1,000 | 405,000 | 0.84 / 3.6 ms |
+| sync (fdatasync per batch) | 1 | 201 | 5.6 / 9.6 ms |
+| sync | 10 | 1,850 | 5.7 / 9.5 ms |
+| sync | 100 | 16,700 | 6.2 / 10.8 ms |
+| sync | 1,000 | 90,800 | 8.9 / 16.8 ms |
+
+- An fsync on this machine's RAID takes about 5.6 ms, so durable writes need
+  batches; combining concurrent writers' batches into one fsync (group
+  commit) comes with step 7.
+- A flush (64 MiB written and fsynced) stalls its batch for 0.24-0.3 s.
+- Reopening took 0.08 s with an empty WAL and 0.30 s to replay 76,000
+  writes (40 MB).
+- Index builds run inside `maintain`, so they block writes. Ingest with
+  `maintain` after every batch (index at 128 MiB) averaged 4,950 rows/s:
+  three builds of 264,000 rows took 199 of the 202 s. Merging all 1M rows
+  into one SSD index (`optimize`) took 172 s; step 5's build of the same
+  index took 135 s, a difference within this machine's run-to-run
+  variation.
+
+Search with deletes. One SSD segment of 1M rows, `W = 4`, page cache, one
+thread, 1,000 queries, warm. Recall@10 is against exact search over the live
+rows, followed by reads per query:
+
+| deleted | L 40, fixed | L 40, adapted | L 80, fixed | L 80, adapted |
+|---|---:|---:|---:|---:|
+| 0% | 0.9648 / 54 | 0.9648 / 54 | 0.9907 / 93 | 0.9907 / 93 |
+| 10% | 0.9587 / 54 | 0.9667 / 59 | 0.9893 / 93 | 0.9915 / 102 |
+| 30% | 0.9403 / 54 | 0.9690 / 72 | 0.9851 / 93 | 0.9942 / 127 |
+| 50% | 0.8977 / 54 | 0.9766 / 93 | 0.9766 / 93 | 0.9967 / 172 |
+| 50%, then compacted (500k rows, 122 s) | 0.9684 / 53 | | 0.9943 / 92 | |
+
+- **Scaling L by 1 / live fraction keeps recall at or above the undeleted
+  index's at the same L,** for 1 / (live fraction) times the reads. The
+  deletes here are uniformly random; deletes concentrated in one region of
+  the space were not measured.
+- **At equal reads, deleted rows still cost recall:** 0.9766 at 50% deleted
+  against 0.9907 undeleted, both at 93 reads, because half the expanded
+  nodes cannot be returned. Compaction removes the cost. The default
+  rebuilds a segment at 20% deleted.
+
+Several segments. The same 1M rows ingested with `maintain` after every
+batch. With the index threshold at 128 MiB (and seal at 64 MiB) that gave
+three SSD segments of 264,000 rows, a flat segment of 132,000 and 76,000
+growing rows. At the defaults (seal 32 MiB, index 64 MiB) it gave seven SSD
+segments of 132,000 rows, a flat segment of 66,000 and 10,000 growing rows;
+that ingest averaged 5,550 rows/s, 177 of its 180 s in seven index builds.
+
+| segments | rows scanned exactly | SSD reads / rounds per query | recall@10, L 40 | page cache: mean / p99 ms | direct I/O: mean / p99 ms |
+|---|---:|---:|---:|---:|---:|
+| 1 SSD | 0 | 54 / 14.8 | 0.9648 | 0.33 / 0.63 | 2.19 / 2.87 |
+| 3 SSD + flat + growing | 208,000 | 155 / 42.4 | 0.9957 | 12.5 / 24.2 | not run |
+| 7 SSD + flat + growing (defaults) | 76,000 | 356 / 97.2 | 0.9975 | 3.76 / 4.86 | 15.3 / 19.7 |
+| flat + growing only (200k rows) | 200,000 | 0 | 1.0000 | 6.10 / 7.99 | |
+
+Direct I/O here is capped at 100,000 reads/s, as in step 5.
+
+- **The exact scan of the RAM segments costs about 30 ns per 128-dim row**
+  on one core: 6.1 ms for 200,000 rows on their own. The defaults are
+  therefore lower than in the first runs: seal at 32 MiB and index at
+  64 MiB. With `maintain` run after each flush, at most about 96 MiB of
+  vectors (196,000 SIFT rows, about 6 ms) is scanned per search; the
+  defaults run had 76,000 rows in RAM.
+- **On SSD, segments add latency, because they are searched one after
+  another.** Each SSD segment waits for its own rounds of reads: 97 rounds
+  for seven segments at L 40, 15.3 ms with direct I/O, against 2.2 ms for
+  one segment. Each segment is searched with the full L, so more segments
+  give higher recall at a fixed L, but one segment at L 160 (0.9989, 6.3 ms)
+  beats seven at L 40 (0.9975, 15.3 ms). `max_indexed_segments` (default 8)
+  trades rebuild work against this. Step 7 is to search segments
+  concurrently, with their reads in flight together, to scan in parallel,
+  and to build indexes in the background.
+
+Not yet: attribute filters (the rows already store attributes), group
+commit, and inserting into an SSD index in place instead of rebuilding it.
+
+Commands (`B`, `S` as above):
+
+```
+$B coll-ingest --base $S/sift_base.fvecs --dir sift1m --pq-m 32 --optimize true
+$B coll-ingest ... --durability sync --batch 100 --secs 5
+$B coll-ingest ... --index-mb 128 --max-ssd 16 --maintain true
+$B coll-search --from sift1m --dir work --base $S/sift_base.fvecs --query $S/sift_query.fvecs \
+   --l 40,80,160 --delete 0,0.1,0.3,0.5 --adapt both --compact true --direct false
+```
+
 ## Designing for billions
 
 Raw `f32` vectors cost `n x dim x 4` bytes:
@@ -765,7 +944,11 @@ Within a shard:
    - io_uring registered buffers;
    - F16C decoding;
    - more even partitions (split the largest k-means clusters)
-6. Segments, WAL, deletes, compaction, metadata filtering
+6. ◐ Collections. Done: WAL with point-in-time recovery, growing and sealed
+   segments, manifest commits, tombstones per row position, index builds and
+   compaction from live rows, crash-state and model tests; ingest, delete
+   and multi-segment search measured on SIFT1M. Still to do: attribute
+   filters
 7. Server and single-node mode: gRPC/HTTP API, collections, the shard
    interface, concurrent reads and writes
 8. Distributed mode: remote shards, query nodes, metadata service,

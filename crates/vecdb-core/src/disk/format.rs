@@ -118,14 +118,14 @@ impl Layout {
         }
     }
 
-    fn code(self) -> u32 {
+    pub(crate) fn code(self) -> u32 {
         match self {
             Layout::Inline => 1,
             Layout::Separate => 2,
         }
     }
 
-    fn from_code(c: u32) -> Option<Self> {
+    pub(crate) fn from_code(c: u32) -> Option<Self> {
         match c {
             1 => Some(Layout::Inline),
             2 => Some(Layout::Separate),
@@ -144,7 +144,7 @@ pub(crate) fn codec_code(c: Codec) -> Option<u32> {
     }
 }
 
-fn codec_from_code(c: u32) -> Option<Codec> {
+pub(crate) fn codec_from_code(c: u32) -> Option<Codec> {
     match c {
         0 => Some(Codec::F32),
         1 => Some(Codec::F16),

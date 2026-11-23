@@ -207,10 +207,13 @@ impl NodeMap {
 }
 
 /// Checks rows and prepares them for the metric, as `GraphIndex::build` does.
-fn prepare(rows: &mut [f32], dim: usize, metric: Metric, threads: usize) -> Result<()> {
+/// Checks rows and prepares them for the metric (unit length for cosine),
+/// unless the source says they already are.
+fn prepare(src: &dyn VectorSource, rows: &mut [f32], dim: usize, metric: Metric, threads: usize) -> Result<()> {
+    let norm = metric.needs_normalization() && !src.prepared();
     par::map_rows_mut(rows, dim, threads, |_, rows| {
         check_finite(rows)?;
-        if metric.needs_normalization() {
+        if norm {
             rows.chunks_exact_mut(dim).for_each(normalize);
         }
         Ok(())
@@ -236,7 +239,7 @@ fn read_nodes(
     par::map_rows_mut(out, dim, threads, |first, rows| gather(src, map, &nodes[first..first + rows.len() / dim], rows))
         .into_iter()
         .collect::<Result<()>>()?;
-    prepare(out, dim, metric, threads)
+    prepare(src, out, dim, metric, threads)
 }
 
 /// Reads the rows of `nodes` (ascending) into `out`: one read per run of
@@ -284,7 +287,7 @@ fn scan(src: &dyn VectorSource, metric: Metric, threads: usize) -> Result<NodeMa
         let count = batch.min(n - first);
         buf.resize(count * dim, 0.0);
         src.read_rows(first, &mut buf)?;
-        prepare(&mut buf, dim, metric, threads)?;
+        prepare(src, &mut buf, dim, metric, threads)?;
         let hashes = par::map_ranges(count, threads, |range| {
             range.map(|i| row_hash(&buf[i * dim..(i + 1) * dim])).collect::<Vec<_>>()
         });
@@ -302,7 +305,7 @@ fn scan(src: &dyn VectorSource, metric: Metric, threads: usize) -> Result<NodeMa
             let mut firsts: Vec<(u32, Vec<f32>)> = Vec::new();
             for &(_, r) in &keys[i..j] {
                 src.read_rows(r as usize, &mut row)?;
-                prepare(&mut row, dim, metric, 1)?;
+                prepare(src, &mut row, dim, metric, 1)?;
                 match firsts.iter().find(|(_, v)| *v == row) {
                     Some(&(f, _)) => repeats.push((r, f)),
                     None => firsts.push((r, row.clone())),

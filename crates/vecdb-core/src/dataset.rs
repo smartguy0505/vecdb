@@ -166,6 +166,12 @@ pub trait VectorSource: Sync {
     fn row_bytes(&self) -> usize;
     /// Reads rows `first..first + out.len() / dim()` into `out` as `f32`.
     fn read_rows(&self, first: usize, out: &mut [f32]) -> Result<()>;
+    /// True when the rows are already prepared for the metric (unit length
+    /// for cosine), as rows read back from an index are. A build then uses
+    /// them as they are: normalizing again could change their last bits.
+    fn prepared(&self) -> bool {
+        false
+    }
 }
 
 impl VectorSource for Vecs<f32> {

@@ -50,6 +50,8 @@ use crate::quant::{Codec, ProductQuantizer};
 use crate::topk::{SearchResult, TopK};
 use format::{CODEBOOKS, CODES, GRAPH, Geometry, Header, ID_START, IDS, VECTORS, decode_vector};
 use io::{DEPTH, DataFile, Reader};
+pub(crate) use format::codec_from_code;
+pub(crate) use format::codec_code;
 pub(crate) use io::{drop_cache, free_space, read_exact_at};
 
 pub use format::{INLINE_MAX_RECORD, Layout, SECTOR};
@@ -110,6 +112,9 @@ pub struct DiskSearchStats {
     pub rounds: usize,
     pub pq_distances: usize,
     pub exact_distances: usize,
+    /// Expanded nodes with at least one id the filter admits (all of them
+    /// in an unfiltered search).
+    pub admitted: usize,
 }
 
 /// Per-thread search state: the I/O ring, read buffers and candidate lists.
@@ -340,12 +345,74 @@ impl DiskIndex {
 
     /// The ids stored at `node`.
     pub fn ids_of(&self, node: u32) -> &[u64] {
+        &self.ids[self.positions_of(node)]
+    }
+
+    /// Positions of `node`'s ids in the id table, `0..len()`. Every id has
+    /// its own position, also when identical vectors share a node, so
+    /// deletes and filters are kept per position.
+    pub fn positions_of(&self, node: u32) -> std::ops::Range<usize> {
         let n = node as usize;
-        if self.id_start.is_empty() {
-            &self.ids[n..n + 1]
-        } else {
-            &self.ids[self.id_start[n] as usize..self.id_start[n + 1] as usize]
+        if self.id_start.is_empty() { n..n + 1 } else { self.id_start[n] as usize..self.id_start[n + 1] as usize }
+    }
+
+    /// The id at position `pos`.
+    pub fn id_at(&self, pos: usize) -> u64 {
+        self.ids[pos]
+    }
+
+    /// The node that holds position `pos`.
+    pub fn node_of(&self, pos: usize) -> u32 {
+        if self.id_start.is_empty() { pos as u32 } else { (self.id_start.partition_point(|&s| s as usize <= pos) - 1) as u32 }
+    }
+
+    /// Reads the stored vectors of nodes `first..first + out.len() / dim()`
+    /// from `file` (this index's file, opened for buffered reads), checking
+    /// each record. Vectors come back decoded, as prepared at build time
+    /// (unit length for cosine, rounded for f16 / bf16).
+    pub fn read_node_vectors(&self, file: &File, first: u32, out: &mut [f32]) -> Result<()> {
+        let dim = self.dim();
+        let count = out.len() / dim;
+        if out.len() % dim != 0 || first as usize + count > self.nodes() {
+            return Err(Error::InvalidArgument("node range out of bounds".into()));
         }
+        let (rpb, bb) = (self.geo.records_per_block, self.geo.block_bytes);
+        let mut buf = Vec::new();
+        let mut vbuf = Vec::new();
+        let mut done = 0;
+        while done < count {
+            let node = first as usize + done;
+            // Whole blocks covering up to about 1 MB of records.
+            let block = node / rpb;
+            let last_block = (node + count - done - 1) / rpb;
+            let blocks = (last_block + 1 - block).min(((1 << 20) / bb).max(1));
+            buf.resize(blocks * bb, 0);
+            read_exact_at(file, &mut buf, self.header.sections[GRAPH].offset + (block * bb) as u64)?;
+            let end = ((block + blocks) * rpb).min(first as usize + count);
+            if self.layout() == Layout::Separate {
+                let vbb = self.geo.vector_block_bytes;
+                vbuf.resize((end - node) * vbb, 0);
+                read_exact_at(file, &mut vbuf, self.header.sections[VECTORS].offset + (node * vbb) as u64)?;
+            }
+            for v in node..end {
+                let at = (v / rpb - block) * bb + (v % rpb) * self.geo.record_len;
+                let r = self.parse(v as u32, &buf[at..at + self.geo.record_len])?;
+                let dst = &mut out[(v - first as usize) * dim..][..dim];
+                match self.layout() {
+                    Layout::Inline => decode_vector(self.codec(), r.vector, dst),
+                    Layout::Separate => {
+                        let vbb = self.geo.vector_block_bytes;
+                        let bytes = &vbuf[(v - node) * vbb..][..self.geo.vector_bytes];
+                        if crc32c(bytes) != r.vector_crc {
+                            return Err(Error::Corrupt(format!("vector of node {v} failed its checksum")));
+                        }
+                        decode_vector(self.codec(), bytes, dst);
+                    }
+                }
+            }
+            done = end - first as usize;
+        }
+        Ok(())
     }
 
     /// A search context for this index's I/O mode.
@@ -392,17 +459,30 @@ impl DiskIndex {
 
     /// Like [`search_with`](Self::search_with), with a context kept per thread.
     pub fn search(&self, query: &[f32], k: usize, params: &DiskSearchParams) -> Result<Vec<SearchResult>> {
+        Ok(self.search_filtered(query, k, params, &|_| true)?.0)
+    }
+
+    /// Like [`search_filtered_with`](Self::search_filtered_with), with a
+    /// context kept per thread. One context serves every index the thread
+    /// searches: its buffers grow to the largest.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        params: &DiskSearchParams,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<(Vec<SearchResult>, DiskSearchStats)> {
         CONTEXT.with_borrow_mut(|slot| {
             if slot.as_ref().is_none_or(|c| c.mode != self.io_mode) {
                 *slot = Some(self.context()?);
             }
             let ctx = slot.as_mut().expect("set above");
-            let result = self.search_with(ctx, query, k, params);
+            let result = self.search_filtered_with(ctx, query, k, params, admit);
             if matches!(result, Err(Error::Io(_))) {
                 // Start the next search with a fresh ring and buffers.
                 *slot = None;
             }
-            Ok(result?.0)
+            result
         })
     }
 
@@ -414,6 +494,21 @@ impl DiskIndex {
         query: &[f32],
         k: usize,
         params: &DiskSearchParams,
+    ) -> Result<(Vec<SearchResult>, DiskSearchStats)> {
+        self.search_filtered_with(ctx, query, k, params, &|_| true)
+    }
+
+    /// Like [`search_with`](Self::search_with), returning only ids whose
+    /// position (see [`positions_of`](Self::positions_of)) `admit` accepts.
+    /// The walk still goes through nodes it rejects, so a filter that
+    /// rejects many nodes needs a larger `l` to find `k` results.
+    pub fn search_filtered_with(
+        &self,
+        ctx: &mut SearchContext,
+        query: &[f32],
+        k: usize,
+        params: &DiskSearchParams,
+        admit: &dyn Fn(usize) -> bool,
     ) -> Result<(Vec<SearchResult>, DiskSearchStats)> {
         if query.len() != self.dim() {
             return Err(Error::DimensionMismatch { expected: self.dim(), got: query.len() });
@@ -439,12 +534,23 @@ impl DiskIndex {
         match self.layout() {
             Layout::Inline => {
                 for e in &ctx.expanded {
-                    self.ids_of(e.node).iter().for_each(|&id| top.push(id, e.exact));
+                    let mut any = false;
+                    for pos in self.positions_of(e.node) {
+                        if admit(pos) {
+                            top.push(self.ids[pos], e.exact);
+                            any = true;
+                        }
+                    }
+                    stats.admitted += any as usize;
                 }
             }
             Layout::Separate => {
+                // Drop rejected nodes before the re-rank cut, so its reads
+                // go to nodes that can be returned.
+                ctx.expanded.retain(|e| self.positions_of(e.node).any(admit));
+                stats.admitted = ctx.expanded.len();
                 let rerank = if params.rerank == 0 { usize::MAX } else { params.rerank.max(k) };
-                self.rerank(ctx, kern, &q, rerank, &mut top, &mut stats)?;
+                self.rerank(ctx, kern, &q, rerank, admit, &mut top, &mut stats)?;
             }
         }
         Ok((top.into_sorted(), stats))
@@ -551,6 +657,7 @@ impl DiskIndex {
         kern: &Kernels,
         q: &[f32],
         rerank: usize,
+        admit: &dyn Fn(usize) -> bool,
         top: &mut TopK,
         st: &mut DiskSearchStats,
     ) -> Result<()> {
@@ -574,7 +681,7 @@ impl DiskIndex {
                 decode_vector(self.codec(), bytes, vector);
                 let d = self.exact(kern, q, vector);
                 st.exact_distances += 1;
-                self.ids_of(e.node).iter().for_each(|&id| top.push(id, d));
+                self.positions_of(e.node).filter(|&p| admit(p)).for_each(|p| top.push(self.ids[p], d));
             }
         }
         Ok(())

@@ -7,6 +7,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod collection;
 pub mod crc32c;
 pub mod dataset;
 pub mod disk;
@@ -23,6 +24,10 @@ pub mod rng;
 pub mod store;
 pub mod topk;
 
+pub use collection::{
+    Attrs, Collection, CollectionConfig, Durability, Field, FieldType, IndexConfig, OpenOptions, SearchOptions, Value,
+    WriteOp,
+};
 pub use dataset::{VectorFile, VectorSource};
 pub use disk::{
     DiskIndex, DiskOpenOptions, DiskSearchParams, DiskSearchStats, DiskWriteOptions, IoMode, Layout, MergePrune,
