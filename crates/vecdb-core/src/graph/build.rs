@@ -71,14 +71,14 @@ impl<'a> Points<'a> {
     }
 
     #[inline]
-    fn inv_norm_of(&self, i: u32) -> f32 {
+    pub fn inv_norm_of(&self, i: u32) -> f32 {
         self.inv_norm.get(i as usize).copied().unwrap_or(0.0)
     }
 
     /// Build distance from a point (row `x`, with `x_inv_norm` = 1 / |x|,
     /// used only for inner product) to node `b`.
     #[inline]
-    fn dist_to(&self, kern: &Kernels, x: &[f32], x_inv_norm: f32, b: u32) -> f32 {
+    pub fn dist_to(&self, kern: &Kernels, x: &[f32], x_inv_norm: f32, b: u32) -> f32 {
         let y = self.row(b);
         match self.metric {
             Metric::L2 => (kern.l2_squared)(x, y),
@@ -88,7 +88,7 @@ impl<'a> Points<'a> {
     }
 
     #[inline]
-    fn dist(&self, kern: &Kernels, a: u32, b: u32) -> f32 {
+    pub fn dist(&self, kern: &Kernels, a: u32, b: u32) -> f32 {
         self.dist_to(kern, self.row(a), self.inv_norm_of(a), b)
     }
 }
@@ -339,33 +339,44 @@ pub(crate) fn robust_prune(
     out
 }
 
-/// The point nearest the mean of all points (by build distance).
-fn medoid(points: &Points, threads: usize) -> u32 {
-    const CHUNK: usize = 4096;
-    let (n, dim) = (points.len(), points.dim);
-    // Sum fixed-size chunks, then add the chunk sums in order: the rounding,
-    // and so the medoid, does not depend on the thread count.
-    let chunks: Vec<Vec<f64>> = par::map_ranges(n.div_ceil(CHUNK), threads, |range| {
-        range
-            .map(|c| {
-                let mut s = vec![0.0f64; dim];
-                for i in c * CHUNK..((c + 1) * CHUNK).min(n) {
-                    for (acc, &x) in s.iter_mut().zip(points.row(i as u32)) {
-                        *acc += x as f64;
-                    }
-                }
-                s
-            })
-            .collect::<Vec<_>>()
-    })
-    .concat();
+/// Rows per chunk when summing for the mean: see [`chunk_sum`].
+pub(crate) const MEAN_CHUNK: usize = 4096;
+
+/// Sum of one chunk of rows (at most [`MEAN_CHUNK`]), in f64. The mean adds
+/// the sums of consecutive chunks in order ([`mean_of`]), so its rounding,
+/// and so the medoid, does not depend on the thread count or on how a
+/// streaming build batches its reads.
+pub(crate) fn chunk_sum<'a>(rows: impl Iterator<Item = &'a [f32]>, dim: usize) -> Vec<f64> {
+    let mut s = vec![0.0f64; dim];
+    for row in rows {
+        for (acc, &x) in s.iter_mut().zip(row) {
+            *acc += x as f64;
+        }
+    }
+    s
+}
+
+/// Mean of `n` rows from the sums of their consecutive chunks.
+pub(crate) fn mean_of<'a>(chunk_sums: impl Iterator<Item = &'a Vec<f64>>, n: usize, dim: usize) -> Vec<f32> {
     let mut mean = vec![0.0f64; dim];
-    for s in &chunks {
+    for s in chunk_sums {
         for (m, v) in mean.iter_mut().zip(s) {
             *m += v;
         }
     }
-    let mean: Vec<f32> = mean.iter().map(|&m| (m / n as f64) as f32).collect();
+    mean.iter().map(|&m| (m / n as f64) as f32).collect()
+}
+
+/// The point nearest the mean of all points (by build distance).
+fn medoid(points: &Points, threads: usize) -> u32 {
+    let (n, dim) = (points.len(), points.dim);
+    let chunks: Vec<Vec<f64>> = par::map_ranges(n.div_ceil(MEAN_CHUNK), threads, |range| {
+        range
+            .map(|c| chunk_sum((c * MEAN_CHUNK..((c + 1) * MEAN_CHUNK).min(n)).map(|i| points.row(i as u32)), dim))
+            .collect::<Vec<_>>()
+    })
+    .concat();
+    let mean = mean_of(chunks.iter(), n, dim);
     let mean_inv_norm = inv_norm(&mean);
     let best = par::map_ranges(n, threads, |range| {
         let kern = kernels::best();
@@ -377,7 +388,7 @@ fn medoid(points: &Points, threads: usize) -> u32 {
 }
 
 /// 1 / |v| (computed in f64), or 0 for a zero vector.
-fn inv_norm(v: &[f32]) -> f32 {
+pub(crate) fn inv_norm(v: &[f32]) -> f32 {
     let n = v.iter().map(|&x| x as f64 * x as f64).sum::<f64>().sqrt();
     if n > 0.0 { (1.0 / n) as f32 } else { 0.0 }
 }

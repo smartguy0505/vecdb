@@ -28,6 +28,7 @@
 //! against the node count, so a damaged file gives [`Error::Corrupt`]
 //! rather than a panic or a silent wrong answer.
 
+mod build;
 mod format;
 mod io;
 mod write;
@@ -48,10 +49,12 @@ use crate::quant::pq::DistanceTable;
 use crate::quant::{Codec, ProductQuantizer};
 use crate::topk::{SearchResult, TopK};
 use format::{CODEBOOKS, CODES, GRAPH, Geometry, Header, ID_START, IDS, VECTORS, decode_vector};
-use io::{DEPTH, DataFile, Reader, drop_cache, read_exact_at};
+use io::{DEPTH, DataFile, Reader};
+pub(crate) use io::{drop_cache, free_space, read_exact_at};
 
 pub use format::{INLINE_MAX_RECORD, Layout, SECTOR};
 pub use io::IoMode;
+pub use build::{MergePrune, PartitionedBuildParams, PartitionedBuildReport, partition_node_bytes};
 pub use write::{DiskWriteOptions, DiskWriteReport};
 
 /// Largest `beam_width`: reads one search keeps in flight together.
@@ -199,6 +202,21 @@ impl DiskIndex {
     /// any file there atomically (write to `<path>.tmp`, fsync, rename).
     pub fn write(graph: &GraphIndex, path: impl AsRef<Path>, opts: &DiskWriteOptions) -> Result<DiskWriteReport> {
         write::write(graph, path.as_ref(), opts)
+    }
+
+    /// Builds an SSD index straight from `source` without holding all its
+    /// vectors in RAM: the collection is split into overlapping partitions
+    /// whose graphs are built one at a time and merged (see
+    /// [`PartitionedBuildParams`]). Row `i` gets id `ids[i]`, or `i` when
+    /// `ids` is `None`.
+    pub fn build_partitioned(
+        source: &dyn crate::dataset::VectorSource,
+        ids: Option<&[u64]>,
+        metric: Metric,
+        path: impl AsRef<Path>,
+        params: &PartitionedBuildParams,
+    ) -> Result<PartitionedBuildReport> {
+        build::build(source, ids, metric, path.as_ref(), params)
     }
 
     /// Opens an index: validates the header, loads and checks the RAM
@@ -686,5 +704,16 @@ fn read_u64s(f: &File, h: &Header, i: usize) -> Result<Vec<u64>> {
     Ok(read_section(f, h, i)?.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect())
 }
 
+/// A fresh directory for one test's files (removed first if it exists).
+#[cfg(test)]
+pub(crate) fn test_dir(name: &str) -> PathBuf {
+    let dir = io::tests::temp_path(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(test)]
+mod build_tests;
 #[cfg(test)]
 mod tests;

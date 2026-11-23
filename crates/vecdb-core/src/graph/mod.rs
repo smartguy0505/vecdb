@@ -17,7 +17,7 @@
 //! Scope for now: batch build only, no inserts or deletes. A built graph is
 //! saved as an SSD index with [`DiskIndex::write`](crate::disk::DiskIndex::write).
 
-mod build;
+pub(crate) mod build;
 pub(crate) mod search;
 pub(crate) mod visited;
 
@@ -60,7 +60,7 @@ impl Default for GraphParams {
 }
 
 impl GraphParams {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.max_degree == 0 || self.max_degree > MAX_DEGREE {
             return Err(Error::InvalidArgument(format!("max_degree must be in 1..={MAX_DEGREE}")));
         }
@@ -336,10 +336,19 @@ impl GraphIndex {
     }
 }
 
+/// Hash of a row for finding identical rows. Rows equal by `==` hash alike
+/// (-0.0 is hashed as 0.0).
+pub(crate) fn row_hash(row: &[f32]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    row.iter().for_each(|&x| (x + 0.0).to_bits().hash(&mut h));
+    h.finish()
+}
+
 /// Groups identical rows. Returns one row per distinct vector (in order of
 /// first appearance), the id ranges per node, and the ids in node order.
 fn dedup(data: Vec<f32>, dim: usize, ids: &[u64]) -> (Vec<f32>, Vec<usize>, Vec<u64>) {
-    use std::collections::hash_map::{DefaultHasher, Entry};
+    use std::collections::hash_map::Entry;
     let n = ids.len();
     let row = |i: usize| &data[i * dim..(i + 1) * dim];
     // rep[i]: the first row equal to row i (`==`, so 0.0 equals -0.0; the
@@ -348,9 +357,7 @@ fn dedup(data: Vec<f32>, dim: usize, ids: &[u64]) -> (Vec<f32>, Vec<usize>, Vec<
     let mut collisions: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut rep = Vec::with_capacity(n);
     for i in 0..n {
-        let mut h = DefaultHasher::new();
-        row(i).iter().for_each(|&x| (x + 0.0).to_bits().hash(&mut h));
-        let h = h.finish();
+        let h = row_hash(row(i));
         let r = match first.entry(h) {
             Entry::Vacant(e) => *e.insert(i),
             Entry::Occupied(e) if row(*e.get()) == row(i) => *e.get(),

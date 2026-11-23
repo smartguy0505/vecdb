@@ -7,12 +7,15 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use vecdb_core::dataset::{self, Vecs};
+use vecdb_core::dataset::{self, VectorFile, VectorSource, Vecs};
 use vecdb_core::format::{read_flat_segment, write_flat_segment};
 use vecdb_core::kernels::{self, Kernels};
 use vecdb_core::rng::SplitMix64;
 use vecdb_core::quant::{Codec, PqParams};
-use vecdb_core::disk::{DiskIndex, DiskOpenOptions, DiskSearchParams, DiskWriteOptions, IoMode, Layout, SearchContext};
+use vecdb_core::disk::{
+    DiskIndex, DiskOpenOptions, DiskSearchParams, DiskWriteOptions, IoMode, Layout, MergePrune, PartitionedBuildParams,
+    SearchContext, partition_node_bytes,
+};
 use vecdb_core::{FlatIndex, GraphIndex, GraphParams, Metric, Navigation, PqIndex, SearchResult};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -45,8 +48,14 @@ commands:
   disk-build   --base F --out PREFIX --pq-m M [--metric l2] [--layout auto] [--codec f32]
                [--degree 64] [--build-l 100] [--alpha 1.2] [--passes 1] [--threads 4]
                [--iters 15] [--max-train 65536] [--limit N]
+               [--build-mem GB | --partitions K] [--overlap 2] [--part-degree R]
+               [--merge pq] [--scratch DIR]
                build the graph and PQ once, then write PREFIX.<layout>.<codec>.vdx for
-               every --layout (auto, inline, separate) and --codec (f32, f16, bf16) listed
+               every --layout (auto, inline, separate) and --codec (f32, f16, bf16) listed.
+               With --build-mem or --partitions: a partitioned build that reads F by
+               position (never loads it), builds overlapping partitions one at a time
+               within the budget and merges them (--merge pq or random);
+               one layout and codec only
   disk-search  --index FILE --query F --gt G [--k 10] [--l 20,40,80,160] [--w 1,2,4,8]
                [--rerank 0] [--threads 4] [--cache 0] [--io auto] [--direct true]
                [--nq N] [--warmup 200] [--verify false]
@@ -55,7 +64,8 @@ commands:
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
-F = .fvecs or .bvecs. Metrics: l2, ip, cosine.
+F = .fvecs or .bvecs (disk-build --build-mem/--partitions also reads .fbin and .u8bin).
+Metrics: l2, ip, cosine.
 Set VECDB_KERNELS=scalar (or avx2-fma) to force a kernel set for A/B runs.
 ";
 
@@ -771,7 +781,7 @@ fn graph_bench(a: &Args) -> AnyResult<()> {
 fn disk_build(a: &Args) -> AnyResult<()> {
     a.allow(&[
         "base", "out", "metric", "layout", "codec", "degree", "build-l", "alpha", "passes", "threads", "pq-m", "iters",
-        "max-train", "limit",
+        "max-train", "limit", "build-mem", "partitions", "overlap", "part-degree", "merge", "scratch",
     ])?;
     let metric = a.metric()?;
     let threads: usize = a.num("threads", 4)?;
@@ -798,6 +808,10 @@ fn disk_build(a: &Args) -> AnyResult<()> {
         seed: 0x5eed,
         threads,
     };
+    let pq = PqParams { m, iters: a.num("iters", 15)?, max_train: a.num("max-train", 65_536)?, seed: 0x5eed, threads };
+    if a.map.contains_key("build-mem") || a.map.contains_key("partitions") {
+        return disk_build_partitioned(a, metric, &out, &layouts, &codecs, params, pq);
+    }
     let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
     let (n, dim) = (base.len(), base.dim);
     println!("data     {n} x {dim} ({}), kernels {}", metric.name(), kernels::best().name);
@@ -816,7 +830,6 @@ fn disk_build(a: &Args) -> AnyResult<()> {
         index.reachable()
     );
     let t0 = Instant::now();
-    let pq = PqParams { m, iters: a.num("iters", 15)?, max_train: a.num("max-train", 65_536)?, seed: 0x5eed, threads };
     index.train_pq(&pq)?;
     println!("pq       {m} B/vector, trained and encoded in {:.1} s", t0.elapsed().as_secs_f64());
     for layout in &layouts {
@@ -834,6 +847,104 @@ fn disk_build(a: &Args) -> AnyResult<()> {
             );
         }
     }
+    Ok(())
+}
+
+static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn progress(msg: &str) {
+    println!("  {:8.1} s  {msg}", START.get_or_init(Instant::now).elapsed().as_secs_f64());
+}
+
+fn disk_build_partitioned(
+    a: &Args,
+    metric: Metric,
+    out: &Path,
+    layouts: &[Option<Layout>],
+    codecs: &[Codec],
+    graph: GraphParams,
+    pq: PqParams,
+) -> AnyResult<()> {
+    let (&[layout], &[codec]) = (layouts, codecs) else {
+        return Err("a partitioned build writes one --layout and one --codec".into());
+    };
+    START.get_or_init(Instant::now);
+    let base = a.req_path("base")?;
+    let src = VectorFile::open(&base, a.opt_num("limit")?)?;
+    let (n, dim) = (src.len(), src.dim());
+    let gb: Option<f64> = a.opt_num("build-mem")?;
+    let merge_name = a.map.get("merge").map(String::as_str).unwrap_or("pq");
+    let p = PartitionedBuildParams {
+        memory_budget: gb.map_or(0, |gb| (gb * 1e9) as u64),
+        partitions: a.num("partitions", 0)?,
+        overlap: a.num("overlap", 2)?,
+        partition_degree: a.num("part-degree", 0)?,
+        merge: MergePrune::parse(merge_name).ok_or_else(|| format!("unknown --merge {merge_name:?} (pq, random)"))?,
+        scratch_dir: a.path("scratch"),
+        write: DiskWriteOptions { layout, codec },
+        progress: Some(progress),
+        graph,
+        pq,
+    };
+    let part_r = if p.partition_degree == 0 { p.graph.max_degree } else { p.partition_degree };
+    println!(
+        "data     {n} x {dim} ({}) read by position from {}, kernels {}",
+        metric.name(),
+        base.display(),
+        kernels::best().name
+    );
+    match gb {
+        Some(gb) => println!(
+            "budget   {gb} GB per partition = {} nodes at {} B/node",
+            (gb * 1e9) as u64 / partition_node_bytes(dim, part_r),
+            partition_node_bytes(dim, part_r)
+        ),
+        None => println!("budget   {} partitions given", p.partitions),
+    }
+    println!(
+        "graph    R {}, partition R {part_r}, build L {}, alpha {}, passes {}, overlap {}, merge {}, {} threads",
+        p.graph.max_degree,
+        p.graph.build_list,
+        p.graph.alpha,
+        p.graph.passes,
+        p.overlap,
+        p.merge.name(),
+        p.graph.threads
+    );
+    let chosen = layout.unwrap_or_else(|| Layout::auto(dim, codec, p.graph.max_degree));
+    let name = format!("{}.{}.{}.vdx", out.display(), chosen.name(), codec.name());
+    let t0 = Instant::now();
+    let read0 = storage_read_bytes();
+    let rep = DiskIndex::build_partitioned(&src, None, metric, &name, &p)?;
+    let total = t0.elapsed().as_secs_f64();
+    let read = storage_read_bytes() - read0;
+    println!(
+        "built    {} partitions (largest {} nodes{}), {} of {} rows distinct, mean degree {:.1}, {} unreachable after merge ({} unrepaired)",
+        rep.partitions,
+        rep.largest_partition,
+        rep.budget_nodes.map_or(String::new(), |b| format!(", budget {b}")),
+        rep.nodes,
+        rep.rows,
+        rep.mean_degree,
+        rep.unreachable,
+        rep.unrepaired
+    );
+    println!(
+        "wrote    {name}: {:.2} GB; SSD {:.0} B/node, RAM {:.1} B/vector",
+        rep.write.file_bytes as f64 / 1e9,
+        rep.write.ssd_bytes_per_node,
+        rep.write.ram_bytes as f64 / n as f64
+    );
+    let steps: Vec<String> = rep.steps.iter().map(|(s, t)| format!("{s} {t:.1}")).collect();
+    println!("time     {total:.1} s: {}", steps.join(", "));
+    let (_, peak) = memory_usage();
+    println!(
+        "memory   peak RSS {:.2} GB; scratch disk peak {:.2} GB; read {:.1} GB from the device, page-cache hits not counted (input file {:.2} GB)",
+        peak as f64 / 1e9,
+        rep.scratch_bytes as f64 / 1e9,
+        read as f64 / 1e9,
+        std::fs::metadata(&base).map_or(0, |m| m.len()) as f64 / 1e9
+    );
     Ok(())
 }
 

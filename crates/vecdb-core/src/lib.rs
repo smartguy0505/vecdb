@@ -23,7 +23,11 @@ pub mod rng;
 pub mod store;
 pub mod topk;
 
-pub use disk::{DiskIndex, DiskOpenOptions, DiskSearchParams, DiskSearchStats, DiskWriteOptions, IoMode, Layout};
+pub use dataset::{VectorFile, VectorSource};
+pub use disk::{
+    DiskIndex, DiskOpenOptions, DiskSearchParams, DiskSearchStats, DiskWriteOptions, IoMode, Layout, MergePrune,
+    PartitionedBuildParams, PartitionedBuildReport,
+};
 pub use distance::Metric;
 pub use error::{Error, Result};
 pub use flat::FlatIndex;

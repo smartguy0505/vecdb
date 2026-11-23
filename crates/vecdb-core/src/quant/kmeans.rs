@@ -1,5 +1,6 @@
 //! Lloyd's k-means with random initialization, used to train PQ codebooks
-//! (and later IVF partitions).
+//! and the partitions of a partitioned SSD index build. The centroids depend
+//! on the seed but not on the thread count.
 
 use crate::error::{Error, Result};
 use crate::kernels;
@@ -36,40 +37,60 @@ pub fn train(data: &[f32], dim: usize, p: &KMeansParams) -> Result<Vec<f32>> {
         centroids.extend_from_slice(&data[i * dim..(i + 1) * dim]);
     }
 
+    let row = |i: usize| &data[i * dim..(i + 1) * dim];
     for _ in 0..p.iters {
-        // Assign each row to its nearest centroid; accumulate sums per thread.
-        let parts = par::map_ranges(n, p.threads, |range| {
+        // Assign each row to its nearest centroid.
+        let labels: Vec<usize> = par::map_ranges(n, p.threads, |range| {
             let kern = kernels::best();
-            let mut sums = vec![0.0f64; k * dim];
-            let mut counts = vec![0usize; k];
             let mut dists = vec![0.0f32; k];
-            for i in range {
-                let x = &data[i * dim..(i + 1) * dim];
-                (kern.l2_squared_batch)(x, &centroids, &mut dists);
-                let j = argmin(&dists);
-                counts[j] += 1;
-                for (s, &v) in sums[j * dim..(j + 1) * dim].iter_mut().zip(x) {
-                    *s += v as f64;
-                }
-            }
-            (sums, counts)
-        });
-        let mut sums = vec![0.0f64; k * dim];
-        let mut counts = vec![0usize; k];
-        for (s, c) in parts {
-            for (a, b) in sums.iter_mut().zip(&s) {
-                *a += b;
-            }
-            for (a, b) in counts.iter_mut().zip(&c) {
-                *a += b;
-            }
+            range
+                .map(|i| {
+                    (kern.l2_squared_batch)(row(i), &centroids, &mut dists);
+                    argmin(&dists)
+                })
+                .collect::<Vec<_>>()
+        })
+        .concat();
+        // Group the rows by cluster, in row order within each cluster.
+        let mut start = vec![0usize; k + 1];
+        for &j in &labels {
+            start[j + 1] += 1;
         }
         for j in 0..k {
-            if counts[j] > 0 {
-                let inv = 1.0 / counts[j] as f64;
-                for d in 0..dim {
-                    centroids[j * dim + d] = (sums[j * dim + d] * inv) as f32;
-                }
+            start[j + 1] += start[j];
+        }
+        let mut members = vec![0usize; n];
+        let mut fill = start.clone();
+        for (i, &j) in labels.iter().enumerate() {
+            members[fill[j]] = i;
+            fill[j] += 1;
+        }
+        drop(labels);
+        // One thread sums each cluster, in row order, so the centroids do
+        // not depend on the thread count.
+        let means = par::map_ranges(k, p.threads, |range| {
+            range
+                .map(|j| {
+                    let rows = &members[start[j]..start[j + 1]];
+                    if rows.is_empty() {
+                        return None;
+                    }
+                    let mut sum = vec![0.0f64; dim];
+                    for &i in rows {
+                        for (s, &v) in sum.iter_mut().zip(row(i)) {
+                            *s += v as f64;
+                        }
+                    }
+                    let inv = 1.0 / rows.len() as f64;
+                    Some(sum.into_iter().map(|s| (s * inv) as f32).collect::<Vec<f32>>())
+                })
+                .collect::<Vec<_>>()
+        })
+        .concat();
+        let mut counts: Vec<usize> = (0..k).map(|j| start[j + 1] - start[j]).collect();
+        for (j, mean) in means.iter().enumerate() {
+            if let Some(m) = mean {
+                centroids[j * dim..(j + 1) * dim].copy_from_slice(m);
             }
         }
         split_empty_clusters(&mut centroids, &mut counts, dim);
@@ -151,6 +172,16 @@ mod tests {
         let data: Vec<f32> = (0..3 * 500).map(|_| rng.uniform(-1.0, 1.0)).collect();
         let p = KMeansParams { k: 8, iters: 10, seed: 11, threads: 2 };
         assert_eq!(train(&data, 3, &p).unwrap(), train(&data, 3, &p).unwrap());
+    }
+
+    #[test]
+    fn same_centroids_for_any_thread_count() {
+        let mut rng = SplitMix64::new(4);
+        let data: Vec<f32> = (0..5 * 3000).map(|_| rng.uniform(-1.0, 1.0)).collect();
+        let at = |threads| train(&data, 5, &KMeansParams { k: 16, iters: 8, seed: 5, threads }).unwrap();
+        let one = at(1);
+        assert_eq!(one, at(3));
+        assert_eq!(one, at(8));
     }
 
     #[test]

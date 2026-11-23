@@ -6,11 +6,11 @@ approximate nearest neighbor search.
 Status: steps 1-4 are done: exact search, the segment file format and
 benchmark harness; SIMD kernels (AVX2/FMA); quantization (PQ, plus
 f16/bf16/int8 storage for re-ranking); and an in-memory graph index (Vamana)
-with a search-time recall/latency knob. Step 5, the SSD index, is partly
-done. Search works and is measured at 1M scale: PQ codes in RAM, graph and
-full vectors on SSD, read with direct I/O and io_uring. Two gaps remain: the
-index must still be built in RAM, and the 100M-vectors-per-node target has
-not been attempted.
+with a search-time recall/latency knob. Step 5, the SSD index, works and is
+measured at 1M scale: PQ codes in RAM, graph and full vectors on SSD, read
+with direct I/O and io_uring, and a partitioned build that needs RAM for one
+partition rather than the whole collection. The 100M-vectors-per-node target
+has not been attempted yet: it needs a dedicated machine.
 
 ## Goals
 
@@ -232,9 +232,11 @@ distances. Build parameters: maximum degree `R` (default 64), build list size
   node. That is the disk index's search (step 5: codes in RAM, one SSD read
   per expanded node), run in memory so its recall can be measured before any
   I/O code exists.
-- **Not yet:** inserts after the build, deletes, saving the graph to disk.
-  Two build passes (`passes = 2`, the original paper's schedule) are
-  implemented but not benchmarked.
+- **Not yet:** inserts after the build and deletes (step 6). Two build
+  passes (`passes = 2`, the original paper's schedule) were measured later,
+  through the SSD index: on SIFT1M they raise recall at equal L by up to
+  0.005 (0.965 to 0.970 at L 40) for twice the build time (see the
+  partitioned build).
 
 Results below are recall@10 and single-thread latency per query (median,
 p99), all in RAM. `dist/q` is distance computations per query (PQ lookups
@@ -389,9 +391,9 @@ process (`DiskIndex::open`).
     their vectors read at the end. Used beyond that.
 
   The cutoff comes from the measurements below.
+- **Building larger than RAM:** `DiskIndex::write` needs the whole graph and
+  all vectors in memory; the partitioned build below does not.
 - **Not yet:**
-  - **Building larger than RAM:** `DiskIndex::write` needs the whole graph
-    and all vectors in memory. A partitioned build is next.
   - **Inserts and deletes:** step 6.
   - **Overlapping CPU work with reads:** see below.
 
@@ -519,8 +521,8 @@ What this shows:
     recall >= 0.95. Part of that is the loaded box (CPU time is inflated).
     The rest needs the CPU work above, and f16 with hardware decoding.
 - **Not shown here:** 100M or more vectors, and many threads. 100M vectors
-  needs the partitioned build and a dedicated machine. Multi-thread QPS on
-  this shared RAID would mostly measure the IOPS cap.
+  needs a dedicated machine. Multi-thread QPS on this shared RAID would
+  mostly measure the IOPS cap.
 
 Commands (`S`, `G` as above; `--layout auto` is the default):
 
@@ -539,6 +541,129 @@ $B disk-search --index gist1m.inline.f16.vdx --query $G/gist_query.fvecs \
       --gt $G/gist_groundtruth.ivecs --threads 1 --w 4 --l 80,160,320
 $B disk-search --index gist1m.separate.f32.vdx ... --rerank 0,20,50   # 0 = re-rank all
 $B disk-search ... --cache 100000            # keep 100k nodes near the entry in RAM
+```
+
+## Partitioned build (step 5)
+
+`DiskIndex::build_partitioned` writes the SSD index straight from a vector
+file. It never loads the file, and holds only one partition's vectors and
+graph in RAM at a time. This is the merged-partition build of DiskANN. Files
+are read by position: `.fvecs`, `.bvecs`, and the `.fbin` / `.u8bin` files
+of big-ann-benchmarks. Any `VectorSource` works.
+
+1. **Scan** every row: check it, prepare it for the metric (normalize for
+   cosine) and hash it. Rows with equal hashes are compared. Identical rows
+   share one node, and nodes are numbered in row order, as in the in-memory
+   build.
+2. **Train** PQ, and k-means centroids for the partitions, on one random
+   sample of nodes. Given a memory budget, the number of partitions grows
+   until the largest one, estimated on the sample with a 10% margin, fits.
+3. **Encode:** a second read PQ-encodes every node and assigns it to its 2
+   nearest centroids (`overlap`), so neighboring partitions share nodes.
+4. **Build the partitions**, one at a time: read the partition's vectors,
+   build its Vamana graph in RAM, and write its out-lists, with their exact
+   distances, to a scratch file.
+5. **Merge:** a node's two out-lists are joined and pruned back to R with
+   RobustPrune. Distances to the node are exact (kept from the partition
+   builds). Distances between candidates come from their PQ codes, because
+   their vectors are not in RAM. A walk from the entry then finds the nodes
+   the merged graph does not reach. Each gets an in-edge from its nearest
+   reachable out-neighbor with a free slot.
+6. **Write:** a third read streams every node, with its merged out-list,
+   into the index file.
+
+- **RAM** is the budget (one partition: about `4·dim + 8·R + 96` bytes per
+  node), plus `m + 4` bytes per vector for the PQ codes and partition
+  numbers, plus read buffers of up to 32 MB per thread. Before that, the
+  scan needs 16 bytes per row; after it, the reachability walk needs up to
+  4 bytes per node. The plan sizes partitions from a sample with a 10%
+  margin. A partition that still comes out over the budget is built anyway,
+  with a warning in the progress log.
+- **Scratch disk** holds the partition out-lists and the merged graph (under
+  1 GB for SIFT1M and GIST1M). It is removed when the build ends, also on
+  error. Free space is checked first.
+- **The same file for any thread count.** For this, k-means now sums each
+  cluster in row order, so PQ codebooks no longer depend on the thread count
+  either. SIFT1M's codebooks did not change: its values are integers, so the
+  sums are exact in any order.
+- **One partition reproduces the in-memory build byte for byte.** A test
+  checks this for every metric, with identical rows and a sampled PQ. At
+  full size, the 0.85 GB SIFT1M file is identical to the one measured above.
+
+Results: recall@10 and SSD reads per query, `W = 4`, single thread.
+SIFT1M was searched from the page cache on all 10,000 queries; the graph
+alone decides recall and reads, so they do not depend on where the blocks
+come from. GIST1M was searched with direct I/O on its 1,000 queries. Build
+times are from the loaded machine and vary by up to 1.6x between runs: four
+10-partition SIFT1M builds with the same partition work (the PQ merge twice,
+two other merges) spent 187-300 s building partitions, and three runs of one
+GIST1M budget build (with an earlier planner that made 23 partitions) took
+1,131 to 1,483 s. The random-merge
+rows were measured before the partition reads were spread over the
+threads, which added up to 0.1 GB of read buffers.
+
+**SIFT1M** (R 64, build L 100, PQ 32 B; recall / reads per query):
+
+| build | mean degree | build time | peak RSS | L 40 | L 80 | L 160 |
+|---|---:|---:|---:|---:|---:|---:|
+| one partition (= in-memory build) | 45.5 | 135 s | 1.25 GB | 0.9653 / 54.4 | 0.9914 / 93.1 | 0.9981 / 172.0 |
+| 10 partitions, PQ merge | 52.4 | 208 s | 0.50 GB | 0.9720 / 55.1 | 0.9944 / 93.9 | 0.9988 / 172.8 |
+| 10 partitions, random merge, partition R 43 (DiskANN's) | 54.4 | 293 s | 0.40 GB | 0.9709 / 54.8 | 0.9937 / 93.5 | 0.9988 / 172.5 |
+| 10 partitions, random merge, partition R 64 | 58.0 | 329 s | 0.44 GB | 0.9666 / 54.7 | 0.9924 / 93.5 | 0.9985 / 172.5 |
+| one partition, two passes (`--passes 2`) | 45.1 | 256 s | 1.20 GB | 0.9700 / 53.8 | 0.9934 / 92.5 | 0.9987 / 171.5 |
+
+**GIST1M** (960 dims, R 64, build L 100, PQ 120 B, inline f32 with 8 KB
+blocks; recall / reads per query):
+
+| build | mean degree | build time | peak RSS | L 80 | L 160 | L 320 |
+|---|---:|---:|---:|---:|---:|---:|
+| one partition (= in-memory build) | 33.4 | 1,013 s | 4.41 GB | 0.897 / 94.0 | 0.959 / 172.0 | 0.985 / 330.5 |
+| 1 GB budget, in a cgroup capped at 1.6 GB: 20 partitions | 38.6 | 1,160 s | 1.10 GB | 0.911 / 94.3 | 0.966 / 172.3 | 0.990 / 330.9 |
+
+What this shows:
+
+- **RAM follows the budget, not the collection.** GIST1M's vectors take
+  3.84 GB. The partitioned build ran in a cgroup capped at 1.6 GB and peaked
+  at 1.10 GB, against 4.41 GB for the one-partition build. SIFT1M with 10
+  partitions peaked at 0.50 GB, against 1.25 GB.
+- **No recall is lost to partitioning.** Every node is inserted into two
+  partitions, and the merged graph matches a two-pass in-memory build
+  (SIFT1M: 0.9720 against 0.9700 at L 40, for 2% more reads). It therefore
+  beats the default one-pass build: GIST1M reaches 0.966 against 0.959 at
+  L 160, for the same reads. The merged graph has more edges (SIFT1M mean
+  degree 52.4 against 45.5). That costs PQ lookups in RAM, not SSD reads.
+- **The PQ merge is at least as good as DiskANN's random truncation,** with
+  fewer edges, on SIFT1M: 0.001 higher recall at L 40 and L 80 and equal at
+  L 160, at mean degree 52.4 against 54.4. Truncating full-degree partition
+  lists at random did worst. `--merge random` remains available.
+- **The cost is 1.1-1.7x the build time of a one-pass build** in these runs
+  (SIFT1M 208-227 s against 135 s; GIST1M 1,131-1,483 s against 1,013 s),
+  because each node is inserted twice, into smaller graphs. That is about
+  what the two-pass build costs (SIFT1M: 256 s). Scratch disk stayed under
+  1 GB.
+- **The merge needs the reachability repair.** GIST1M's merged graph left
+  2,455 nodes (0.25%) unreachable from the entry; 2,414 new in-edges made
+  them all reachable. SIFT1M had none.
+- **Partitions are uneven.** GIST1M's k-means partitions held 12k to 189k
+  nodes (mean 98k, budget 225k), so the build needed 20 partitions where 9
+  would hold the nodes at even sizes. Extra partitions cost little build
+  time, since each node is still inserted twice. Each partition reads its
+  rows, and gaps of up to 16 KB between them, so on a cold cache extra
+  partitions add reads (not measured here: the input files were in the page
+  cache). Splitting the largest clusters would even them out.
+- **At 100M vectors** (estimated, not run): for 128 dims, R 64 and 32-byte
+  PQ codes, RAM peaks at the budget plus about 3.6 GB for codes and
+  partition numbers. The scan needs 1.6 GB before that, and the
+  reachability walk up to 0.4 GB after the partitions. Scratch disk is up to
+  about 130 GB and the index about 82 GB.
+
+Commands (`S`, `G` as above):
+
+```
+$B disk-build --base $S/sift_base.fvecs --out sift1m-p10 --pq-m 32 --threads 6 --partitions 10
+$B disk-build --base $G/gist_base.fvecs --out gist1m-1g --pq-m 120 --threads 6 --build-mem 1
+$B disk-build ... --partitions 1          # = the in-memory build, byte for byte
+$B disk-build ... --merge random --part-degree 43   # DiskANN's merge
 ```
 
 ## Designing for billions
@@ -631,14 +756,15 @@ Within a shard:
    graph (step 5)
 5. ◐ SSD index. Done: PQ codes in RAM; graph and full vectors on SSD (f32,
    f16 or bf16; layout chosen by record size); checksummed records; direct
-   I/O; io_uring beam search; hot-node cache. Measured on SIFT1M, GIST1M and
-   2048- and 8192-dim data. Still to do:
-   - a partitioned build for collections larger than RAM (needed for the
-     100M-vectors-per-node target);
+   I/O; io_uring beam search; hot-node cache; a partitioned build within a
+   memory budget. Measured on SIFT1M, GIST1M and 2048- and 8192-dim data.
+   Still to do:
+   - a 100M-vector build and search on dedicated hardware (the target per
+     node);
    - processing blocks while the round's other reads are in flight;
    - io_uring registered buffers;
    - F16C decoding;
-   - 100M-scale runs on dedicated hardware
+   - more even partitions (split the largest k-means clusters)
 6. Segments, WAL, deletes, compaction, metadata filtering
 7. Server and single-node mode: gRPC/HTTP API, collections, the shard
    interface, concurrent reads and writes

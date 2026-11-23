@@ -28,6 +28,31 @@ where
     })
 }
 
+/// Like [`map_ranges`] over the rows of `data` (`dim` values each), giving
+/// each thread mutable access to its rows: `f(first_row, rows)`.
+pub fn map_rows_mut<T, R, F>(data: &mut [T], dim: usize, threads: usize, f: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(usize, &mut [T]) -> R + Sync,
+{
+    let n = data.len().checked_div(dim).unwrap_or(0);
+    let threads = effective_threads(threads).min(n.max(1));
+    if threads <= 1 {
+        return vec![f(0, data)];
+    }
+    let per = n.div_ceil(threads);
+    std::thread::scope(|s| {
+        let f = &f;
+        let handles: Vec<_> = data
+            .chunks_mut(per * dim)
+            .enumerate()
+            .map(|(t, rows)| s.spawn(move || f(t * per, rows)))
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("worker thread panicked")).collect()
+    })
+}
+
 pub fn effective_threads(threads: usize) -> usize {
     if threads == 0 {
         std::thread::available_parallelism().map_or(1, |n| n.get())

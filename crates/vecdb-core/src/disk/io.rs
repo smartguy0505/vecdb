@@ -117,6 +117,31 @@ pub(crate) fn drop_cache(file: &File) {
     let _ = file;
 }
 
+/// Bytes free for an unprivileged writer on the file system holding `dir`
+/// (Linux; `None` elsewhere or on error).
+pub(crate) fn free_space(dir: &std::path::Path) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `st` is a valid out-pointer;
+        // statvfs fills it completely when it returns 0.
+        let st = unsafe {
+            if libc::statvfs(path.as_ptr(), st.as_mut_ptr()) != 0 {
+                return None;
+            }
+            st.assume_init()
+        };
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 /// Heap memory whose usable part starts on an `ALIGN` boundary. Never
 /// reallocated after creation, so pointers into it stay valid.
 struct AlignedBuf {
