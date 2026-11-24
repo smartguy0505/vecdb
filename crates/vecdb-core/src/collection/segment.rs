@@ -11,12 +11,12 @@
 //! also records its number until no open search predates it
 //! ([`Tombstones::prune`]); [`AsOf`] reads the bits as of a snapshot.
 
-use std::cell::OnceCell;
-use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::bytes::{Dec, Enc, write_file};
 use super::columns::{ColumnBuilder, SegmentAttrs};
@@ -92,9 +92,9 @@ impl Tombstones {
         }
         // The number first, then the bit: a search that sees the bit (an
         // acquire load of the word) also sees the number.
-        self.last_seq.store(seq, Ordering::Relaxed);
         {
             let mut r = self.recent.lock().unwrap();
+            self.last_seq.store(seq, Ordering::Relaxed);
             r.order.push_back((pos as u32, seq));
             r.seq_of.insert(pos as u32, seq);
         }
@@ -144,6 +144,15 @@ impl Tombstones {
         w
     }
 
+    /// The deletes after write `seq`, oldest first: position and sequence
+    /// number. Complete while a snapshot at `seq` is registered.
+    pub fn deleted_after(&self, seq: u64) -> Vec<(u32, u64)> {
+        let r = self.recent.lock().unwrap();
+        let mut out: Vec<(u32, u64)> = r.order.iter().rev().take_while(|&&(_, d)| d > seq).copied().collect();
+        out.reverse();
+        out
+    }
+
     /// Forgets the numbers of deletes up to `seq`, which no open snapshot
     /// predates.
     pub fn prune(&self, seq: u64) {
@@ -169,14 +178,20 @@ impl Tombstones {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// Writes the tombstone file (fsynced; the caller fsyncs the directory).
-    pub fn write(&self, path: &Path, segment: u64) -> Result<usize> {
+    /// All bits set now.
+    pub fn words(&self) -> Vec<u64> {
+        self.words.iter().map(|w| w.load(Ordering::Acquire)).collect()
+    }
+
+    /// Writes a tombstone file for `segment` with the bits `words` (from
+    /// `words` or `words_as_of`), fsynced; the caller fsyncs the directory.
+    /// Returns the rows deleted.
+    pub fn write(&self, path: &Path, segment: u64, words: &[u64]) -> Result<usize> {
         let mut e = Enc::default();
         e.buf.extend_from_slice(&DEL_MAGIC);
         e.u32(DEL_VERSION);
         e.u64(segment);
         e.u64(self.len as u64);
-        let words: Vec<u64> = self.words.iter().map(|w| w.load(Ordering::Acquire)).collect();
         let count: usize = words.iter().map(|w| w.count_ones() as usize).sum();
         e.u64(count as u64);
         words.iter().for_each(|&w| e.u64(w));
@@ -217,41 +232,40 @@ impl Tombstones {
     }
 }
 
-/// A segment's tombstones as of one snapshot, for many lookups: reads the
-/// shared bits until a delete newer than the snapshot shows up, then a copy
-/// of the bits as of the snapshot.
+/// A segment's tombstones as of one snapshot (a registered one), for many
+/// lookups: the shared bits, less the deletes newer than the snapshot, which
+/// are few. (A copy of the bits would be many MiB for a large segment.)
 pub(crate) struct AsOf<'a> {
     tomb: &'a Tombstones,
     seq: u64,
-    frozen: OnceCell<Vec<u64>>,
+    /// The positions deleted by the writes after `seq`, up to this one.
+    newer: RefCell<(u64, HashSet<u32>)>,
 }
 
 impl<'a> AsOf<'a> {
     pub fn new(tomb: &'a Tombstones, seq: u64) -> Self {
-        Self { tomb, seq, frozen: OnceCell::new() }
+        Self { tomb, seq, newer: RefCell::new((seq, HashSet::new())) }
     }
 
     #[inline]
     pub fn deleted(&self, pos: usize) -> bool {
-        if let Some(w) = self.frozen.get() {
-            return w[pos / 64] >> (pos % 64) & 1 != 0;
-        }
         if !self.tomb.is_set(pos) {
             return false;
         }
-        if self.tomb.last_seq.load(Ordering::Acquire) <= self.seq {
-            return true;
-        }
-        let w = self.frozen.get_or_init(|| self.tomb.words_as_of(self.seq));
-        w[pos / 64] >> (pos % 64) & 1 != 0
+        // At least the number of the delete that set the bit.
+        let last = self.tomb.last_seq.load(Ordering::Acquire);
+        last <= self.seq || self.was_deleted(pos, last)
     }
 
-    /// Clears the positions deleted as of the snapshot from `b`.
-    pub fn remove_from(&self, b: &mut super::bitmap::Bitmap) {
-        match self.frozen.get() {
-            Some(w) => b.and_not_words(w.iter().copied()),
-            None => b.and_not_words(self.tomb.words_as_of(self.seq).into_iter()),
+    #[cold]
+    fn was_deleted(&self, pos: usize, last: u64) -> bool {
+        let (upto, newer) = &mut *self.newer.borrow_mut();
+        if *upto < last {
+            let r = self.tomb.recent.lock().unwrap();
+            newer.extend(r.order.iter().rev().take_while(|&&(_, d)| d > *upto).map(|&(p, _)| p));
+            *upto = r.order.back().map_or(last, |&(_, d)| d);
         }
+        !newer.contains(&(pos as u32))
     }
 }
 
@@ -387,6 +401,7 @@ impl Growing {
     }
 
     /// The live row of `id` now.
+    #[inline]
     pub fn row_of(&self, id: u64) -> Option<usize> {
         let r = *self.latest.get(&id)? as usize;
         (self.del[r] == 0).then_some(r)
@@ -402,7 +417,7 @@ impl Growing {
     }
 
     /// Whether `row` is deleted now.
-    #[inline]
+    #[cfg(test)]
     pub fn is_dead(&self, row: usize) -> bool {
         self.del[row] != 0
     }
@@ -440,6 +455,11 @@ impl Growing {
         self.live += 1;
     }
 
+    /// The write that deleted `row` (0: live).
+    pub fn deleted_by(&self, row: usize) -> u64 {
+        self.del[row]
+    }
+
     /// Deletes the live row of `id`, by write `seq`.
     pub fn delete(&mut self, id: u64, seq: u64) -> bool {
         match self.row_of(id) {
@@ -455,6 +475,16 @@ impl Growing {
     pub fn vector(&self, row: usize) -> &[f32] {
         &self.data[row * self.dim..(row + 1) * self.dim]
     }
+}
+
+/// A full growing segment, waiting to be written to a segment file: no rows
+/// are added any more, but its rows can still be deleted.
+pub(crate) struct Frozen {
+    pub rows: Arc<RwLock<Growing>>,
+    /// The last write before it was frozen.
+    pub last_seq: u64,
+    /// The generation of the log with its writes (and no later ones).
+    pub wal: u64,
 }
 
 pub(crate) enum Body {
@@ -540,5 +570,48 @@ impl Sealed {
             Body::Disk { by_id, .. } => by_id.len() * 4,
         };
         self.positions().div_ceil(8) + by_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rng::SplitMix64;
+
+    /// Deletes that arrive between the lookups of one reader, before and
+    /// after the snapshot's, next to a reader of every later snapshot.
+    #[test]
+    fn deletes_as_of_a_snapshot() {
+        let (n, mut rng) = (500, SplitMix64::new(3));
+        let t = Tombstones::new(n);
+        let mut by: Vec<Option<u64>> = vec![None; n];
+        let mut readers: Vec<(u64, AsOf)> = Vec::new();
+        for seq in 1..=400u64 {
+            let pos = (rng.next_u64() % n as u64) as usize;
+            let fresh = t.delete(pos, seq);
+            assert_eq!(fresh, by[pos].is_none());
+            by[pos].get_or_insert(seq);
+            if seq == 100 {
+                // All snapshots from here on are kept.
+                t.prune(seq);
+            }
+            if seq >= 100 && seq % 20 == 0 {
+                readers.push((seq, AsOf::new(&t, seq)));
+            }
+            for (at, r) in &readers {
+                for _ in 0..20 {
+                    let p = (rng.next_u64() % n as u64) as usize;
+                    let want = by[p].is_some_and(|d| d <= *at);
+                    assert_eq!((r.deleted(p), t.deleted_as_of(p, *at)), (want, want), "{p} at {at}, after {seq}");
+                }
+            }
+        }
+        for (at, r) in &readers {
+            let words = t.words_as_of(*at);
+            for (p, d) in by.iter().enumerate() {
+                let want = d.is_some_and(|d| d <= *at);
+                assert_eq!((r.deleted(p), words[p / 64] >> (p % 64) & 1 != 0), (want, want));
+            }
+        }
     }
 }

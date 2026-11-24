@@ -51,7 +51,7 @@ fn random_filter(rng: &mut SplitMix64, depth: usize) -> Filter {
             1 => Filter::In(field.into(), (0..rng.next_u64() % 4).map(|_| value(rng)).collect()),
             _ => {
                 let (x, y) = (random_int(rng, field), random_int(rng, field));
-                Filter::Range { field: field.into(), min: x.min(y), max: if rng.next_u64() % 5 == 0 { x.min(y) - 1 } else { x.max(y) } }
+                Filter::Range { field: field.into(), min: x.min(y), max: if rng.next_u64() % 5 == 0 { x.min(y).saturating_sub(1) } else { x.max(y) } }
             }
         };
     }

@@ -1058,6 +1058,7 @@ fn positions_map_to_their_nodes() {
 pub(crate) fn test_dir(name: &str) -> PathBuf {
     let dir = io::tests::temp_path(name);
     let _ = std::fs::remove_dir_all(&dir);
+    crate::format::durable::forget(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

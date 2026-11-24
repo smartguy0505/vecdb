@@ -175,8 +175,40 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
+    #[cfg(test)]
+    let names = durable::names(dir);
     File::open(dir)?.sync_all()?;
+    #[cfg(test)]
+    durable::record(names);
     Ok(())
+}
+
+/// Which file names a power loss would leave: those that were there when
+/// their directory was last fsynced.
+#[cfg(test)]
+pub(crate) mod durable {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    static NAMES: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+
+    pub fn names(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir).map_or(Vec::new(), |d| d.flatten().map(|e| e.path()).collect())
+    }
+
+    pub fn record(names: Vec<PathBuf>) {
+        NAMES.lock().unwrap().extend(names);
+    }
+
+    /// Forgets what is under `dir`, which is about to be used anew.
+    pub fn forget(dir: &Path) {
+        NAMES.lock().unwrap().retain(|p| !p.starts_with(dir));
+    }
+
+    pub fn is(path: &Path) -> bool {
+        NAMES.lock().unwrap().contains(path)
+    }
 }
 
 /// Reads and fully verifies a flat segment into memory.

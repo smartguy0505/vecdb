@@ -12,6 +12,7 @@
 //! Dimensions need not divide evenly by `m`: the first `dim % m` subspaces
 //! get one extra dimension.
 
+use crate::cancel::Cancel;
 use crate::distance::Metric;
 use crate::error::{Error, Result};
 use crate::kernels;
@@ -55,6 +56,10 @@ impl ProductQuantizer {
     /// Trains on `data` (row-major, `dim` per row; at least 256 rows).
     /// Vectors must already be prepared for the metric (normalized for cosine).
     pub fn train(dim: usize, data: &[f32], p: &PqParams) -> Result<Self> {
+        Self::train_until(dim, data, p, &Cancel::default())
+    }
+
+    pub(crate) fn train_until(dim: usize, data: &[f32], p: &PqParams, cancel: &Cancel) -> Result<Self> {
         check_dim(dim)?;
         if p.m == 0 || p.m > dim {
             return Err(Error::InvalidArgument(format!("PQ m = {} must be in 1..={dim}", p.m)));
@@ -78,6 +83,7 @@ impl ProductQuantizer {
         let offsets = subspace_offsets(dim, p.m);
         let mut codebooks = vec![0.0f32; KSUB * dim];
         for i in 0..p.m {
+            cancel.check()?;
             let (lo, hi) = (offsets[i], offsets[i + 1]);
             let dsub = hi - lo;
             let mut sub = Vec::with_capacity(rows.len() * dsub);

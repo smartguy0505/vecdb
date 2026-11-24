@@ -25,6 +25,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+use crate::cancel::Cancel;
 use crate::distance::{Metric, check_finite, normalize};
 use crate::error::{Error, Result};
 use crate::kernels::{self, Kernels};
@@ -132,7 +133,7 @@ impl GraphIndex {
         }
         let (data, id_start, node_ids) = dedup(data, dim, ids);
         let points = build::Points::new(&data, dim, metric, params.threads);
-        let (lists, entry) = build::build(&points, params);
+        let (lists, entry) = build::build(&points, params, &Cancel::default())?;
         drop(points);
 
         let stride = params.max_degree + 1;

@@ -17,6 +17,11 @@
 //! A record is one batch, so a batch is replayed whole or not at all.
 //! Sequence numbers run on without gaps from the manifest's `flushed_seq`.
 //!
+//! Each time the growing segment is frozen a new log is started, and the
+//! old one is kept until the frozen rows are in a segment file. So there
+//! may be several: the manifest names the first one still needed, and they
+//! are replayed in order as one ([`replay_chain`]).
+//!
 //! Recovery is point-in-time: replay stops at the first record that is
 //! incomplete or fails its checksum, and the file is cut there. After a
 //! crash that is the batch being written. Records written without an fsync
@@ -29,6 +34,12 @@
 //! open fails instead of dropping acknowledged writes, naming the byte to
 //! cut the log at to recover the writes before it. (The records after a bad
 //! one are found through its length field; a damaged length hides them.)
+//!
+//! The same holds from one log to the next. Buffered writes at the end of a
+//! log can be lost while the next log, written later, survives: the next
+//! log then starts past where the first ends, and it and those after it are
+//! dropped. If any of them holds a `Sync` record, though, the lost writes
+//! were durable before it, so something damaged them, and the open fails.
 
 use std::fs::{File, OpenOptions};
 #[cfg(test)]
@@ -40,6 +51,7 @@ use super::bytes::{Dec, Enc};
 use super::{Durability, WriteOp};
 use crate::crc32c::crc32c;
 use crate::error::{Error, Result};
+use crate::format::sync_parent_dir;
 
 const MAGIC: [u8; 8] = *b"VECDBWAL";
 const VERSION: u32 = 1;
@@ -59,6 +71,12 @@ pub(crate) fn wal_name(generation: u64) -> String {
     format!("wal-{generation:08}.log")
 }
 
+/// The generation in a log's file name (`None` for other names).
+pub(crate) fn wal_generation(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("wal-")?.strip_suffix(".log")?;
+    (digits.len() == 8 && digits.bytes().all(|b| b.is_ascii_digit())).then(|| digits.parse().ok())?
+}
+
 /// One write read back from the log.
 pub(crate) enum LoggedOp<'a> {
     Upsert { id: u64, vector: &'a [f32], attrs: &'a [u8] },
@@ -67,21 +85,26 @@ pub(crate) enum LoggedOp<'a> {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReplayReport {
+    /// Logs replayed.
+    pub logs: u64,
     /// Batches and writes replayed.
     pub batches: u64,
     pub ops: u64,
     /// Bytes of the log read.
     pub bytes: u64,
-    /// Bytes cut from the end of the log: an incomplete or damaged record
-    /// and anything after it.
+    /// Bytes dropped: an incomplete or damaged record and anything after
+    /// it, and logs whose preceding writes were lost.
     pub cut_bytes: u64,
 }
 
 pub(crate) struct Wal {
     file: File,
     path: PathBuf,
+    generation: u64,
     /// Length of the valid log.
     len: u64,
+    /// Length known to be durable: fsynced, or written by an fsynced create.
+    synced: u64,
     batches: u64,
     /// Set when a write or fsync failed: the file's state is unknown, so no
     /// further writes are accepted until the collection is reopened.
@@ -90,8 +113,10 @@ pub(crate) struct Wal {
 }
 
 impl Wal {
-    /// Creates an empty log, fsynced (the caller fsyncs the directory).
-    pub fn create(dir: &Path, generation: u64, dim: usize) -> Result<Self> {
+    /// Creates an empty log. With `sync` it is fsynced (the caller fsyncs
+    /// the directory); without, a power loss may leave no log or one
+    /// without a header, which a reopen takes for the end of the chain.
+    pub fn create(dir: &Path, generation: u64, dim: usize, sync: bool) -> Result<Self> {
         let path = dir.join(wal_name(generation));
         let mut file = OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
         let mut e = Enc::default();
@@ -102,11 +127,15 @@ impl Wal {
         e.u32(0);
         e.crc();
         file.write_all(&e.buf)?;
-        file.sync_all()?;
+        if sync {
+            file.sync_all()?;
+        }
         Ok(Self {
             file,
             path,
+            generation,
             len: HEADER_LEN as u64,
+            synced: if sync { HEADER_LEN as u64 } else { 0 },
             batches: 0,
             poisoned: false,
             buf: Vec::new(),
@@ -115,6 +144,10 @@ impl Wal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn bytes(&self) -> u64 {
@@ -218,31 +251,179 @@ impl Wal {
             }
         }
         self.len += self.buf.len() as u64;
+        if durability == Durability::Sync {
+            self.synced = self.len;
+        }
         self.batches += batches.len() as u64;
         Ok(())
     }
 
-    /// Opens log `generation` and calls `apply` on every write in it, in
-    /// order, with its sequence number. The first record must start at
-    /// `next_seq`. Cuts an incomplete or damaged tail (see the module docs).
-    pub fn replay(
-        dir: &Path,
-        generation: u64,
-        dim: usize,
-        next_seq: u64,
-        mut apply: impl FnMut(u64, LoggedOp<'_>) -> Result<()>,
-    ) -> Result<(Self, ReplayReport)> {
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// If records (or the header) may not be durable yet: the file, to
+    /// fsync without holding the log, and the length that makes durable
+    /// (then see [`mark_synced`](Self::mark_synced)). `None` under `Sync`.
+    pub fn unsynced(&self) -> Result<Option<(File, u64)>> {
+        Ok(if self.synced < self.len { Some((self.file.try_clone()?, self.len)) } else { None })
+    }
+
+    /// Records that the first `len` bytes were fsynced.
+    pub fn mark_synced(&mut self, len: u64) {
+        self.synced = self.synced.max(len);
+    }
+
+    /// Length of the log known to be durable.
+    #[cfg(test)]
+    pub fn synced(&self) -> u64 {
+        self.synced
+    }
+}
+
+/// What [`replay_chain`] hands its caller, in order.
+pub(crate) enum Event<'a> {
+    /// A write and its sequence number.
+    Op(u64, LoggedOp<'a>),
+    /// The end of a log that another one follows.
+    EndOfLog { generation: u64 },
+}
+
+/// The logs of a collection, replayed.
+pub(crate) struct Chain {
+    /// All logs but the last, oldest first.
+    pub closed: Vec<Wal>,
+    /// The last one: new writes go there.
+    pub active: Wal,
+    pub report: ReplayReport,
+    /// Names of logs dropped because the writes before them were lost.
+    pub dropped: Vec<String>,
+}
+
+/// Replays the logs from generation `first` on, in order, as one sequence
+/// of writes starting at `next_seq`. Cuts an incomplete or damaged tail and
+/// drops the logs after lost writes (see the module docs). Everything kept
+/// is fsynced, and so is the directory. No file is changed before all of them have been checked.
+pub(crate) fn replay_chain(
+    dir: &Path,
+    first: u64,
+    dim: usize,
+    next_seq: u64,
+    mut on: impl FnMut(Event<'_>) -> Result<()>,
+) -> Result<Chain> {
+    let mut gens: Vec<u64> = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        if let Some(g) = e?.file_name().to_str().and_then(wal_generation)
+            && g >= first
+        {
+            gens.push(g);
+        }
+    }
+    gens.sort_unstable();
+    if gens.first() != Some(&first) {
+        return Err(Error::Corrupt(format!("{} is missing in {}", wal_name(first), dir.display())));
+    }
+    let mut kept: Vec<(Loaded, End)> = Vec::new();
+    let mut dropped = Vec::new();
+    let mut report = ReplayReport::default();
+    let mut seq = next_seq;
+    let mut cur = Loaded::read(dir, first, dim)?;
+    for (i, &g) in gens.iter().enumerate() {
+        let end = cur.replay(seq, dim, |s, op| on(Event::Op(s, op)))?;
+        seq += end.ops;
+        report.logs += 1;
+        report.batches += end.batches;
+        report.ops += end.ops;
+        report.bytes += end.pos as u64;
+        report.cut_bytes += (cur.bytes.len() - end.pos) as u64;
+        let Some(&g2) = gens.get(i + 1) else {
+            kept.push((cur, end));
+            break;
+        };
+        let next = if g2 == g + 1 {
+            Loaded::read(dir, g2, dim)
+        } else {
+            Err(Error::Corrupt(format!("{} is missing", wal_name(g + 1))))
+        };
+        match next {
+            Ok(next) if next.first_seq().is_none_or(|f| f == seq) => {
+                if end.ops > 0 {
+                    on(Event::EndOfLog { generation: g })?;
+                }
+                let mut log = std::mem::replace(&mut cur, next);
+                // Only its length is needed from here on.
+                log.bytes = Vec::new();
+                kept.push((log, end));
+            }
+            Err(e @ (Error::Io(_) | Error::Unsupported(_))) => return Err(e),
+            next => {
+                // This log ends before the next one starts.
+                if let Ok(n) = &next
+                    && n.first_seq().is_some_and(|f| f < seq)
+                {
+                    return Err(n.corrupt(format!("starts before write {seq}, where {} ends", wal_name(g))));
+                }
+                for &g in &gens[i + 1..] {
+                    let bytes = std::fs::read(dir.join(wal_name(g)))?;
+                    if holds_synced_record(&bytes) {
+                        return Err(cur.corrupt(format!(
+                            "it ends at byte {} with write {}, but {} holds later writes acknowledged with Sync; \
+                             cutting it at byte {0} and removing the logs after it recovers the writes before",
+                            end.pos,
+                            seq - 1,
+                            wal_name(g)
+                        )));
+                    }
+                    report.cut_bytes += bytes.len() as u64;
+                    dropped.push(wal_name(g));
+                }
+                kept.push((cur, end));
+                break;
+            }
+        }
+    }
+    // Gone for good before any write reuses their numbers.
+    for name in &dropped {
+        std::fs::remove_file(dir.join(name))?;
+    }
+    let mut logs =
+        (first..).zip(kept).map(|(g, (log, end))| log.into_wal(g, &end)).collect::<Result<Vec<Wal>>>()?;
+    // Also for the names of logs created without an fsync.
+    sync_parent_dir(&dir.join(wal_name(first)))?;
+    let active = logs.pop().expect("the first log");
+    Ok(Chain { closed: logs, active, report, dropped })
+}
+
+/// A log read into memory.
+struct Loaded {
+    file: File,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    /// Length of the file.
+    len: usize,
+}
+
+/// Where a log's good records end.
+struct End {
+    pos: usize,
+    batches: u64,
+    ops: u64,
+}
+
+impl Loaded {
+    /// Reads log `generation` and checks its header.
+    fn read(dir: &Path, generation: u64, dim: usize) -> Result<Self> {
         let path = dir.join(wal_name(generation));
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let corrupt = |m: String| Error::Corrupt(format!("WAL {}: {m}", path.display()));
-        if bytes.len() < HEADER_LEN {
-            return Err(corrupt("header truncated".into()));
+        let log = Self { file, path, len: bytes.len(), bytes };
+        if log.bytes.len() < HEADER_LEN {
+            return Err(log.corrupt("header truncated".into()));
         }
-        let mut h = Dec::checked(&bytes[..HEADER_LEN], "WAL header")?;
+        let mut h = Dec::checked(&log.bytes[..HEADER_LEN], "WAL header")?;
         if h.take(8)? != MAGIC {
-            return Err(corrupt("bad magic".into()));
+            return Err(log.corrupt("bad magic".into()));
         }
         let version = h.u32()?;
         if version != VERSION {
@@ -250,22 +431,38 @@ impl Wal {
         }
         let (file_dim, file_gen) = (h.u32()? as usize, h.u64()?);
         if file_dim != dim || file_gen != generation {
-            return Err(corrupt(format!("written for dim {file_dim}, generation {file_gen}")));
+            return Err(log.corrupt(format!("written for dim {file_dim}, generation {file_gen}")));
         }
+        Ok(log)
+    }
 
-        let mut report = ReplayReport::default();
-        let mut pos = HEADER_LEN;
-        let mut seq = next_seq;
+    fn corrupt(&self, m: String) -> Error {
+        Error::Corrupt(format!("WAL {}: {m}", self.path.display()))
+    }
+
+    /// The first write in the log, if its first record is good.
+    fn first_seq(&self) -> Option<u64> {
+        let body = record_at(&self.bytes, HEADER_LEN)?;
+        Some(u64::from_le_bytes(body[..8].try_into().unwrap()))
+    }
+
+    /// Calls `apply` on every write in the log, in order, with its sequence
+    /// number. The first record must start at `next_seq`.
+    fn replay(&self, next_seq: u64, dim: usize, mut apply: impl FnMut(u64, LoggedOp<'_>) -> Result<()>) -> Result<End> {
+        let bytes = &self.bytes;
+        let mut end = End { pos: HEADER_LEN, batches: 0, ops: 0 };
         let mut vector = vec![0.0f32; dim];
-        while let Some(body) = record_at(&bytes, pos) {
+        while let Some(body) = record_at(bytes, end.pos) {
+            let pos = end.pos;
             let mut d = Dec::new(body, "WAL record");
             let first = d.u64()?;
             let count = d.u32()? as u64;
             d.u8()?; // flags
+            let seq = next_seq + end.ops;
             if first != seq || count == 0 {
                 // A record with a good checksum in the wrong place: not a
                 // torn write.
-                return Err(corrupt(format!("record at byte {pos} starts at write {first}, expected {seq}")));
+                return Err(self.corrupt(format!("record at byte {pos} starts at write {first}, expected {seq}")));
             }
             for s in first..first + count {
                 match d.u8()? {
@@ -277,37 +474,64 @@ impl Wal {
                         apply(s, LoggedOp::Upsert { id, vector: &vector, attrs })?;
                     }
                     DELETE => apply(s, LoggedOp::Delete { id: d.u64()? })?,
-                    t => return Err(corrupt(format!("unknown op {t} at write {s}"))),
+                    t => return Err(self.corrupt(format!("unknown op {t} at write {s}"))),
                 }
             }
             d.done()?;
-            seq += count;
-            report.batches += 1;
-            report.ops += count;
-            pos += 8 + body.len();
+            end.batches += 1;
+            end.ops += count;
+            end.pos += 8 + body.len();
         }
-        report.bytes = pos as u64;
-        report.cut_bytes = (bytes.len() - pos) as u64;
-        if synced_record_after(&bytes, pos) {
-            return Err(corrupt(format!(
-                "the record at byte {pos} is damaged and a write acknowledged with Sync follows it; \
-                 cutting the log at byte {pos} recovers the writes before it"
+        if synced_record_after(bytes, end.pos) {
+            return Err(self.corrupt(format!(
+                "the record at byte {} is damaged and a write acknowledged with Sync follows it; \
+                 cutting the log at byte {0} recovers the writes before it",
+                end.pos
             )));
         }
-        if report.cut_bytes > 0 {
-            file.set_len(pos as u64)?;
-            file.sync_all()?;
+        Ok(end)
+    }
+
+    /// The log, cut after its last good record and made durable: records
+    /// written without an fsync may be only in the page cache, and could
+    /// otherwise be lost behind a later `Sync` record.
+    fn into_wal(self, generation: u64, end: &End) -> Result<Wal> {
+        if end.pos < self.len {
+            self.file.set_len(end.pos as u64)?;
         }
-        let wal = Self {
-            file,
-            path,
-            len: pos as u64,
-            batches: report.batches,
+        self.file.sync_all()?;
+        Ok(Wal {
+            file: self.file,
+            path: self.path,
+            generation,
+            len: end.pos as u64,
+            synced: end.pos as u64,
+            batches: end.batches,
             poisoned: false,
             buf: Vec::new(),
-        };
-        Ok((wal, report))
+        })
     }
+}
+
+/// Whether a log (its header may be damaged) holds any record written with
+/// `Sync`. Records after a bad one are found through its length field.
+fn holds_synced_record(bytes: &[u8]) -> bool {
+    let mut pos = HEADER_LEN;
+    while pos + 8 <= bytes.len() {
+        if let Some(body) = record_at(bytes, pos) {
+            if body[12] & FLAG_SYNC != 0 {
+                return true;
+            }
+            pos += 8 + body.len();
+        } else {
+            let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            if !(MIN_BODY..=MAX_BATCH_BYTES).contains(&len) {
+                return false;
+            }
+            pos += 8 + len;
+        }
+    }
+    false
 }
 
 /// Whether a good record after the bad record at `pos` proves that the bad
@@ -375,7 +599,7 @@ mod tests {
             b
         };
         let (a, b, c, d) = (del(1), del(2), del(3), del(4));
-        let mut wal = Wal::create(&dir, 1, 4).unwrap();
+        let mut wal = Wal::create(&dir, 1, 4, true).unwrap();
         wal.append_group(&[(1, 1, &a), (2, 1, &b), (3, 1, &c)], Durability::Sync).unwrap();
         let one_group = wal.bytes();
         wal.append_group(&[(4, 1, &d)], Durability::Sync).unwrap();
@@ -386,13 +610,13 @@ mod tests {
         let replay = |bytes: &[u8]| {
             fs::write(&path, bytes).unwrap();
             let mut ids = Vec::new();
-            let r = Wal::replay(&dir, 1, 4, 1, |_, op| {
-                if let LoggedOp::Delete { id } = op {
+            let r = replay_chain(&dir, 1, 4, 1, |e| {
+                if let Event::Op(_, LoggedOp::Delete { id }) = e {
                     ids.push(id);
                 }
                 Ok(())
             });
-            r.map(|(_, rep)| (ids, rep.cut_bytes))
+            r.map(|c| (ids, c.report.cut_bytes))
         };
         assert_eq!(replay(&good).unwrap(), (vec![1, 2, 3, 4], 0));
         // The second record damaged, the next group intact: refused.

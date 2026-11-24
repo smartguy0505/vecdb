@@ -11,7 +11,9 @@
 //! boundaries depend only on the collection size, so the graph is identical
 //! for any thread count.
 
+use crate::cancel::Cancel;
 use crate::distance::Metric;
+use crate::error::Result;
 use crate::kernels::{self, Kernels};
 use crate::par;
 use crate::rng::SplitMix64;
@@ -95,11 +97,11 @@ impl<'a> Points<'a> {
 
 /// Builds the graph. Returns the out-lists (each at most `max_degree` long)
 /// and the entry node (the point nearest the mean).
-pub(crate) fn build(points: &Points, p: &GraphParams) -> (Vec<Vec<u32>>, u32) {
+pub(crate) fn build(points: &Points, p: &GraphParams, cancel: &Cancel) -> Result<(Vec<Vec<u32>>, u32)> {
     let n = points.len();
     let mut graph: Vec<Vec<u32>> = vec![Vec::new(); n];
     if n == 0 {
-        return (graph, 0);
+        return Ok((graph, 0));
     }
     let entry = medoid(points, p.threads);
     let max_batch = ((n as f64 * MAX_BATCH_FRACTION).ceil() as usize).max(1);
@@ -111,7 +113,8 @@ pub(crate) fn build(points: &Points, p: &GraphParams) -> (Vec<Vec<u32>>, u32) {
         let mut size = if pass == 0 { 1 } else { max_batch };
         while start < n {
             let end = (start + size).min(n);
-            insert_batch(points, &mut graph, &order[start..end], entry, alpha, pass > 0, p);
+            insert_batch(points, &mut graph, &order[start..end], entry, alpha, pass > 0, p, cancel);
+            cancel.check()?;
             start = end;
             size = (size * 2).min(max_batch);
         }
@@ -134,7 +137,7 @@ pub(crate) fn build(points: &Points, p: &GraphParams) -> (Vec<Vec<u32>>, u32) {
         graph[node as usize] = list;
     }
     connect_unreachable(points, &mut graph, entry, p);
-    (graph, entry)
+    Ok((graph, entry))
 }
 
 /// Vamana does not guarantee that every node is reachable from the entry:
@@ -196,6 +199,7 @@ fn mark_reachable(graph: &[Vec<u32>], start: u32, reached: &mut [bool]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_batch(
     points: &Points,
     graph: &mut [Vec<u32>],
@@ -204,6 +208,7 @@ fn insert_batch(
     alpha: f32,
     keep_existing: bool,
     p: &GraphParams,
+    cancel: &Cancel,
 ) {
     let r = p.max_degree;
     let slack = ((r as f32 * SLACK).ceil() as usize).max(r);
@@ -215,6 +220,8 @@ fn insert_batch(
         let mut scratch = Scratch::new();
         let mut occl = Vec::new();
         range
+            // (Cancelled, the graph is dropped: what is in it does not matter.)
+            .take_while(|_| !cancel.is_cancelled())
             .map(|i| {
                 let node = batch[i];
                 let (x, xn) = (points.row(node), points.inv_norm_of(node));

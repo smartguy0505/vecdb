@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use super::search::prefer_scan;
 use super::*;
 use crate::disk::test_dir;
 use crate::rng::SplitMix64;
+use crate::topk::SearchResult;
 
 /// Small integer coordinates: L2 and inner-product distances are exact in
 /// f32, so results can be compared with a reference exactly, ties included.
@@ -18,7 +20,13 @@ fn small_config(dim: usize, metric: Metric, seal_rows: usize) -> CollectionConfi
 }
 
 fn test_opts() -> OpenOptions {
-    OpenOptions { durability: Durability::Buffered, direct_io: false, threads: 2, ..Default::default() }
+    OpenOptions {
+        durability: Durability::Buffered,
+        background: false,
+        direct_io: false,
+        threads: 2,
+        ..Default::default()
+    }
 }
 
 /// The reference: live rows by id.
@@ -317,6 +325,32 @@ fn bad_writes_change_nothing() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A collection written before there could be several logs is marked as
+/// one that may have them when it is opened, so older code refuses it.
+#[test]
+fn an_older_manifest_is_upgraded_at_open() {
+    let dir = test_dir("coll-upgrade");
+    let mut c = Collection::create(&dir, small_config(4, Metric::L2, 100), test_opts()).unwrap();
+    let mut rng = SplitMix64::new(1);
+    let mut model = Model::default();
+    upsert_many(&mut c, &mut model, &mut rng, 0..250);
+    drop(c);
+    let path = dir.join(MANIFEST);
+    let new = fs::read(&path).unwrap();
+    let mut old = new[..new.len() - 4].to_vec();
+    old[8..12].copy_from_slice(&1u32.to_le_bytes());
+    let crc = crate::crc32c::crc32c(&old);
+    old.extend(crc.to_le_bytes());
+    fs::write(&path, &old).unwrap();
+    for _ in 0..2 {
+        let (c, _) = Collection::open(&dir, test_opts()).unwrap();
+        check_approx(&c, &model, &mut rng, 1.0);
+        drop(c);
+        assert_eq!(fs::read(&path).unwrap(), new);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn manifest_round_trips_and_detects_damage() {
     let mut cfg = CollectionConfig::new(96, Metric::Cosine);
@@ -415,6 +449,36 @@ fn upsert_many(c: &mut Collection, model: &mut Model, rng: &mut SplitMix64, ids:
         c.write(&ops).unwrap();
         ops.iter().for_each(|op| model.apply(op));
     }
+}
+
+/// Rows upserted over and over leave flat segments of deleted rows: those
+/// are merged before they take much more than twice `index_bytes`.
+#[test]
+fn flat_segments_of_deleted_rows_are_merged() {
+    let dir = test_dir("coll-shrink");
+    let dim = 8;
+    // Never enough live rows for an index.
+    let mut c = Collection::create(&dir, ssd_config(dim, Metric::L2, 500, 4000), test_opts()).unwrap();
+    let mut rng = SplitMix64::new(12);
+    let mut model = Model::default();
+    let mut jobs = Vec::new();
+    for round in 0..40u64 {
+        // A few rows of each round stay, so no segment is ever all deleted.
+        let again = (0..480).map(|i| (i * 7 + round * 300) % 2500);
+        upsert_many(&mut c, &mut model, &mut rng, again.chain((0..20).map(|i| 10_000 + round * 20 + i)));
+        jobs.extend(c.maintain().unwrap());
+        let st = c.stats();
+        let rows: usize = st.segments.iter().map(|s| s.rows).sum();
+        assert!(rows <= 8500, "{rows} rows in {} segments", st.segments.len());
+        assert!(st.segments.iter().all(|s| s.kind == "flat"));
+    }
+    assert!(jobs.len() >= 2 && jobs.iter().all(|j| j.reason == "shrink"), "{jobs:?}");
+    check_approx(&c, &model, &mut rng, 1.0);
+    drop(c);
+    let (c, _) = Collection::open(&dir, test_opts()).unwrap();
+    check_approx(&c, &model, &mut rng, 1.0);
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -682,7 +746,10 @@ fn crashes_around_the_manifest_commit_lose_nothing() {
             fs::copy(after.join(n), crash.join(n)).unwrap();
         });
         let (cc, report) = Collection::open(&crash, test_opts()).unwrap();
-        assert_eq!(report.removed, added.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // (A new log is part of the chain, with or without writes in it.)
+        let orphans: Vec<String> =
+            added.iter().filter(|n| wal_generation(n).is_none()).map(|s| s.to_string()).collect();
+        assert_eq!(report.removed, orphans);
         check_approx(&cc, &model, &mut rng, 0.95);
         drop(cc);
 
@@ -814,5 +881,8 @@ fn damage_is_found_past_buffered_records() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+mod background;
 mod concurrent;
 mod filters;
+mod logs;
+mod parallel;

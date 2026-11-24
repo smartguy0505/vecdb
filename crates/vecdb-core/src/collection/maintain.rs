@@ -1,52 +1,62 @@
 //! Index builds and compaction: replacing sealed segments with one new
 //! segment built from their live rows.
 //!
-//! When a job is due, [`Collection::maintain`] first flushes (so the WAL is
-//! empty and every tombstone is on disk), then runs jobs until none is due,
-//! in this order:
+//! Jobs are run one at a time, by the background builder (see `background`)
+//! or by [`Engine::maintain`], until none is due, in this order:
 //!
 //! 1. **index:** the flat segments hold `index_bytes` of live vectors:
 //!    build one SSD index from all of them.
 //! 2. **drop:** a segment has no live rows left: remove it.
-//! 3. **compact:** an SSD segment has `compact_deleted` of its rows
+//! 3. **shrink:** the flat segments take `index_bytes`, and at least half of
+//!    that is deleted rows: merge them into one flat segment. (So they never
+//!    take much more than twice `index_bytes`, whatever is upserted.)
+//! 4. **compact:** an SSD segment has `compact_deleted` of its rows
 //!    deleted: rebuild it without them.
-//! 4. **merge:** there are more than `max_indexed_segments` SSD segments:
+//! 5. **merge:** there are more than `max_indexed_segments` SSD segments:
 //!    merge the two smallest.
 //!
-//! A job's output with fewer than [`MIN_SSD_ROWS`] rows is written as a flat
-//! segment instead. Each job commits with one manifest write; the files of
-//! the segments it replaced are removed after that (searches that still
-//! hold those segments read them through open files).
+//! An output with fewer than [`MIN_SSD_ROWS`] rows is always a flat segment.
+//! Each job commits with one manifest write; the files of the segments it
+//! replaced are removed after that (searches that still hold those segments
+//! read them through open files).
 //!
 //! Jobs run while searches and writes go on. A job takes the rows live in
-//! its inputs, builds without locks, then commits under the writer lock:
-//! rows deleted while it ran (deletes and upserts of their ids) are deleted
-//! in the new segment too, and written to its tombstone file in the same
-//! commit, as a flush meanwhile may have moved them out of the WAL.
+//! its inputs and builds without locks, or a snapshot: that would keep the
+//! sequence number of every delete made during the build. It commits in two
+//! steps. First, with the rows deleted meanwhile (deletes and upserts of
+//! their ids) written to the new segment's tombstone file, it installs the
+//! manifest. Then, under the writer lock, it takes over the deletes made
+//! since, with their numbers, and replaces the segments in the view.
+//!
+//! The new segment lacks rows that writes still only in the logs deleted
+//! (the first step fsyncs the logs, so a power loss cannot take those writes
+//! back). That is fine for a reopen, which replays them: deleting a row that
+//! is already gone does nothing.
 
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::manifest::{SegmentEntry, SegmentKind};
+use super::manifest::{MANIFEST, SegmentEntry, SegmentKind};
 use super::columns::AttrWriter;
 use super::segment::{Body, Sealed, attrs_name, del_name, disk_name, flat_name};
-use super::{Collection, CollectionConfig};
+use super::{CollectionConfig, Engine, OpenOptions, Snapshot};
+use crate::cancel::Cancel;
 use crate::dataset::VectorSource;
 use crate::disk::{DiskIndex, DiskOpenOptions, DiskWriteOptions, MergePrune, PartitionedBuildParams};
 use crate::error::Result;
-use crate::format::write_flat_segment;
+use crate::format::{sync_parent_dir, write_flat_segment};
 use crate::quant::PqParams;
 use crate::store::{InMemoryStore, VectorStore};
 
 /// Smallest output written as an SSD index; smaller ones stay flat.
 pub const MIN_SSD_ROWS: usize = 2048;
 
-/// One job [`Collection::maintain`] ran.
+/// One job that [`Engine::maintain`] ran.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobReport {
-    /// "index", "drop", "compact", "merge" or "optimize".
+    /// "index", "drop", "shrink", "compact", "merge" or "optimize".
     pub reason: &'static str,
     /// Segments replaced.
     pub inputs: Vec<u64>,
@@ -58,11 +68,11 @@ pub struct JobReport {
     pub seconds: f64,
 }
 
-impl Collection {
+impl Engine {
     /// Runs the index builds and compactions that are due (see the module
     /// docs), after a flush. Returns when they are done; cheap when nothing
-    /// is due. Searches and writes go on meanwhile; one `maintain` runs at
-    /// a time.
+    /// is due. Searches and writes go on meanwhile. Not needed with
+    /// background threads, which do the same as it becomes due.
     pub fn maintain(&self) -> Result<Vec<JobReport>> {
         let _one = self.maintaining.lock().unwrap();
         if self.next_job().is_none() {
@@ -71,7 +81,7 @@ impl Collection {
         self.flush()?;
         let mut done = Vec::new();
         while let Some((reason, job)) = self.next_job() {
-            done.push(self.rebuild(&job, reason)?);
+            done.push(self.rebuild(&job, reason, self.opts.threads)?);
         }
         Ok(done)
     }
@@ -85,11 +95,11 @@ impl Collection {
         if all.is_empty() {
             return Ok(None);
         }
-        Ok(Some(self.rebuild(&all, "optimize")?))
+        Ok(Some(self.rebuild(&all, "optimize", self.opts.threads)?))
     }
 
     /// The next job that is due: its reason and its input segments' ids.
-    fn next_job(&self) -> Option<(&'static str, Vec<u64>)> {
+    pub(super) fn next_job(&self) -> Option<(&'static str, Vec<u64>)> {
         let cfg = &self.config;
         let view = self.view();
         let sealed = &view.sealed;
@@ -104,6 +114,11 @@ impl Collection {
         }
         if let Some(i) = (0..sealed.len()).find(|&i| sealed[i].live() == 0) {
             return Some(("drop", ids(vec![i])));
+        }
+        let flat_rows: usize = flats.iter().map(|&i| sealed[i].positions()).sum();
+        let taken = flat_rows as u64 * cfg.dim as u64 * 4;
+        if taken >= cfg.index_bytes && taken >= flat_bytes.saturating_mul(2) {
+            return Some(("shrink", ids(flats)));
         }
         let ssd: Vec<usize> = (0..sealed.len()).filter(|i| !is_flat(i)).collect();
         for &i in &ssd {
@@ -123,45 +138,45 @@ impl Collection {
     }
 
     /// Replaces the segments `inputs` (ids, oldest first) with one segment
-    /// of their live rows. The rows are taken under the writer lock, the
-    /// segment is built without it, and the commit takes it again: rows
-    /// deleted meanwhile are deleted in the new segment too.
-    fn rebuild(&self, inputs: &[u64], reason: &'static str) -> Result<JobReport> {
+    /// of their live rows (see the module docs), built by `threads` threads.
+    pub(super) fn rebuild(&self, inputs: &[u64], reason: &'static str, threads: usize) -> Result<JobReport> {
         let t0 = Instant::now();
         let cfg = self.config.clone();
-        // 1. The inputs, the rows live in them now, an id for the output.
-        let (segs, rows, id) = {
-            let mut w = self.writer.lock().unwrap();
-            let view = self.view();
-            let segs = inputs
-                .iter()
-                .map(|&id| {
-                    view.sealed.iter().find(|s| s.id == id).cloned().ok_or_else(|| {
-                        crate::error::Error::InvalidArgument(format!("segment {id} is not in the collection"))
-                    })
-                })
-                .collect::<Result<Vec<Arc<Sealed>>>>()?;
-            let mut rows: Vec<(u32, u32)> = Vec::new();
-            for (j, s) in segs.iter().enumerate() {
-                rows.extend((0..s.positions()).filter(|&p| !s.tomb.is_set(p)).map(|p| (j as u32, p as u32)));
-            }
-            // Taken now (the next manifest records it), so a flush during
-            // the build numbers its segment after this one.
-            let id = w.manifest.next_segment;
-            w.manifest.next_segment += 1;
-            (segs, rows, id)
+        // 1. The inputs and the rows live in them, and an id for the output:
+        // taken now, so a flush during the build numbers its segment after
+        // this one (the next manifest records both).
+        let id = {
+            let mut m = self.manifest.lock().unwrap();
+            m.next_segment += 1;
+            m.next_segment - 1
         };
+        let snap = self.snapshot();
+        let segs = inputs
+            .iter()
+            .map(|&id| {
+                snap.view.sealed.iter().find(|s| s.id == id).cloned().ok_or_else(|| {
+                    crate::error::Error::InvalidArgument(format!("segment {id} is not in the collection"))
+                })
+            })
+            .collect::<Result<Vec<Arc<Sealed>>>>()?;
+        let mut rows: Vec<(u32, u32)> = Vec::new();
+        let dead: Vec<Vec<u64>> = segs.iter().map(|s| s.tomb.words_as_of(snap.seq)).collect();
+        drop(snap);
+        for (j, (s, deleted)) in segs.iter().zip(&dead).enumerate() {
+            let live = (0..s.positions()).filter(|&p| deleted[p / 64] >> (p % 64) & 1 == 0);
+            rows.extend(live.map(|p| (j as u32, p as u32)));
+        }
         let ids: Vec<u64> = rows.iter().map(|&(j, p)| segs[j as usize].id_at(p as usize)).collect();
 
         // 2. The new segment and its files. `order`: for each of its
         // positions, the entry in `rows`.
         let mut created = Vec::new();
-        let built = (|| -> Result<Option<(Sealed, Vec<usize>)>> {
+        let built = (|| -> Result<Option<(Sealed, Vec<Vec<u32>>)>> {
             if rows.is_empty() {
                 return Ok(None);
             }
             let src = LiveRows::new(&segs, &rows, cfg.dim);
-            let (mut sealed, order) = if rows.len() < MIN_SSD_ROWS {
+            let (mut sealed, order) = if rows.len() < MIN_SSD_ROWS || reason == "shrink" {
                 let mut store = InMemoryStore::with_capacity(cfg.dim, rows.len())?;
                 let mut v = vec![0.0f32; cfg.dim];
                 for (i, &id) in ids.iter().enumerate() {
@@ -175,7 +190,7 @@ impl Collection {
             } else {
                 let path = self.dir.join(disk_name(id));
                 created.push(path.clone());
-                let params = build_params(&cfg, &self.opts);
+                let params = build_params(&cfg, &self.opts, threads, self.background.cancel());
                 DiskIndex::build_partitioned(&src, Some(&ids), cfg.metric, &path, &params)?;
                 let index = DiskIndex::open(&path, &DiskOpenOptions { direct: self.opts.direct_io, io: self.opts.io })?;
                 // The index orders ids by node.
@@ -183,14 +198,15 @@ impl Collection {
                 let order = (0..index.len()).map(|p| row_of[&index.id_at(p)]).collect();
                 (Sealed::disk(id, index, None, vec![path])?, order)
             };
+            // Where each input row went.
+            let mut new_pos: Vec<Vec<u32>> = segs.iter().map(|s| vec![u32::MAX; s.positions()]).collect();
+            for (np, &r) in order.iter().enumerate() {
+                let (j, p) = rows[r];
+                new_pos[j as usize][p as usize] = np as u32;
+            }
             if !cfg.fields.is_empty() {
                 // Rows are copied in each input's file order; only the
                 // offsets table follows the new positions.
-                let mut new_pos: Vec<Vec<u32>> = segs.iter().map(|s| vec![u32::MAX; s.positions()]).collect();
-                for (np, &r) in order.iter().enumerate() {
-                    let (j, p) = rows[r];
-                    new_pos[j as usize][p as usize] = np as u32;
-                }
                 let ap = self.dir.join(attrs_name(id));
                 created.push(ap.clone());
                 let mut w = AttrWriter::create(&ap, &cfg.fields, order.len())?;
@@ -204,7 +220,7 @@ impl Collection {
                 sealed.attrs = Some(w.finish()?);
                 sealed.files.push(ap);
             }
-            Ok(Some((sealed, order)))
+            Ok(Some((sealed, new_pos)))
         })();
         let cleanup = |created: &[std::path::PathBuf]| {
             created.iter().for_each(|p| {
@@ -219,75 +235,79 @@ impl Collection {
             }
         };
 
-        // 3. Commit, from the manifest and view as they are now (flushes
-        // may have come in between).
-        let mut w = self.writer.lock().unwrap();
-        let view = self.view();
-        let mut m = w.manifest.clone();
+        self.at("build: built");
+
+        // 3. Commit, from the manifest as it is now (flushes may have come
+        // in between, but none can from here on).
+        let mut man = self.manifest.lock().unwrap();
+        let mut m = man.clone();
         m.generation += 1;
-        let mut carried = 0;
-        let result = (|| -> Result<Option<Sealed>> {
-            let Some((sealed, order)) = built else { return Ok(None) };
-            // Rows deleted since step 1 (all before any search that will
-            // see the new segment, so for every snapshot).
-            for (np, &r) in order.iter().enumerate() {
-                let (j, p) = rows[r];
-                if segs[j as usize].tomb.is_set(p as usize) {
-                    sealed.tomb.settle(np);
-                    carried += 1;
-                }
-            }
-            // A flush may have moved those deletes from the WAL to the
-            // inputs' tombstone files, which this commit retires.
-            let (mut deleted, mut del_gen) = (0, 0);
-            if carried > 0 {
-                let path = self.dir.join(del_name(id, m.generation));
-                created.push(path.clone());
-                deleted = sealed.tomb.write(&path, id)? as u64;
-                del_gen = m.generation;
-            }
-            let entry = SegmentEntry {
-                id,
-                kind: match sealed.body {
-                    Body::Flat(_) => SegmentKind::Flat,
-                    Body::Disk { .. } => SegmentKind::Disk,
-                },
-                positions: sealed.positions() as u64,
-                deleted,
-                del_gen,
-            };
-            // The new segment takes the place of the oldest one it replaces.
+        let result = (|| -> Result<(usize, Option<Snapshot>)> {
             let first = m.segments.iter().position(|e| inputs.contains(&e.id)).expect("inputs are in the manifest");
-            m.segments.insert(first, entry);
-            Ok(Some(sealed))
-        })()
-        .and_then(|fresh| {
-            m.segments.retain(|e| !inputs.contains(&e.id));
-            if let Some(f) = created.first() {
-                crate::format::sync_parent_dir(f)?;
+            let (mut carried, mut snap) = (0, None);
+            if let Some((sealed, new_pos)) = &built {
+                // The deletes so far, all logged (and then made durable):
+                // under the writer lock, with a snapshot, so that the later
+                // ones keep their numbers.
+                let now: Vec<Vec<u64>> = {
+                    let _w = self.writer.lock().unwrap();
+                    snap = Some(self.snapshot());
+                    segs.iter().map(|s| s.tomb.words()).collect()
+                };
+                self.at("build: deletes collected");
+                for ((now, dead), new_pos) in now.iter().zip(&dead).zip(new_pos) {
+                    for (i, w) in now.iter().zip(dead).map(|(n, d)| n & !d).enumerate() {
+                        for b in (0..64).filter(|b| w >> b & 1 == 1) {
+                            sealed.tomb.settle(new_pos[i * 64 + b] as usize);
+                            carried += 1;
+                        }
+                    }
+                }
+                let (mut deleted, mut del_gen) = (0, 0);
+                if carried > 0 {
+                    let path = self.dir.join(del_name(id, m.generation));
+                    created.push(path.clone());
+                    deleted = sealed.tomb.write(&path, id, &sealed.tomb.words())? as u64;
+                    del_gen = m.generation;
+                }
+                // The new segment takes the place of the oldest one it
+                // replaces.
+                m.segments.insert(
+                    first,
+                    SegmentEntry {
+                        id,
+                        kind: match sealed.body {
+                            Body::Flat(_) => SegmentKind::Flat,
+                            Body::Disk { .. } => SegmentKind::Disk,
+                        },
+                        positions: sealed.positions() as u64,
+                        deleted,
+                        del_gen,
+                    },
+                );
             }
+            m.segments.retain(|e| !inputs.contains(&e.id));
+            // The inputs' rows may be gone because of writes still only in
+            // the logs. Those must not be lost after this: an upsert's new
+            // row is only there.
+            self.sync_logs()?;
+            sync_parent_dir(&self.dir.join(MANIFEST))?;
             m.install(&self.dir)?;
-            Ok(fresh)
-        });
-        let fresh = match result {
-            Ok(f) => f,
+            Ok((carried, snap))
+        })();
+        let (mut carried, snap) = match result {
+            Ok(r) => r,
             Err(e) => {
                 cleanup(&created);
                 return Err(e);
             }
         };
 
-        // Committed: swap the view, then drop the old segments' files.
-        let mut old_files = Vec::new();
-        for (e, s) in w.manifest.segments.iter().zip(&view.sealed) {
-            if inputs.contains(&e.id) {
-                old_files.extend(s.files.iter().cloned());
-                if e.del_gen != 0 {
-                    old_files.push(self.dir.join(del_name(e.id, e.del_gen)));
-                }
-            }
-        }
-        let output = fresh.as_ref().map(|s| {
+        // Committed. As in a flush, the old files stay until the rename is
+        // known to be durable.
+        let durable = sync_parent_dir(&self.dir.join(MANIFEST));
+        self.at("build: installed");
+        let output = built.as_ref().map(|(s, _)| {
             (
                 s.id,
                 match s.body {
@@ -296,30 +316,55 @@ impl Collection {
                 },
             )
         });
-        let mut sealed = Vec::with_capacity(view.sealed.len());
-        let mut fresh = fresh.map(Arc::new);
-        for s in &view.sealed {
-            if inputs.contains(&s.id) {
-                if let Some(f) = fresh.take() {
-                    sealed.push(f);
+        let mut old_files = Vec::new();
+        {
+            let _w = self.writer.lock().unwrap();
+            let view = self.view();
+            for (e, s) in man.segments.iter().zip(&view.sealed) {
+                debug_assert_eq!(e.id, s.id);
+                if inputs.contains(&e.id) {
+                    old_files.extend(s.files.iter().cloned());
+                    if e.del_gen != 0 {
+                        old_files.push(self.dir.join(del_name(e.id, e.del_gen)));
+                    }
                 }
-            } else {
-                sealed.push(s.clone());
             }
+            let mut fresh = built.map(|(s, new_pos)| {
+                // Deletes since the tombstone file: only in the logs, with
+                // their numbers (see `flush`).
+                let seq = snap.as_ref().expect("taken").seq;
+                let mut late = Vec::new();
+                for (s, new_pos) in segs.iter().zip(&new_pos) {
+                    late.extend(s.tomb.deleted_after(seq).into_iter().map(|(p, d)| (d, new_pos[p as usize])));
+                }
+                late.sort_unstable();
+                for (d, p) in late {
+                    s.tomb.delete(p as usize, d);
+                    carried += 1;
+                }
+                Arc::new(s)
+            });
+            let mut sealed = Vec::with_capacity(view.sealed.len());
+            for s in &view.sealed {
+                if inputs.contains(&s.id) {
+                    sealed.extend(fresh.take());
+                } else {
+                    sealed.push(s.clone());
+                }
+            }
+            let next = super::View { sealed, frozen: view.frozen.clone(), growing: view.growing.clone() };
+            *self.view.write().unwrap() = Arc::new(next);
         }
-        *self.view.write().unwrap() = Arc::new(super::View { sealed, growing: view.growing.clone() });
-        w.manifest = m;
+        *man = m;
+        drop(man);
+        drop(snap);
         drop(segs);
-        // As in flush: old files go only once the rename is durable, and
-        // no writes are taken until it is.
-        if let Err(e) = crate::format::sync_parent_dir(&self.dir.join(super::manifest::MANIFEST)) {
-            w.wal.poison();
-            return Err(e);
-        }
-        drop(w);
+        self.at("build: replaced");
+        durable?;
         for p in old_files {
             let _ = fs::remove_file(p);
         }
+        self.background.built(&Ok(()));
         Ok(JobReport {
             reason,
             inputs: inputs.to_vec(),
@@ -331,11 +376,11 @@ impl Collection {
     }
 }
 
-fn build_params(cfg: &CollectionConfig, opts: &super::OpenOptions) -> PartitionedBuildParams {
+fn build_params(cfg: &CollectionConfig, opts: &OpenOptions, threads: usize, cancel: Cancel) -> PartitionedBuildParams {
     let i = &cfg.index;
     PartitionedBuildParams {
-        graph: cfg.graph_params(opts.threads),
-        pq: PqParams { threads: opts.threads, ..PqParams::new(i.pq_m) },
+        graph: cfg.graph_params(threads),
+        pq: PqParams { threads, ..PqParams::new(i.pq_m) },
         write: DiskWriteOptions { layout: i.layout, codec: i.codec },
         memory_budget: opts.build_memory,
         partitions: 0,
@@ -344,6 +389,7 @@ fn build_params(cfg: &CollectionConfig, opts: &super::OpenOptions) -> Partitione
         merge: MergePrune::Pq,
         scratch_dir: None,
         progress: opts.progress,
+        cancel,
     }
 }
 

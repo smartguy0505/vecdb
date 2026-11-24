@@ -176,33 +176,53 @@ fn rounds(res: &[SearchResult], groups: u64) -> Vec<u64> {
         .collect()
 }
 
-/// Writers upsert whole groups while readers search and a maintainer runs
-/// flushes, index builds, compactions and merges: every search sees each
-/// id once, each group from one batch, and never an older round than it
-/// saw before.
+/// Writers upsert whole groups while readers search and flushes, index
+/// builds, compactions and merges run: every search sees each id once, each
+/// group from one batch, and never an older round than it saw before.
 #[test]
 fn searches_see_whole_batches_and_each_id_once() {
-    let dir = test_dir("coll-concurrent");
+    whole_batches("coll-concurrent", &test_opts());
+}
+
+#[test]
+fn searches_see_whole_batches_with_background_threads() {
+    whole_batches("coll-concurrent-bg", &OpenOptions { background: true, ..test_opts() });
+}
+
+#[test]
+fn searches_see_whole_batches_with_a_pool() {
+    let pool = Some(SearchPool::new(3, 4).unwrap());
+    whole_batches("coll-concurrent-pool", &OpenOptions { background: true, pool, ..test_opts() });
+}
+
+fn whole_batches(name: &str, opts: &OpenOptions) {
+    let dir = test_dir(name);
     let (dim, groups) = (8, 300u64);
     let n = (groups * GROUP) as usize;
     let mut cfg = ssd_config(dim, Metric::L2, 400, 2048);
     cfg.fields = vec![Field::int("g")];
-    let c = Collection::create(&dir, cfg, test_opts()).unwrap();
+    let c = Collection::create(&dir, cfg, opts.clone()).unwrap();
     for g in 0..groups {
         write_group(&c, g, 0);
     }
     c.maintain().unwrap();
+    c.wait_idle().unwrap();
     let round = AtomicU64::new(1);
     let last = Mutex::new(vec![0u64; groups as usize]);
     let stop = AtomicBool::new(false);
     let (searches, jobs) = (AtomicU64::new(0), Mutex::new(Vec::new()));
+    let t0 = std::time::Instant::now();
     std::thread::scope(|s| {
         let writers: Vec<_> = (0..2u64)
             .map(|w| {
-                let (c, round, last) = (&c, &round, &last);
+                let (c, round, last, t0) = (&c, &round, &last, &t0);
                 s.spawn(move || {
                     let mut rng = SplitMix64::new(w + 10);
-                    for _ in 0..300 {
+                    for i in 0.. {
+                        // Until enough has happened.
+                        if i >= 300 && (c.stats().builds > 4 || t0.elapsed().as_secs() > 30) {
+                            break;
+                        }
                         let g = (rng.next_u64() % (groups / 2)) * 2 + w;
                         let r = round.fetch_add(1, Ordering::Relaxed);
                         write_group(c, g, r);
@@ -212,7 +232,7 @@ fn searches_see_whole_batches_and_each_id_once() {
             })
             .collect();
         s.spawn(|| {
-            while !stop.load(Ordering::Relaxed) {
+            while !opts.background && !stop.load(Ordering::Relaxed) {
                 jobs.lock().unwrap().extend(c.maintain().unwrap());
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -250,14 +270,17 @@ fn searches_see_whole_batches_and_each_id_once() {
     let jobs = jobs.into_inner().unwrap();
     let reasons: HashSet<&str> = jobs.iter().map(|j| j.reason).collect();
     assert!(searches.load(Ordering::Relaxed) >= 20, "{} searches", searches.load(Ordering::Relaxed));
-    assert!(reasons.contains("compact") || reasons.contains("merge"), "jobs: {reasons:?}");
+    let st = c.stats();
+    assert!(st.flushes > 2 && st.builds > 2, "{st:?}");
+    assert!(opts.background || reasons.contains("compact") || reasons.contains("merge"), "jobs: {reasons:?}");
+    c.wait_idle().unwrap();
     let want = last.into_inner().unwrap();
     assert_eq!(rounds(&search_all(&c, None, n), groups), want);
     // No search is open: the next write drops every delete record.
     write_group(&c, 0, want[0]);
     assert_eq!(c.stats().delete_records, 0);
     drop(c);
-    let (c, _) = Collection::open(&dir, test_opts()).unwrap();
+    let (c, _) = Collection::open(&dir, opts.clone()).unwrap();
     assert_eq!(rounds(&search_all(&c, None, n), groups), want);
     drop(c);
     let _ = fs::remove_dir_all(&dir);
@@ -426,4 +449,38 @@ fn a_failed_group_answers_every_writer() {
     assert_eq!(c.live_ids().len() as u64, acked);
     drop(c);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// An index build leaves out rows that buffered writes deleted. After a
+/// power loss that takes those writes back, the rows must be there again:
+/// an upsert's old row may go only once its new row is durable.
+#[test]
+fn builds_do_not_outlive_the_buffered_deletes_they_apply() {
+    let dir = test_dir("coll-powerloss");
+    let dim = 8;
+    let c = Collection::create(&dir, small_config(dim, Metric::L2, 100_000), test_opts()).unwrap();
+    for id in 0..50u64 {
+        c.upsert(id, &[id as f32; 8], &Attrs::default()).unwrap();
+    }
+    c.flush().unwrap();
+    // Only in the WAL, not fsynced (durability is Buffered).
+    c.upsert(5, &[100.0; 8], &Attrs::default()).unwrap();
+    assert!(c.delete(6).unwrap());
+    let ids: Vec<u64> = c.sealed().iter().map(|s| s.id).collect();
+    c.rebuild(&ids, "test", 2).unwrap();
+    let crashed = test_dir("coll-powerloss-crash");
+    super::logs::power_loss_copy(&c, &dir, &crashed, || 0.0);
+    drop(c);
+    let (c, _) = Collection::open(&crashed, test_opts()).unwrap();
+    // A prefix of the batches: before both, after the upsert, or after both.
+    let five = c.get(5).unwrap().map(|(v, _)| v[0]);
+    match c.stats().next_seq - 51 {
+        0 => assert!(five == Some(5.0) && c.contains(6), "id 5: {five:?}, id 6: {}", c.contains(6)),
+        1 => assert!(five == Some(100.0) && c.contains(6), "id 5: {five:?}, id 6: {}", c.contains(6)),
+        2 => assert!(five == Some(100.0) && !c.contains(6), "id 5: {five:?}, id 6: {}", c.contains(6)),
+        n => panic!("{n} writes after the flush"),
+    }
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&crashed);
 }

@@ -3,7 +3,7 @@
 //! set (a flush, an index build, a compaction) commits with one rename.
 //!
 //! ```text
-//! magic "VECDBMAN", version u32 (1)
+//! magic "VECDBMAN", version u32 (2)
 //! config: dim u32, metric u32, seal_bytes u64, index_bytes u64,
 //!         compact_deleted f32, max_indexed_segments u32,
 //!         index: max_degree u32, build_list u32, alpha f32, passes u32,
@@ -15,6 +15,10 @@
 //!         deleted u64, del_gen u64 (0 = no tombstone file)
 //! crc u32: CRC-32C of everything before it
 //! ```
+//!
+//! Version 1 is the same, from before there could be several logs: code
+//! that knows only version 1 would take the later ones for leftovers and
+//! remove them, so a collection is moved to version 2 when it is opened.
 
 use std::path::Path;
 
@@ -27,7 +31,7 @@ use crate::error::{Error, Result};
 
 pub(crate) const MANIFEST: &str = "MANIFEST";
 const MAGIC: [u8; 8] = *b"VECDBMAN";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SegmentKind {
@@ -113,7 +117,7 @@ impl Manifest {
             return Err(d.corrupt("bad magic"));
         }
         let version = d.u32()?;
-        if version != VERSION {
+        if version != 1 && version != VERSION {
             return Err(Error::Unsupported(format!("manifest version {version}")));
         }
         let dim = d.u32()? as usize;
@@ -168,6 +172,12 @@ impl Manifest {
 
     pub fn read(dir: &Path) -> Result<Self> {
         Self::decode(&std::fs::read(dir.join(MANIFEST))?)
+    }
+
+    /// Whether the manifest in `dir` is of an earlier version.
+    pub fn is_old(dir: &Path) -> Result<bool> {
+        let bytes = std::fs::read(dir.join(MANIFEST))?;
+        Ok(bytes.get(8..12) != Some(&VERSION.to_le_bytes()[..]))
     }
 
     /// Replaces the manifest atomically and fsyncs the directory.

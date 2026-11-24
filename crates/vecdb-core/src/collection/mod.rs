@@ -5,7 +5,8 @@
 //! ```text
 //! <dir>/MANIFEST                 which files make up the collection (atomic replace)
 //!       LOCK                     held while a process has the collection open
-//!       wal-<gen>.log            writes since the last flush
+//!       wal-<gen>.log            writes not flushed yet: one log per frozen
+//!                                segment, and the current one
 //!       seg-<id>.flat            sealed segment: ids + prepared vectors, searched exactly
 //!       seg-<id>.vdx             sealed segment: SSD index (PQ in RAM, graph + vectors on SSD)
 //!       seg-<id>.attrs           attributes: rows, and the column index filters read
@@ -17,10 +18,11 @@
 //! the WAL as one record (fsynced under [`Durability::Sync`]), then applied:
 //! an upsert deletes the id's current row, wherever it is, and appends a new
 //! row to the growing segment. The growing segment lives in RAM and is
-//! searched exactly. Once its vectors reach `seal_bytes`, [`Collection::flush`]
-//! seals it: its live rows become a flat segment file, the tombstones of
-//! every segment that gained deletes are written, a new WAL is started, and
-//! a new manifest commits all of it.
+//! searched exactly. Once its vectors reach `seal_bytes` it is frozen, and a
+//! new growing segment and a new WAL start. A flush (see `flush`) then turns
+//! the frozen segment's live rows into a flat segment file, writes the
+//! tombstones of every segment that gained deletes, and commits all of it
+//! with a new manifest, which no longer needs the frozen segment's WAL.
 //!
 //! **Index builds and compaction** ([`Collection::maintain`]) replace sealed
 //! segments with new ones built from their live rows, and commit the swap
@@ -28,8 +30,10 @@
 //! they hold `index_bytes` of vectors; SSD segments with many deleted rows
 //! are rebuilt without them.
 //!
-//! **Read path.** A search runs on every segment and merges the top-k lists.
-//! Every segment returns exact distances, so they compare directly.
+//! **Read path.** A search runs on every segment, on several at once if a
+//! [`SearchPool`] has threads to spare (see `search`), and merges the top-k
+//! lists. Every segment returns exact distances, so they compare
+//! directly.
 //!
 //! **Filters.** A search may carry a [`Filter`] on the declared fields.
 //! Each segment keeps a column index of its attributes in RAM (keyword
@@ -45,7 +49,7 @@
 //!
 //! **Crash safety.** Files are written under new names, fsynced, then
 //! committed by renaming the manifest into place; the old WAL is removed only
-//! after that. Opening replays the WAL on top of the manifest's state and
+//! after that. Opening replays the logs on top of the manifest's state and
 //! removes files no manifest refers to.
 //!
 //! **Concurrency.** A collection is shared by threads through `&self`.
@@ -64,41 +68,47 @@
 //! **Group commit.** Writers that arrive while a batch is being logged
 //! queue up; the next of them logs every waiting batch with one WAL write
 //! and, under [`Durability::Sync`], one fsync. Each batch is still its own
-//! WAL record, so a crash keeps or drops batches whole. Index builds run while searches and writes go on; only their
-//! commit takes the writer lock (see `maintain`).
+//! WAL record, so a crash keeps or drops batches whole.
+//!
+//! **Flushes and builds** run while searches and writes go on: they write
+//! their files without locks, and take the writer lock only to replace the
+//! segment list (see `flush` and `maintain`).
 
+mod background;
 mod bitmap;
-mod bytes;
+pub(crate) mod bytes;
 mod columns;
 pub mod filter;
+mod flush;
 mod maintain;
 mod manifest;
 pub mod meta;
+pub(crate) mod search;
 mod segment;
 mod wal;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use crate::disk::{DiskIndex, DiskOpenOptions, DiskSearchParams, IoMode, Layout};
+use crate::disk::{DiskIndex, DiskOpenOptions, IoMode, Layout};
 use crate::distance::{Metric, check_finite, normalize};
 use crate::error::{Error, Result};
-use crate::format::{read_flat_segment, sync_parent_dir, write_flat_segment};
+use crate::format::{read_flat_segment, sync_parent_dir};
 use crate::graph::GraphParams;
-use crate::kernels;
+use crate::pool::SearchPool;
 use crate::quant::Codec;
 use crate::store::{VectorStore, check_dim};
-use crate::topk::{SearchResult, TopK};
+use background::{Background, Room, Workers};
+use columns::{SegmentAttrs, decode_row, encode_row};
 use manifest::{MANIFEST, Manifest, SegmentEntry, SegmentKind};
-use bitmap::Bitmap;
-use columns::{AttrWriter, SegmentAttrs, decode_row, encode_row};
-use filter::Compiled;
-use segment::{AsOf, Body, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
-use wal::{LoggedOp, Wal, wal_name};
+use segment::{Body, Frozen, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
+use wal::{Event, LoggedOp, Wal, replay_chain, wal_generation, wal_name};
 
+pub use background::BuildLimit;
 pub use filter::Filter;
 pub use maintain::{JobReport, MIN_SSD_ROWS};
 pub use meta::{Attrs, Field, FieldType, NO_ATTRS, Value};
@@ -157,10 +167,11 @@ impl CollectionConfig {
     /// 20% deleted, at most 8 SSD segments; R 64, build L 100, α 1.2, PQ
     /// with `dim / 4` bytes (8 to 256), f32 vectors.
     ///
-    /// The growing and flat segments are scanned exactly on every search
-    /// (about 30 ns per 128-dim row on one core, measured), so the two
-    /// thresholds bound that cost: with `maintain` run after each flush, at
-    /// most about 96 MiB of vectors are scanned.
+    /// The growing, frozen and flat segments are scanned exactly on every
+    /// search (about 30 ns per live 128-dim row on one core, measured), so
+    /// the two thresholds bound that cost: once flushes and builds have
+    /// caught up, at most `seal_bytes` + `index_bytes` of live vectors are
+    /// scanned, 96 MiB with the defaults.
     pub fn new(dim: usize, metric: Metric) -> Self {
         Self {
             dim,
@@ -205,6 +216,15 @@ impl CollectionConfig {
         meta::validate_fields(&self.fields)
     }
 
+    /// Whether a row can be in the collection.
+    pub(crate) fn check_row(&self, vector: &[f32], attrs: &Attrs) -> Result<()> {
+        if vector.len() != self.dim {
+            return Err(Error::DimensionMismatch { expected: self.dim, got: vector.len() });
+        }
+        check_finite(vector)?;
+        attrs.validate(&self.fields)
+    }
+
     fn graph_params(&self, threads: usize) -> GraphParams {
         let i = &self.index;
         GraphParams {
@@ -222,13 +242,33 @@ impl CollectionConfig {
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     pub durability: Durability,
-    /// Threads for index builds; 0 = one per CPU.
+    /// Flush full segments and build indexes on background threads. Without,
+    /// the write that fills a segment flushes it, and indexes are built by
+    /// [`Engine::maintain`] only.
+    pub background: bool,
+    /// With `background`: writes wait while flat segments hold more than
+    /// this many bytes of vectors (they are in RAM, and every search scans
+    /// them) and an index build or a merge that will take them is due.
+    /// Builds run one at a time, so that is after the one that is running,
+    /// whatever its size, and that of other collections sharing
+    /// [`builds`](Self::builds): minutes, if it is a compaction of a large
+    /// segment. 0 = no limit.
+    pub max_unindexed_bytes: u64,
+    /// Background builds that may run at once, over all collections given
+    /// the same limit. `None`: one per collection.
+    pub builds: Option<Arc<BuildLimit>>,
+    /// Threads for index builds. 0 = one per CPU, or one per two CPUs for
+    /// background builds, which share the CPUs with searches.
     pub threads: usize,
     /// RAM an index build may use for one partition.
     pub build_memory: u64,
     /// Read SSD indexes with `O_DIRECT`.
     pub direct_io: bool,
     pub io: IoMode,
+    /// Threads that help searches: a search then runs on several segments
+    /// (and parts of those in RAM) at once, as far as there are threads and
+    /// CPUs to spare. `None`: each search runs on its caller's thread.
+    pub pool: Option<Arc<SearchPool>>,
     /// Called with a line of progress during index builds.
     pub progress: Option<fn(&str)>,
 }
@@ -237,10 +277,14 @@ impl Default for OpenOptions {
     fn default() -> Self {
         Self {
             durability: Durability::Sync,
+            background: true,
+            max_unindexed_bytes: 1 << 30,
+            builds: None,
             threads: 0,
             build_memory: 2 << 30,
             direct_io: true,
             io: IoMode::Auto,
+            pool: None,
             progress: None,
         }
     }
@@ -338,16 +382,27 @@ pub struct CollectionStats {
     pub live: usize,
     pub growing_rows: usize,
     pub growing_live: usize,
-    /// RAM for the growing segment's attributes and their index.
+    /// Segments frozen and not flushed yet, and their rows.
+    pub frozen: usize,
+    pub frozen_rows: usize,
+    /// RAM for the attributes of the growing and frozen segments, and
+    /// their index.
     pub growing_attr_bytes: usize,
     pub segments: Vec<SegmentInfo>,
+    /// Bytes of every log still needed.
     pub wal_bytes: u64,
     /// Sequence number the next write gets.
     pub next_seq: u64,
     /// Deletes kept with their sequence numbers for open searches.
     pub delete_records: usize,
-    /// Why the last flush a write started failed, until one succeeds.
+    /// Why the last flush failed, until one succeeds.
     pub flush_error: Option<String>,
+    /// The same for background builds.
+    pub build_error: Option<String>,
+    /// Since the collection was opened: frozen segments flushed, and builds
+    /// and compactions committed.
+    pub flushes: u64,
+    pub builds: u64,
     /// Since the collection was opened: write batches, the groups they
     /// were logged in (one WAL write each), and WAL fsyncs.
     pub write_batches: u64,
@@ -369,26 +424,38 @@ pub struct OpenReport {
 pub(crate) struct View {
     /// Oldest first, in manifest order.
     sealed: Vec<Arc<Sealed>>,
+    /// Waiting to be flushed, oldest first.
+    frozen: Vec<Arc<Frozen>>,
     /// Appended to by the writer.
     growing: Arc<RwLock<Growing>>,
 }
 
+impl View {
+    /// The segments in RAM, newest first.
+    fn memory(&self) -> impl Iterator<Item = &Arc<RwLock<Growing>>> {
+        [&self.growing].into_iter().chain(self.frozen.iter().rev().map(|f| &f.rows))
+    }
+}
+
 /// What only the writer touches.
 struct Writer {
-    /// The manifest on disk (its `segments` in the same order as the
-    /// view's sealed segments).
-    manifest: Manifest,
+    /// The log writes go to: the growing segment's.
     wal: Wal,
+    /// Earlier logs still needed, oldest first: the frozen segments'.
+    closed: Vec<Wal>,
     /// Sequence number the next write gets.
     next_seq: u64,
-    /// The last flush that a write started and that failed, if the next
-    /// one has not succeeded yet.
-    flush_error: Option<String>,
     /// Since the collection was opened: batches logged, groups they were
     /// logged in, fsyncs.
     batches: u64,
     groups: u64,
     syncs: u64,
+}
+
+impl Writer {
+    fn new(wal: Wal, closed: Vec<Wal>, next_seq: u64) -> Self {
+        Self { wal, closed, next_seq, batches: 0, groups: 0, syncs: 0 }
+    }
 }
 
 /// A write batch checked and encoded by its caller, ready to log and apply.
@@ -435,7 +502,7 @@ const GROUP_BYTES: usize = 16 << 20;
 /// Set while a writer logs a group: if it panics, the group's writers get
 /// an error instead of waiting forever.
 struct Leading<'a> {
-    c: &'a Collection,
+    c: &'a Engine,
     tickets: Vec<u64>,
 }
 
@@ -456,34 +523,70 @@ impl Drop for Leading<'_> {
 /// A search's view of the collection: the segments, and the last write it
 /// sees. Registered while it lives, so deletes it predates keep their
 /// sequence numbers.
-struct Snapshot<'a> {
-    c: &'a Collection,
+pub(crate) struct Snapshot<'a> {
+    c: &'a Engine,
     view: Arc<View>,
     seq: u64,
 }
 
 impl Drop for Snapshot<'_> {
     fn drop(&mut self) {
-        let mut open = self.c.snapshots.lock().unwrap();
-        if let Some(n) = open.get_mut(&self.seq) {
-            *n -= 1;
-            if *n == 0 {
-                open.remove(&self.seq);
-            }
-        }
+        self.c.unregister(self.seq);
     }
 }
 
-/// A collection: shared by any number of threads (`&self` everywhere).
-/// Writes are applied one batch at a time, in order; each search reads a
-/// snapshot (see the module docs).
+/// An open collection: an [`Engine`], which has all the operations, and its
+/// background threads (with [`OpenOptions::background`]), which stop when
+/// it is dropped. What they had not flushed or built yet is done after the
+/// next open.
 pub struct Collection {
+    // First, so the threads are gone before the lock is released.
+    _workers: Workers,
+    engine: Arc<Engine>,
+}
+
+impl Collection {
+    /// Creates a collection in `dir` (created if missing; must not hold one).
+    pub fn create(dir: impl AsRef<Path>, config: CollectionConfig, opts: OpenOptions) -> Result<Self> {
+        Self::start(Engine::create(dir.as_ref(), config, opts)?)
+    }
+
+    /// Opens the collection in `dir`: loads its segments, replays the logs
+    /// and removes files the manifest does not refer to.
+    pub fn open(dir: impl AsRef<Path>, opts: OpenOptions) -> Result<(Self, OpenReport)> {
+        let (engine, report) = Engine::open(dir.as_ref(), opts)?;
+        Ok((Self::start(engine)?, report))
+    }
+
+    fn start(engine: Engine) -> Result<Self> {
+        let engine = Arc::new(engine);
+        let workers = Workers::start(&engine)?;
+        Ok(Self { _workers: workers, engine })
+    }
+}
+
+impl Deref for Collection {
+    type Target = Engine;
+
+    fn deref(&self) -> &Engine {
+        &self.engine
+    }
+}
+
+/// A collection's operations, for any number of threads at once (`&self`
+/// everywhere). Writes are applied one batch at a time, in order; each
+/// search reads a snapshot (see the module docs).
+pub struct Engine {
     dir: PathBuf,
     _lock: File,
     opts: OpenOptions,
-    config: CollectionConfig,
-    /// Held while a batch is logged and applied, and while a flush or an
-    /// index build commits.
+    config: Arc<CollectionConfig>,
+    /// The manifest on disk (its `segments` in the order of the view's
+    /// sealed segments). Held while a flush or an index build commits;
+    /// taken before `writer`.
+    manifest: Mutex<Manifest>,
+    /// Held while a batch is logged and applied, and while the view is
+    /// replaced.
     writer: Mutex<Writer>,
     /// Batches waiting to be logged; one waiting writer at a time logs all
     /// that are waiting, with one WAL write and (under `Sync`) one fsync.
@@ -495,15 +598,23 @@ pub struct Collection {
     visible: AtomicU64,
     /// Open snapshots: sequence number -> how many.
     snapshots: Mutex<BTreeMap<u64, usize>>,
-    /// One `maintain` or `optimize` at a time.
+    /// One flush at a time, and one `maintain` or `optimize`.
+    flushing: Mutex<()>,
     maintaining: Mutex<()>,
+    /// What the background threads, and those waiting for them, share.
+    background: Background,
+    #[cfg(test)]
+    hook: Mutex<Option<Hook>>,
 }
 
-impl Collection {
-    /// Creates a collection in `dir` (created if missing; must not hold one).
-    pub fn create(dir: impl AsRef<Path>, config: CollectionConfig, opts: OpenOptions) -> Result<Self> {
+/// Called at named points of a flush or a build, to have something happen
+/// right there.
+#[cfg(test)]
+type Hook = Box<dyn FnMut(&Engine, &'static str) + Send>;
+
+impl Engine {
+    fn create(dir: &Path, config: CollectionConfig, opts: OpenOptions) -> Result<Self> {
         config.validate()?;
-        let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         let lock = lock_dir(dir)?;
         if dir.join(MANIFEST).exists() {
@@ -531,17 +642,15 @@ impl Collection {
             next_segment: 1,
             segments: Vec::new(),
         };
-        let wal = Wal::create(dir, 1, config.dim)?;
+        let wal = Wal::create(dir, 1, config.dim, true)?;
         sync_parent_dir(wal.path())?;
         manifest.write(dir)?;
-        let growing = Growing::new(config.dim, &config.fields);
-        Ok(Self::assemble(dir, lock, opts, config, manifest, wal, Vec::new(), growing, 1))
+        let growing = Arc::new(RwLock::new(Growing::new(config.dim, &config.fields)));
+        let view = View { sealed: Vec::new(), frozen: Vec::new(), growing };
+        Ok(Self::assemble(dir, lock, opts, config, manifest, view, Writer::new(wal, Vec::new(), 1)))
     }
 
-    /// Opens the collection in `dir`: loads its segments, replays the WAL
-    /// and removes files the manifest does not refer to.
-    pub fn open(dir: impl AsRef<Path>, opts: OpenOptions) -> Result<(Self, OpenReport)> {
-        let dir = dir.as_ref();
+    fn open(dir: &Path, opts: OpenOptions) -> Result<(Self, OpenReport)> {
         let lock = lock_dir(dir)?;
         let manifest = Manifest::read(dir)?;
         let config = manifest.config.clone();
@@ -550,9 +659,21 @@ impl Collection {
             sealed.push(Arc::new(load_segment(dir, &config, e, &opts)?));
         }
         let mut growing = Growing::new(config.dim, &config.fields);
+        let mut frozen: Vec<Arc<Frozen>> = Vec::new();
         let mut next_seq = manifest.flushed_seq + 1;
         let (mut vector, mut row) = (Vec::new(), Vec::new());
-        let (wal, replay) = Wal::replay(dir, manifest.wal_gen, config.dim, next_seq, |seq, op| {
+        // Each log but the last held the writes of a frozen segment, and
+        // becomes one again.
+        let chain = replay_chain(dir, manifest.wal_gen, config.dim, next_seq, |event| {
+            let (seq, op) = match event {
+                Event::Op(seq, op) => (seq, op),
+                Event::EndOfLog { generation } => {
+                    let full = std::mem::replace(&mut growing, Growing::new(config.dim, &config.fields));
+                    let rows = Arc::new(RwLock::new(full));
+                    frozen.push(Arc::new(Frozen { rows, last_seq: next_seq - 1, wal: generation }));
+                    return Ok(());
+                }
+            };
             match op {
                 LoggedOp::Upsert { id, vector: v, attrs } => {
                     let a = Attrs::decode(attrs)?;
@@ -562,47 +683,70 @@ impl Collection {
                     if !config.fields.is_empty() {
                         encode_row(&a, &config.fields, &mut row);
                     }
-                    delete_live(&sealed, &mut growing, id, seq);
+                    delete_live(&sealed, &frozen, &mut growing, id, seq);
                     growing.push(id, &vector, &row, seq);
                 }
                 LoggedOp::Delete { id } => {
-                    delete_live(&sealed, &mut growing, id, seq);
+                    delete_live(&sealed, &frozen, &mut growing, id, seq);
                 }
             }
             next_seq = seq + 1;
             Ok(())
         })?;
         // Only once everything the manifest names has loaded.
-        let removed = remove_unreferenced(dir, &manifest)?;
-        let c = Self::assemble(dir, lock, opts, config, manifest, wal, sealed, growing, next_seq);
-        Ok((c, OpenReport { replay, removed }))
+        if Manifest::is_old(dir)? {
+            manifest.write(dir)?;
+        }
+        let mut removed = remove_unreferenced(dir, &manifest)?;
+        removed.extend(chain.dropped);
+        removed.sort();
+        let frozen_at: Vec<u64> = frozen.iter().map(|f| f.last_seq).collect();
+        let view = View { sealed, frozen, growing: Arc::new(RwLock::new(growing)) };
+        let writer = Writer::new(chain.active, chain.closed, next_seq);
+        let c = Self::assemble(dir, lock, opts, config, manifest, view, writer);
+        frozen_at.into_iter().for_each(|seq| c.register(seq));
+        Ok((c, OpenReport { replay: chain.report, removed }))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn assemble(
         dir: &Path,
         lock: File,
         opts: OpenOptions,
         config: CollectionConfig,
         manifest: Manifest,
-        wal: Wal,
-        sealed: Vec<Arc<Sealed>>,
-        growing: Growing,
-        next_seq: u64,
+        view: View,
+        writer: Writer,
     ) -> Self {
-        let view = View { sealed, growing: Arc::new(RwLock::new(growing)) };
         Self {
             dir: dir.to_path_buf(),
             _lock: lock,
             opts,
-            config,
-            writer: Mutex::new(Writer { manifest, wal, next_seq, flush_error: None, batches: 0, groups: 0, syncs: 0 }),
+            config: Arc::new(config),
+            manifest: Mutex::new(manifest),
+            visible: AtomicU64::new(writer.next_seq - 1),
+            writer: Mutex::new(writer),
             queue: Mutex::new(Queue::default()),
             queue_cv: Condvar::new(),
             view: RwLock::new(Arc::new(view)),
-            visible: AtomicU64::new(next_seq - 1),
             snapshots: Mutex::new(BTreeMap::new()),
+            flushing: Mutex::new(()),
             maintaining: Mutex::new(()),
+            background: Background::default(),
+            #[cfg(test)]
+            hook: Mutex::new(None),
+        }
+    }
+
+    /// A named point (see `Hook`).
+    #[inline(always)]
+    fn at(&self, _point: &'static str) {
+        #[cfg(test)]
+        {
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(mut h) = hook {
+                h(self, _point);
+                self.hook.lock().unwrap().get_or_insert(h);
+            }
         }
     }
 
@@ -621,7 +765,7 @@ impl Collection {
 
     /// The view and the last write applied, read together (no flush or
     /// build can swap the view in between), and registered.
-    fn snapshot(&self) -> Snapshot<'_> {
+    pub(crate) fn snapshot(&self) -> Snapshot<'_> {
         let mut open = self.snapshots.lock().unwrap();
         let (view, seq) = {
             let v = self.view.read().unwrap();
@@ -632,11 +776,27 @@ impl Collection {
         Snapshot { c: self, view, seq }
     }
 
+    /// Keeps the sequence numbers of deletes after write `seq` (the last
+    /// one applied, or an earlier one already registered).
+    fn register(&self, seq: u64) {
+        *self.snapshots.lock().unwrap().entry(seq).or_insert(0) += 1;
+    }
+
+    fn unregister(&self, seq: u64) {
+        let mut open = self.snapshots.lock().unwrap();
+        if let Some(n) = open.get_mut(&seq) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&seq);
+            }
+        }
+    }
+
     /// Live rows now.
     pub fn len(&self) -> usize {
         let v = self.view();
-        let g = v.growing.read().unwrap().live();
-        g + v.sealed.iter().map(|s| s.live()).sum::<usize>()
+        let memory: usize = v.memory().map(|g| g.read().unwrap().live()).sum();
+        memory + v.sealed.iter().map(|s| s.live()).sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -650,10 +810,11 @@ impl Collection {
     }
 
     pub fn stats(&self) -> CollectionStats {
-        let (wal_bytes, next_seq, flush_error, writes) = {
-            let w = self.writer.lock().unwrap();
-            (w.wal.bytes(), w.next_seq, w.flush_error.clone(), (w.batches, w.groups, w.syncs))
+        let (wal_bytes, next_seq, writes) = {
+            let mut w = self.writer.lock().unwrap();
+            (w.logs_mut().map(|l| l.bytes()).sum(), w.next_seq, (w.batches, w.groups, w.syncs))
         };
+        let bg = self.background.progress();
         let v = self.view();
         let segments = v
             .sealed
@@ -671,17 +832,26 @@ impl Collection {
                 attr_values: s.attrs.as_ref().map_or(0, |a| a.columns.values()),
             })
             .collect();
+        let (frozen_rows, frozen_live, frozen_attrs) = v.frozen.iter().fold((0, 0, 0), |(r, l, a), f| {
+            let g = f.rows.read().unwrap();
+            (r + g.rows(), l + g.live(), a + g.attr_ram())
+        });
         let g = v.growing.read().unwrap();
         CollectionStats {
-            live: g.live() + v.sealed.iter().map(|s| s.live()).sum::<usize>(),
+            live: g.live() + frozen_live + v.sealed.iter().map(|s| s.live()).sum::<usize>(),
             growing_rows: g.rows(),
             growing_live: g.live(),
-            growing_attr_bytes: g.attr_ram(),
+            frozen: v.frozen.len(),
+            frozen_rows,
+            growing_attr_bytes: g.attr_ram() + frozen_attrs,
             segments,
             wal_bytes,
             next_seq,
             delete_records: v.sealed.iter().map(|s| s.tomb.recent_len()).sum(),
-            flush_error,
+            flush_error: bg.flush_error,
+            build_error: bg.build_error,
+            flushes: bg.flushes,
+            builds: bg.builds,
             write_batches: writes.0,
             write_groups: writes.1,
             wal_syncs: writes.2,
@@ -699,19 +869,61 @@ impl Collection {
 
     /// Applies `ops` in order as one batch: logged as one WAL record, so a
     /// crash keeps all of them or none, and searches see all of them or
-    /// none. Seals the growing segment when it is full; a failed seal does
-    /// not fail the write (it is logged and applied), and is retried by
-    /// the next write (see [`CollectionStats::flush_error`]).
+    /// none.
+    ///
+    /// Waits for room first when flushes or index builds are far behind
+    /// ([`Error::Unavailable`] if that is because they keep failing). A
+    /// failed flush alone does not fail a write, which is logged and
+    /// applied; it is retried (see [`CollectionStats::flush_error`]).
     pub fn write(&self, ops: &[WriteOp]) -> Result<()> {
         self.write_ops(ops).map(|_| ())
     }
 
-    /// As `write`; per op, whether its id had a live row.
-    fn write_ops(&self, ops: &[WriteOp]) -> Result<Vec<bool>> {
+    /// As [`write`](Self::write); per op, whether its id had a live row.
+    pub fn write_ops(&self, ops: &[WriteOp]) -> Result<Vec<bool>> {
         if ops.is_empty() {
             return Ok(Vec::new());
         }
         let p = self.prepare(ops)?;
+        self.make_room()?;
+        let r = self.enqueue(p);
+        if !self.opts.background {
+            self.flush_frozen();
+        }
+        r
+    }
+
+    /// Waits, or fails, while there is no room for another write.
+    fn make_room(&self) -> Result<()> {
+        loop {
+            match self.room(&self.background.progress()) {
+                Room::Yes => return Ok(()),
+                Room::Wait => {
+                    self.background.wait(|p| !matches!(self.room(p), Room::Wait));
+                }
+                Room::No(why) => {
+                    // A last try, as only writes freeze (and, without
+                    // background threads, flush).
+                    let mut w = self.writer.lock().unwrap();
+                    if self.view().frozen.len() < flush::MAX_FROZEN {
+                        let r = self.freeze(&mut w);
+                        self.background.flushed(&r.map(|()| false));
+                    }
+                    drop(w);
+                    if !self.opts.background {
+                        self.flush_frozen();
+                    }
+                    return match self.room(&self.background.progress()) {
+                        Room::No(_) => Err(Error::Unavailable(why)),
+                        _ => Ok(()),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Has `p` logged and applied, with the batches waiting at the time.
+    fn enqueue(&self, p: Prepared) -> Result<Vec<bool>> {
         let mut q = self.queue.lock().unwrap();
         let ticket = q.next_ticket;
         q.next_ticket += 1;
@@ -758,11 +970,7 @@ impl Collection {
         let cfg = &self.config;
         for op in ops {
             if let WriteOp::Upsert { vector, attrs, .. } = op {
-                if vector.len() != cfg.dim {
-                    return Err(Error::DimensionMismatch { expected: cfg.dim, got: vector.len() });
-                }
-                check_finite(vector)?;
-                attrs.validate(&cfg.fields)?;
+                cfg.check_row(vector, attrs)?;
             }
         }
         if ops.len() > u32::MAX as usize || Wal::record_bytes(cfg.dim, ops) > wal::MAX_BATCH_BYTES {
@@ -815,7 +1023,7 @@ impl Collection {
                 let mut had = Vec::with_capacity(p.ops.len());
                 let mut u = 0;
                 for &(id, upsert) in &p.ops {
-                    had.push(delete_live(&view.sealed, &mut g, id, seq));
+                    had.push(delete_live(&view.sealed, &view.frozen, &mut g, id, seq));
                     if upsert {
                         let row = &p.rows[if u == 0 { 0 } else { p.row_end[u - 1] }..p.row_end[u]];
                         g.push(id, &p.vectors[u * dim..(u + 1) * dim], row, seq);
@@ -832,8 +1040,10 @@ impl Collection {
         // The WAL check bounds the log of a workload that mostly deletes.
         let seal = self.config.seal_bytes;
         let full = view.growing.read().unwrap().bytes() >= seal || w.wal.bytes() >= seal.saturating_mul(2);
-        if full {
-            w.flush_error = self.flush_locked(w).err().map(|e| e.to_string());
+        if full && view.frozen.len() < flush::MAX_FROZEN {
+            if let Err(e) = self.freeze(w) {
+                self.background.flushed(&Err(e));
+            }
         }
         out
     }
@@ -856,8 +1066,8 @@ impl Collection {
         let fields = &self.config.fields;
         match locate_at(&snap.view, id, snap.seq) {
             None => Ok(None),
-            Some(Place::Growing(r)) => {
-                let g = snap.view.growing.read().unwrap();
+            Some(Place::Memory(m, r)) => {
+                let g = m.read().unwrap();
                 let attrs = if fields.is_empty() { Attrs::default() } else { decode_row(g.attrs(r), fields)? };
                 Ok(Some((g.vector(r).to_vec(), attrs)))
             }
@@ -879,252 +1089,23 @@ impl Collection {
             }
         }
     }
-
-    pub fn search(&self, query: &[f32], k: usize, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
-        Ok(self.search_with_stats(query, k, opts)?.0)
-    }
-
-    /// The `k` nearest live rows over all segments, closest first, as of
-    /// the last write applied when the search starts.
-    pub fn search_with_stats(
-        &self,
-        query: &[f32],
-        k: usize,
-        opts: &SearchOptions,
-    ) -> Result<(Vec<SearchResult>, SearchStats)> {
-        self.search_in(&self.snapshot(), query, k, opts)
-    }
-
-    fn search_in(
-        &self,
-        snap: &Snapshot,
-        query: &[f32],
-        k: usize,
-        opts: &SearchOptions,
-    ) -> Result<(Vec<SearchResult>, SearchStats)> {
-        let cfg = &self.config;
-        if query.len() != cfg.dim {
-            return Err(Error::DimensionMismatch { expected: cfg.dim, got: query.len() });
-        }
-        check_finite(query)?;
-        let mut st = SearchStats::default();
-        if k == 0 {
-            return Ok((Vec::new(), st));
-        }
-        let mut q = query.to_vec();
-        if cfg.metric.needs_normalization() {
-            normalize(&mut q);
-        }
-        let kern = kernels::best();
-        let mut top = TopK::new(k);
-        let filter = match &opts.filter {
-            None => None,
-            Some(f) => match f.compile(&cfg.fields)? {
-                Compiled::All => None,
-                Compiled::Nothing => return Ok((Vec::new(), st)),
-                c => Some(c),
-            },
-        };
-        let seq = snap.seq;
-
-        let n = snap.view.growing.read().unwrap().rows_at(seq);
-        if n > 0 {
-            st.segments += 1;
-            let matching = filter.as_ref().map(|c| {
-                c.eval(snap.view.growing.read().unwrap().cols.as_ref().expect("a filter with fields"))
-            });
-            // In chunks, each under its own read lock: a write waits for
-            // one chunk, not a whole scan (and searches arriving meanwhile
-            // wait for the write). Rows the writer adds or deletes between
-            // chunks are newer than the snapshot.
-            let chunk = growing_chunk_rows(cfg.dim);
-            let mut start = 0;
-            while start < n {
-                let end = (start + chunk).min(n);
-                let g = snap.view.growing.read().unwrap();
-                let rows = &g.data[start * cfg.dim..end * cfg.dim];
-                let push = |r: usize, d: f32| top.push(g.ids[start + r], d);
-                let scanned = match &matching {
-                    None => segment::scan(kern, cfg.metric, &q, rows, |r| g.live_at(start + r, seq), push),
-                    Some(m) => {
-                        let admit = |r: usize| m.get(start + r) && g.live_at(start + r, seq);
-                        segment::scan(kern, cfg.metric, &q, rows, admit, push)
-                    }
-                };
-                st.scanned += scanned;
-                if matching.is_some() {
-                    st.matched += scanned;
-                }
-                start = end;
-            }
-        }
-        for s in &snap.view.sealed {
-            st.segments += 1;
-            let deleted = AsOf::new(&s.tomb, seq);
-            let matching = filter.as_ref().map(|c| {
-                let mut m = c.eval(&s.attrs.as_ref().expect("a filter with fields").columns);
-                deleted.remove_from(&mut m);
-                m
-            });
-            if let Some(m) = &matching {
-                let n = m.count();
-                st.matched += n;
-                if n == 0 {
-                    continue;
-                }
-            }
-            match &s.body {
-                Body::Flat(store) => {
-                    let push = |p: usize, d: f32| top.push(store.id(p), d);
-                    st.scanned += match &matching {
-                        None => segment::scan(kern, cfg.metric, &q, store.raw_vectors(), |p| !deleted.deleted(p), push),
-                        Some(m) => segment::scan(kern, cfg.metric, &q, store.raw_vectors(), |p| m.get(p), push),
-                    };
-                }
-                Body::Disk { index, .. } => {
-                    let res = match &matching {
-                        None => {
-                            let live = s.live() as f64 / s.positions() as f64;
-                            self.search_graph(index, query, k, opts, live, &|p| !deleted.deleted(p), &mut st)?
-                        }
-                        Some(m) => self.search_disk_filtered(index, query, k, opts, m, &mut st)?,
-                    };
-                    res.iter().for_each(|r| top.push(r.id, r.distance));
-                }
-            }
-        }
-        Ok((top.into_sorted(), st))
-    }
-
-    /// Seals the growing segment into a flat segment file and writes the
-    /// tombstones of every segment that gained deletes, then commits both
-    /// with a new manifest and starts a new WAL. Does nothing when there is
-    /// nothing to write. Searches go on meanwhile; writes wait.
-    pub fn flush(&self) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
-        let r = self.flush_locked(&mut w);
-        if r.is_ok() {
-            w.flush_error = None;
-        }
-        r
-    }
-
-    fn flush_locked(&self, w: &mut Writer) -> Result<()> {
-        let view = self.view();
-        let g = view.growing.read().unwrap();
-        let dirty: Vec<usize> = (0..view.sealed.len())
-            .filter(|&i| view.sealed[i].tomb.count() as u64 != w.manifest.segments[i].deleted)
-            .collect();
-        if g.rows() == 0 && dirty.is_empty() && w.wal.batches() == 0 {
-            return Ok(());
-        }
-        let cfg = &self.config;
-        let mut m = w.manifest.clone();
-        m.generation += 1;
-        let mut created: Vec<PathBuf> = Vec::new();
-        let mut superseded: Vec<PathBuf> = Vec::new();
-        let result = (|| -> Result<(Option<Sealed>, Wal)> {
-            // 1. The growing segment's live rows, as a flat segment.
-            let fresh = if g.live() > 0 {
-                let (store, live) = live_rows(&g, cfg.dim)?;
-                let id = m.next_segment;
-                m.next_segment += 1;
-                let path = self.dir.join(flat_name(id));
-                created.push(path.clone());
-                write_flat_segment(&path, cfg.metric, &store)?;
-                let mut files = vec![path];
-                let mut attrs = None;
-                if !cfg.fields.is_empty() {
-                    let ap = self.dir.join(attrs_name(id));
-                    created.push(ap.clone());
-                    let mut aw = AttrWriter::create(&ap, &cfg.fields, live.len())?;
-                    for (pos, &r) in live.iter().enumerate() {
-                        aw.push(pos, g.attrs(r))?;
-                    }
-                    attrs = Some(aw.finish()?);
-                    files.push(ap);
-                }
-                m.segments.push(SegmentEntry {
-                    id,
-                    kind: SegmentKind::Flat,
-                    positions: store.len() as u64,
-                    deleted: 0,
-                    del_gen: 0,
-                });
-                Some(Sealed::flat(id, store, attrs, files))
-            } else {
-                None
-            };
-            // 2. Tombstones that changed.
-            for &i in &dirty {
-                let s = &view.sealed[i];
-                let path = self.dir.join(del_name(s.id, m.generation));
-                created.push(path.clone());
-                let count = s.tomb.write(&path, s.id)?;
-                let e = &mut m.segments[i];
-                if e.del_gen != 0 {
-                    superseded.push(self.dir.join(del_name(e.id, e.del_gen)));
-                }
-                e.deleted = count as u64;
-                e.del_gen = m.generation;
-            }
-            // 3. A new WAL for the writes after this flush.
-            m.wal_gen += 1;
-            let wal = Wal::create(&self.dir, m.wal_gen, cfg.dim)?;
-            created.push(wal.path().to_path_buf());
-            m.flushed_seq = w.next_seq - 1;
-            // 4. Commit: the new files are fsynced, their names too, then
-            // the manifest is renamed into place.
-            sync_parent_dir(wal.path())?;
-            m.install(&self.dir)?;
-            Ok((fresh, wal))
-        })();
-        let (fresh, wal) = match result {
-            Ok(r) => r,
-            Err(e) => {
-                created.iter().for_each(|p| {
-                    let _ = fs::remove_file(p);
-                });
-                return Err(e);
-            }
-        };
-        drop(g);
-        // The new manifest is in place, so the state follows it. Until the
-        // directory fsync succeeds the rename may not survive a crash, so
-        // the old files stay (the next open removes them).
-        let durable = sync_parent_dir(&self.dir.join(MANIFEST));
-        superseded.push(w.wal.path().to_path_buf());
-        w.wal = wal;
-        w.manifest = m;
-        let mut sealed = view.sealed.clone();
-        sealed.extend(fresh.map(Arc::new));
-        let growing = Arc::new(RwLock::new(Growing::new(cfg.dim, &cfg.fields)));
-        *self.view.write().unwrap() = Arc::new(View { sealed, growing });
-        if let Err(e) = durable {
-            // A crash could bring back the old manifest, which does not know
-            // the new WAL: take no writes that would go there.
-            w.wal.poison();
-            return Err(e);
-        }
-        for p in superseded {
-            let _ = fs::remove_file(p);
-        }
-        Ok(())
-    }
 }
 
 /// Where a live row is.
-enum Place {
-    Growing(usize),
+enum Place<'a> {
+    /// In the growing segment or a frozen one: its row there.
+    Memory(&'a RwLock<Growing>, usize),
     /// Index into the view's sealed segments, and the position.
     Sealed(usize, usize),
 }
 
 /// The row of `id` live as of write `seq` in `view`. An id's rows are
 /// newer in newer segments, so the newest that is not deleted is the one.
-fn locate_at(view: &View, id: u64, seq: u64) -> Option<Place> {
-    if let Some(r) = view.growing.read().unwrap().row_at(id, seq) {
-        return Some(Place::Growing(r));
+fn locate_at(view: &View, id: u64, seq: u64) -> Option<Place<'_>> {
+    for m in view.memory() {
+        if let Some(r) = m.read().unwrap().row_at(id, seq) {
+            return Some(Place::Memory(m, r));
+        }
     }
     for (i, s) in view.sealed.iter().enumerate().rev() {
         if let Some(pos) = s.locate(id)
@@ -1138,10 +1119,17 @@ fn locate_at(view: &View, id: u64, seq: u64) -> Option<Place> {
 
 /// Deletes the live row of `id`, wherever it is, by write `seq`. Only the
 /// writer calls this, holding `g` (the growing segment of the view whose
-/// sealed segments are `sealed`).
-fn delete_live(sealed: &[Arc<Sealed>], g: &mut Growing, id: u64, seq: u64) -> bool {
+/// other segments are `sealed` and `frozen`).
+fn delete_live(sealed: &[Arc<Sealed>], frozen: &[Arc<Frozen>], g: &mut Growing, id: u64, seq: u64) -> bool {
     if g.delete(id, seq) {
         return true;
+    }
+    for f in frozen.iter().rev() {
+        // Only the writer changes which rows are live.
+        let here = f.rows.read().unwrap().row_of(id).is_some();
+        if here {
+            return f.rows.write().unwrap().delete(id, seq);
+        }
     }
     // Newest first: a re-inserted id is most likely in a recent segment.
     for s in sealed.iter().rev() {
@@ -1162,124 +1150,7 @@ fn prepare_vector(metric: Metric, v: &[f32], out: &mut Vec<f32>) {
     }
 }
 
-impl Collection {
-    /// The graph walk over one SSD segment, `admitted` of whose rows can be
-    /// returned.
-    #[allow(clippy::too_many_arguments)]
-    fn search_graph(
-        &self,
-        index: &DiskIndex,
-        query: &[f32],
-        k: usize,
-        opts: &SearchOptions,
-        admitted: f64,
-        admit: &dyn Fn(usize) -> bool,
-        st: &mut SearchStats,
-    ) -> Result<Vec<SearchResult>> {
-        let params = DiskSearchParams {
-            l: if opts.adapt_l { boosted_l(opts.l.max(k), admitted, MAX_BOOST) } else { opts.l.max(k) },
-            beam_width: opts.beam_width,
-            rerank: opts.rerank,
-        };
-        let (res, ds) = index.search_filtered(query, k, &params, admit)?;
-        st.reads += ds.reads;
-        st.rounds += ds.rounds;
-        st.expanded += ds.expanded;
-        Ok(res)
-    }
-
-    /// One SSD segment under a filter that `matching` (live positions) holds.
-    fn search_disk_filtered(
-        &self,
-        index: &DiskIndex,
-        query: &[f32],
-        k: usize,
-        opts: &SearchOptions,
-        matching: &Bitmap,
-        st: &mut SearchStats,
-    ) -> Result<Vec<SearchResult>> {
-        let n = matching.count();
-        let admit = |p: usize| matching.get(p);
-        let l = opts.l.max(k);
-        let scan = match opts.filter_mode {
-            FilterMode::Scan => true,
-            FilterMode::Graph => false,
-            FilterMode::Auto => prefer_scan(n, index.len(), l, opts.beam_width, index.is_direct()),
-        };
-        if !scan {
-            st.graph_segments += 1;
-            let params = DiskSearchParams {
-                l: if opts.adapt_l { boosted_l(l, n as f64 / index.len() as f64, MAX_FILTER_BOOST) } else { l },
-                beam_width: opts.beam_width,
-                rerank: opts.rerank,
-            };
-            let (res, ds) = index.search_filtered(query, k, &params, &admit)?;
-            st.reads += ds.reads;
-            st.rounds += ds.rounds;
-            st.expanded += ds.expanded;
-            // The walk should meet about `l` matching nodes; far fewer means
-            // the matches lie away from its path (or the boost was capped).
-            if opts.filter_mode == FilterMode::Graph || ds.admitted * 2 >= l.min(n) {
-                return Ok(res);
-            }
-            st.fallbacks += 1;
-        }
-        st.scan_segments += 1;
-        let (res, ds) = index.search_subset(query, k, l, &mut matching.ones(), &admit)?;
-        st.reads += ds.reads;
-        st.rounds += ds.rounds;
-        st.pq_scanned += ds.pq_distances;
-        Ok(res)
-    }
-}
-
-/// Largest factor the candidate list of a walk is scaled by for deleted rows.
-const MAX_BOOST: f64 = 8.0;
-/// The same for a filter. `Auto` scans a segment where fewer than 1 / this
-/// of the rows match, as the walk could not be scaled enough.
-const MAX_FILTER_BOOST: f64 = 16.0;
-/// Rows a filtered scan scores in the time of one round of a walk (one
-/// read latency plus its CPU). Measured on SIFT1M (128 dimensions, 32-byte
-/// PQ codes), 1 thread: a round took about 140 µs with direct I/O (reads
-/// capped at 100,000 per second) and 16 µs from the page cache; a scan
-/// about 40 ns per matching row (bitmap, PQ distance, code fetch).
-const SCAN_ROWS_PER_ROUND_DIRECT: f64 = 3500.0;
-const SCAN_ROWS_PER_ROUND_CACHED: f64 = 400.0;
-
-/// Whether a filtered SSD segment with `matching` of its `positions` rows
-/// is cheaper to scan than to walk with beam width `width`: the walk takes
-/// about L / W + 4 rounds at its scaled L, the scan time grows with the
-/// rows it scores.
-fn prefer_scan(matching: usize, positions: usize, l: usize, width: usize, direct: bool) -> bool {
-    let f = matching as f64 / positions as f64;
-    if f < 1.0 / MAX_FILTER_BOOST {
-        return true;
-    }
-    let rounds = boosted_l(l, f, MAX_FILTER_BOOST) as f64 / width.max(1) as f64 + 4.0;
-    let per_round = if direct { SCAN_ROWS_PER_ROUND_DIRECT } else { SCAN_ROWS_PER_ROUND_CACHED };
-    (matching as f64) < rounds * per_round
-}
-
-/// Candidate list size for an SSD segment where only `admitted` of the
-/// rows can be returned: the walk passes through rejected nodes, so it
-/// needs a longer list to expand as many returnable ones.
-fn boosted_l(l: usize, admitted: f64, max_boost: f64) -> usize {
-    let boost = (1.0 / admitted.max(1e-9)).min(max_boost);
-    (l as f64 * boost).ceil() as usize
-}
-
-/// The growing segment's live rows, copied (it stays intact if the flush
-/// fails), and their rows in the growing segment.
-fn live_rows(g: &Growing, dim: usize) -> Result<(crate::store::InMemoryStore, Vec<usize>)> {
-    let mut store = crate::store::InMemoryStore::with_capacity(dim, g.live())?;
-    let live: Vec<usize> = (0..g.rows()).filter(|&r| !g.is_dead(r)).collect();
-    for &r in &live {
-        store.push(g.ids[r], g.vector(r))?;
-    }
-    Ok((store, live))
-}
-
-fn lock_dir(dir: &Path) -> Result<File> {
+pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
     let f = FsOpenOptions::new().create(true).truncate(false).write(true).open(dir.join(LOCK))?;
     match f.try_lock() {
         Ok(()) => Ok(f),
@@ -1327,7 +1198,7 @@ fn load_segment(dir: &Path, cfg: &CollectionConfig, e: &SegmentEntry, opts: &Ope
 /// The files of ours in `dir` that `m` does not refer to, removed. Files
 /// with other names are left alone.
 fn remove_unreferenced(dir: &Path, m: &Manifest) -> Result<Vec<String>> {
-    let mut keep: Vec<String> = vec![wal_name(m.wal_gen)];
+    let mut keep: Vec<String> = Vec::new();
     for e in &m.segments {
         keep.push(match e.kind {
             SegmentKind::Flat => flat_name(e.id),
@@ -1344,7 +1215,8 @@ fn remove_unreferenced(dir: &Path, m: &Manifest) -> Result<Vec<String>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
-        if !is_ours(&name) || keep.contains(&name) {
+        // The logs from `wal_gen` on were replayed.
+        if !is_ours(&name) || keep.contains(&name) || wal_generation(&name).is_some_and(|g| g >= m.wal_gen) {
             continue;
         }
         if entry.file_type()?.is_dir() {
@@ -1367,8 +1239,8 @@ fn is_ours(name: &str) -> bool {
     if base == MANIFEST {
         return name != MANIFEST;
     }
-    if let Some(rest) = base.strip_prefix("wal-") {
-        return rest.strip_suffix(".log").is_some_and(digits);
+    if wal_generation(base).is_some() {
+        return true;
     }
     let Some(rest) = base.strip_prefix("seg-") else { return false };
     let (id, ext) = rest.split_at(rest.len().min(8));
@@ -1390,13 +1262,23 @@ fn is_ours(name: &str) -> bool {
 }
 
 #[cfg(test)]
-impl Collection {
+impl Engine {
     pub(crate) fn wal_path(&self) -> PathBuf {
         self.writer.lock().unwrap().wal.path().to_path_buf()
     }
 
     pub(crate) fn wal_bytes(&self) -> u64 {
         self.writer.lock().unwrap().wal.bytes()
+    }
+
+    /// Runs `f` at a moment when nothing is being committed or logged, with
+    /// every log still needed: its path, length, and length known to be
+    /// durable.
+    pub(crate) fn quiesced<T>(&self, f: impl FnOnce(&[(PathBuf, u64, u64)]) -> T) -> T {
+        let _m = self.manifest.lock().unwrap();
+        let mut w = self.writer.lock().unwrap();
+        let logs: Vec<_> = w.logs_mut().map(|l| (l.path().to_path_buf(), l.bytes(), l.synced())).collect();
+        f(&logs)
     }
 
     /// Makes every later WAL append fail, as a failed fsync does.
@@ -1415,8 +1297,10 @@ impl Collection {
         for s in &v.sealed {
             out.extend((0..s.positions()).filter(|&p| !s.tomb.is_set(p)).map(|p| s.id_at(p)));
         }
-        let g = v.growing.read().unwrap();
-        out.extend((0..g.rows()).filter(|&r| !g.is_dead(r)).map(|r| g.ids[r]));
+        for m in v.memory() {
+            let g = m.read().unwrap();
+            out.extend((0..g.rows()).filter(|&r| !g.is_dead(r)).map(|r| g.ids[r]));
+        }
         out
     }
 }

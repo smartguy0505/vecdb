@@ -11,6 +11,14 @@ pub enum Error {
     Corrupt(String),
     /// On-disk data is valid but written by a format version we cannot read.
     Unsupported(String),
+    /// No collection of that name.
+    NotFound(String),
+    /// The collection is there already.
+    AlreadyExists(String),
+    /// Not possible now; may be later.
+    Unavailable(String),
+    /// Stopped through a [`Cancel`](crate::Cancel).
+    Cancelled,
     Io(std::io::Error),
 }
 
@@ -27,6 +35,10 @@ impl Error {
             Error::InvalidArgument(m) => Error::InvalidArgument(m.clone()),
             Error::Corrupt(m) => Error::Corrupt(m.clone()),
             Error::Unsupported(m) => Error::Unsupported(m.clone()),
+            Error::NotFound(m) => Error::NotFound(m.clone()),
+            Error::AlreadyExists(m) => Error::AlreadyExists(m.clone()),
+            Error::Unavailable(m) => Error::Unavailable(m.clone()),
+            Error::Cancelled => Error::Cancelled,
             Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
         }
     }
@@ -43,6 +55,10 @@ impl fmt::Display for Error {
             Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt data: {m}"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
+            Error::NotFound(m) => write!(f, "not found: {m}"),
+            Error::AlreadyExists(m) => write!(f, "already exists: {m}"),
+            Error::Unavailable(m) => write!(f, "unavailable: {m}"),
+            Error::Cancelled => write!(f, "cancelled"),
             Error::Io(e) => write!(f, "I/O error: {e}"),
         }
     }

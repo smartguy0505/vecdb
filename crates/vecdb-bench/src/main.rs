@@ -18,7 +18,7 @@ use vecdb_core::disk::{
     DiskIndex, DiskOpenOptions, DiskSearchParams, DiskWriteOptions, IoMode, Layout, MergePrune, PartitionedBuildParams,
     SearchContext, partition_node_bytes,
 };
-use vecdb_core::{FlatIndex, GraphIndex, GraphParams, Metric, Navigation, PqIndex, SearchResult};
+use vecdb_core::{Cancel, FlatIndex, GraphIndex, GraphParams, Metric, Navigation, PqIndex, SearchResult};
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -66,22 +66,25 @@ commands:
   coll-ingest  --base F --dir D [--metric l2] [--batch 1000] [--durability buffered|sync]
                [--seal-mb 32] [--index-mb 64] [--max-ssd 8] [--pq-m M] [--threads 6]
                [--build-mem 2] [--maintain false] [--optimize false] [--secs S] [--limit N]
-               [--labels false] [--writers 1]
+               [--labels false] [--writers 1] [--rate 0] [--background false]
+               [--unindexed-mb 1024]
                create a collection in D and upsert F (ids = row numbers) through the WAL:
                rows/s and batch latency (--writers threads take batches in turn: their
-               batches share WAL writes and fsyncs); --maintain runs index builds as they fall due,
-               --optimize merges everything into one SSD index at the end; then reopen.
+               batches share WAL writes and fsyncs), at --rate rows/s in all (0 = flat out).
+               Segments are flushed by the write that fills them, and --maintain runs index
+               builds as they fall due; or with --background, threads do both (writes wait
+               while more than --unindexed-mb wait for a build); --optimize merges everything into one SSD index at the end; then reopen.
                --labels adds int fields u (uniform 0..999) and p (bucket of a random
                projection) for coll-filter
   coll-search  --from D0 --dir D --base F --query Q [--k 10] [--l 40,80,160] [--w 4]
                [--nq 1000] [--delete 0,0.1,0.3] [--seed 1] [--adapt true|false|both]
-               [--compact false]
+               [--compact false] [--pool 0]
                copy collection D0 to D, delete random rows in stages (cumulative
                fractions), and measure recall against exact search over the live rows,
                reads and 1-thread latency; --compact runs maintain() after the last stage
   coll-filter  --dir D --base F --query Q [--k 10] [--l 40,80,160] [--w 4] [--nq 300]
                [--filter u,p,near] [--select 0.001,0.01,0.05,0.2,0.5] [--mode graph,scan,auto]
-               [--warm true] [--direct true]
+               [--warm true] [--direct true] [--pool 0]
                search a collection made with --labels under range filters matching the
                given fraction of rows: u = uniform labels, p = one slab of the projection
                (matches far from most queries), near = a slab around each query's own
@@ -89,16 +92,20 @@ commands:
                over the matching rows
   coll-concurrent --from D0 --dir D --base F --query Q [--k 10] [--l 40] [--w 4] [--nq 1000]
                [--readers 1,2,4,8] [--secs 5] [--writers 0] [--write-batch 100]
-               [--write-rate 0] [--durability buffered|sync] [--churn 0] [--growing 0]
-               [--build false]
-               [--windows 3] [--threads 6] [--direct true]
+               [--write-rate 0] [--read-rate 0] [--durability buffered|sync] [--churn 0] [--growing 0]
+               [--build false] [--windows 3] [--threads 6] [--direct true] [--pool 0]
+               [--background false]
                copy collection D0 to D and search it from --readers threads at once for
                --secs each: QPS, recall, latency; with --writers threads upserting random
                rows of F (same vectors; --write-rate rows/s in all, 0 = flat out);
                --churn first deletes that fraction of rows (0.2 or more makes a compaction
                due; recall is against the rows left), --growing
                leaves that many upserted rows unsealed (searched by a full scan), and
-               --build then searches while maintain() runs (--threads build threads)
+               --build then searches while maintain() runs (--threads build threads);
+               --read-rate limits all readers to that many searches per second;
+               --background flushes and builds on background threads.
+               For all of these, --pool N gives searches N threads to help them, which
+               use up to --pool-cpus CPUs (default a quarter of them) for computing
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
@@ -925,6 +932,7 @@ fn disk_build_partitioned(
         scratch_dir: a.path("scratch"),
         write: DiskWriteOptions { layout, codec },
         progress: Some(progress),
+        cancel: Cancel::default(),
         graph,
         pq,
     };

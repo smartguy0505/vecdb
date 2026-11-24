@@ -41,6 +41,7 @@ use std::time::Instant;
 
 use super::write::{DiskWriteOptions, DiskWriteReport, IndexWriter, Shape, header};
 use super::{free_space, read_exact_at};
+use crate::cancel::Cancel;
 use crate::dataset::VectorSource;
 use crate::distance::{Metric, check_finite, normalize};
 use crate::error::{Error, Result};
@@ -121,6 +122,8 @@ pub struct PartitionedBuildParams {
     pub scratch_dir: Option<PathBuf>,
     /// Called with a line of progress after each step.
     pub progress: Option<fn(&str)>,
+    /// Stops the build early, leaving no files.
+    pub cancel: Cancel,
 }
 
 impl Default for PartitionedBuildParams {
@@ -136,6 +139,7 @@ impl Default for PartitionedBuildParams {
             merge: MergePrune::Pq,
             scratch_dir: None,
             progress: None,
+            cancel: Cancel::default(),
         }
     }
 }
@@ -278,12 +282,13 @@ fn gather(src: &dyn VectorSource, map: &NodeMap, nodes: &[u32], out: &mut [f32])
 }
 
 /// Step 1: finds identical rows.
-fn scan(src: &dyn VectorSource, metric: Metric, threads: usize) -> Result<NodeMap> {
+fn scan(src: &dyn VectorSource, metric: Metric, threads: usize, cancel: &Cancel) -> Result<NodeMap> {
     let (n, dim) = (src.len(), src.dim());
     let batch = (READ_BYTES / (dim * 4)).max(1);
     let mut keys: Vec<(u64, u32)> = Vec::with_capacity(n);
     let mut buf = Vec::new();
     for first in (0..n).step_by(batch) {
+        cancel.check()?;
         let count = batch.min(n - first);
         buf.resize(count * dim, 0.0);
         src.read_rows(first, &mut buf)?;
@@ -553,7 +558,7 @@ fn parse_adjacency(rec: &[u8], list: &mut Vec<u32>) {
 /// in-edge, from its nearest reachable out-neighbor with a free slot, or
 /// else from the first reachable node with one. Returns the nodes not
 /// reached at first, the edges added, and the nodes left unreachable.
-fn connect_unreachable(adj: &Adjacency, nodes: usize, entry: u32) -> Result<(usize, usize, usize)> {
+fn connect_unreachable(adj: &Adjacency, nodes: usize, entry: u32, cancel: &Cancel) -> Result<(usize, usize, usize)> {
     let mut reached = vec![0u64; nodes.div_ceil(64)];
     let is = |reached: &[u64], v: u32| reached[v as usize / 64] >> (v % 64) & 1 == 1;
     let mut rec = vec![0u8; adj.stride()];
@@ -568,6 +573,9 @@ fn connect_unreachable(adj: &Adjacency, nodes: usize, entry: u32) -> Result<(usi
         stack.push(start);
         while let Some(v) = stack.pop() {
             count += 1;
+            if count % 4096 == 0 {
+                cancel.check()?;
+            }
             adj.read(v, rec, list)?;
             for &nb in list.iter() {
                 if !is(reached, nb) {
@@ -686,7 +694,7 @@ pub(crate) fn build(
     };
 
     // 1. Scan.
-    let map = scan(src, metric, threads)?;
+    let map = scan(src, metric, threads, &p.cancel)?;
     let nodes = map.nodes();
     log(format!("scan: {n} rows, {nodes} distinct"));
     step("scan", &mut t);
@@ -704,7 +712,7 @@ pub(crate) fn build(
     let mut sample = Vec::new();
     read_nodes(src, &map, metric, &sample_nodes, threads, &mut sample)?;
     drop(sample_nodes);
-    let pq = ProductQuantizer::train(dim, &sample, &p.pq)?;
+    let pq = ProductQuantizer::train_until(dim, &sample, &p.pq, &p.cancel)?;
     let budget_nodes = (p.partitions == 0).then(|| (p.memory_budget / partition_node_bytes(dim, part_r)) as usize);
     if budget_nodes.is_some_and(|b| b < 1000) {
         return Err(Error::InvalidArgument(format!(
@@ -758,6 +766,7 @@ pub(crate) fn build(
     let mut buf = Vec::new();
     let mut batch_nodes: Vec<u32> = Vec::with_capacity(batch);
     for v0 in (0..nodes).step_by(batch) {
+        p.cancel.check()?;
         let v1 = (v0 + batch).min(nodes);
         batch_nodes.clear();
         batch_nodes.extend(v0 as u32..v1 as u32);
@@ -805,6 +814,7 @@ pub(crate) fn build(
     let mut part_bytes = 0u64;
     let by_distance = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     for s in 0..k {
+        p.cancel.check()?;
         let ts = Instant::now();
         let members: Vec<u32> = if k == 1 {
             (0..nodes as u32).collect()
@@ -821,7 +831,7 @@ pub(crate) fn build(
             read_nodes(src, &map, metric, &members, threads, &mut buf)?;
             let points = Points::new(&buf, dim, metric, threads);
             let gp = GraphParams { max_degree: part_r, seed: p.graph.seed.wrapping_add(s as u64), ..p.graph.clone() };
-            let (lists, _) = build_graph(&points, &gp);
+            let (lists, _) = build_graph(&points, &gp, &p.cancel)?;
             let best = par::map_ranges(members.len(), threads, |range| {
                 let kern = kernels::best();
                 range.map(|i| (points.dist_to(kern, &mean, mean_inv_norm, i as u32), members[i])).min_by(by_distance)
@@ -875,6 +885,7 @@ pub(crate) fn build(
     let mut edges = 0u64;
     let mut joined: Vec<Vec<(f32, u32)>> = Vec::new();
     for v0 in (0..nodes).step_by(BATCH) {
+        p.cancel.check()?;
         let v1 = (v0 + BATCH).min(nodes);
         joined.resize_with(v1 - v0, Vec::new);
         for v in v0..v1 {
@@ -906,7 +917,7 @@ pub(crate) fn build(
         fs::remove_file(part_path(s))?;
     }
     let adj = Adjacency { file: adj_file, r };
-    let (unreachable, added, unrepaired) = connect_unreachable(&adj, nodes, entry)?;
+    let (unreachable, added, unrepaired) = connect_unreachable(&adj, nodes, entry, &p.cancel)?;
     edges += added as u64;
     log(format!(
         "merge: mean degree {:.1}; {unreachable} nodes unreachable, {added} edges added, {unrepaired} still unreachable",
@@ -920,6 +931,7 @@ pub(crate) fn build(
     let mut rec = vec![0u8; adj.stride()];
     let mut list = Vec::with_capacity(r);
     for v0 in (0..nodes).step_by(batch) {
+        p.cancel.check()?;
         let v1 = (v0 + batch).min(nodes);
         batch_nodes.clear();
         batch_nodes.extend(v0 as u32..v1 as u32);
@@ -1000,13 +1012,13 @@ mod tests {
         // slot; 4 is reached through 3; 5 has no out-edges and takes the
         // first reachable node with room (0).
         let adj = adjacency(&dir, 2, &[&[1], &[2], &[1], &[4, 2], &[3], &[]]);
-        assert_eq!(connect_unreachable(&adj, 6, 0).unwrap(), (3, 2, 0));
+        assert_eq!(connect_unreachable(&adj, 6, 0, &Cancel::default()).unwrap(), (3, 2, 0));
         assert_eq!(list(&adj, 2), vec![1, 3]);
         assert_eq!(list(&adj, 0), vec![1, 5]);
         assert_eq!(list(&adj, 4), vec![3]);
         // Every reachable node full: node 2 cannot get an in-edge.
         let adj = adjacency(&dir, 1, &[&[1], &[0], &[]]);
-        assert_eq!(connect_unreachable(&adj, 3, 0).unwrap(), (1, 0, 1));
+        assert_eq!(connect_unreachable(&adj, 3, 0, &Cancel::default()).unwrap(), (1, 0, 1));
         let _ = fs::remove_dir_all(&dir);
     }
 

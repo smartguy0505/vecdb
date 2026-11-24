@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::cancel::Cancel;
 use crate::dataset::Vecs;
 use crate::flat::FlatIndex;
 use crate::graph::GraphParams;
@@ -54,6 +55,7 @@ fn params(partitions: usize, merge: MergePrune, threads: usize) -> PartitionedBu
         merge,
         scratch_dir: None,
         progress: None,
+        cancel: Cancel::default(),
     }
 }
 
@@ -292,4 +294,72 @@ fn file_source_builds_the_same_index() {
     let rep = DiskIndex::build_partitioned(&file, None, Metric::L2, &b, &p).unwrap();
     assert_eq!((rep.nodes, rep.partitions), (n - 4, 7));
     assert!(std::fs::read(&a).unwrap() == std::fs::read(&b).unwrap());
+}
+
+thread_local! {
+    /// Progress lines left until the build is cancelled, and its flag.
+    static CANCEL_AT: std::cell::RefCell<(usize, Cancel)> = Default::default();
+}
+
+/// Cancelled after any of its progress lines, a build stops and leaves no
+/// files.
+#[test]
+fn a_cancelled_build_leaves_nothing() {
+    fn count_down(_: &str) {
+        CANCEL_AT.with_borrow_mut(|(left, cancel)| {
+            *left = left.saturating_sub(1);
+            if *left == 0 {
+                cancel.cancel();
+            }
+        });
+    }
+    let dir = Dir::new("build-cancel");
+    let path = dir.file("i.vdx");
+    let data = Vecs { dim: 8, data: structured(3000, 8, 1) };
+    let mut lines = 0;
+    loop {
+        lines += 1;
+        let cancel = Cancel::default();
+        CANCEL_AT.set((lines, cancel.clone()));
+        let p = PartitionedBuildParams {
+            progress: Some(count_down),
+            cancel: cancel.clone(),
+            ..params(2, MergePrune::Pq, 2)
+        };
+        let r = DiskIndex::build_partitioned(&data, None, Metric::L2, &path, &p);
+        if !cancel.is_cancelled() {
+            r.unwrap();
+            break;
+        }
+        assert!(matches!(r, Err(Error::Cancelled)), "after line {lines}: {:?}", r.map(|r| r.rows));
+        assert!(dir.others(&[]).is_empty(), "{:?}", dir.others(&[]));
+    }
+    assert!(lines > 5, "{lines} lines");
+    // And before it starts.
+    let p = PartitionedBuildParams { cancel: Cancel::default(), ..params(2, MergePrune::Pq, 2) };
+    p.cancel.cancel();
+    let again = dir.file("again.vdx");
+    assert!(matches!(DiskIndex::build_partitioned(&data, None, Metric::L2, &again, &p), Err(Error::Cancelled)));
+    assert_eq!(dir.others(&[&path]).len(), 0);
+}
+
+/// In the middle of a graph, too.
+#[test]
+fn a_graph_build_is_cancelled_midway() {
+    let data = structured(20_000, 8, 1);
+    let points = crate::graph::build::Points::new(&data, 8, Metric::L2, 1);
+    let p = GraphParams { max_degree: 32, build_list: 200, ..graph_params(1) };
+    let t0 = std::time::Instant::now();
+    crate::graph::build::build(&points, &p, &Cancel::default()).unwrap();
+    let full = t0.elapsed();
+    let cancel = Cancel::default();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(full / 5);
+            cancel.cancel();
+        });
+        let t0 = std::time::Instant::now();
+        assert!(matches!(crate::graph::build::build(&points, &p, &cancel), Err(Error::Cancelled)));
+        assert!(t0.elapsed() < full / 2, "{:?} of {full:?}", t0.elapsed());
+    });
 }

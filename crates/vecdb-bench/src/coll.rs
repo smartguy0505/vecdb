@@ -9,7 +9,7 @@ use vecdb_core::disk::IoMode;
 use vecdb_core::rng::SplitMix64;
 use vecdb_core::{
     Attrs, Collection, CollectionConfig, Durability, Field, Filter, FilterMode, FlatIndex, Metric, OpenOptions,
-    SearchOptions, WriteOp,
+    SearchOptions, SearchPool, WriteOp,
 };
 
 use super::{AnyResult, Args, load_vectors, memory_usage, parse_list, progress, run_queries};
@@ -21,8 +21,13 @@ fn open_options(a: &Args) -> AnyResult<OpenOptions> {
         "buffered" => Durability::Buffered,
         d => return Err(format!("unknown durability {d:?} (sync, buffered)").into()),
     };
+    let pool: usize = a.num("pool", 0)?;
     Ok(OpenOptions {
         durability,
+        background: a.num("background", false)?,
+        max_unindexed_bytes: (a.num::<f64>("unindexed-mb", 1024.0)? * (1 << 20) as f64) as u64,
+        builds: None,
+        pool: if pool > 0 { Some(SearchPool::new(pool, a.num("pool-cpus", 0)?)?) } else { None },
         threads: a.num("threads", 6)?,
         build_memory: (a.num::<f64>("build-mem", 2.0)? * (1u64 << 30) as f64) as u64,
         direct_io: a.num("direct", true)?,
@@ -35,7 +40,8 @@ fn open_options(a: &Args) -> AnyResult<OpenOptions> {
 pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     a.allow(&[
         "base", "dir", "metric", "limit", "batch", "durability", "seal-mb", "index-mb", "max-ssd", "pq-m", "threads",
-        "build-mem", "maintain", "optimize", "secs", "direct", "labels", "writers",
+        "build-mem", "maintain", "optimize", "secs", "direct", "labels", "writers", "background", "unindexed-mb",
+        "rate",
     ])?;
     let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
     let dir = a.req_path("dir")?;
@@ -58,12 +64,14 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     let maintain: bool = a.num("maintain", false)?;
     let secs: f64 = a.num("secs", f64::INFINITY)?;
     let writers: usize = a.num("writers", 1)?;
+    // Rows per second over all writers; 0: as fast as they go.
+    let rate: f64 = a.num("rate", 0.0)?;
     if writers > 1 && maintain {
         return Err("--maintain runs with one writer only".into());
     }
     let c = Collection::create(&dir, cfg.clone(), opts.clone())?;
     println!(
-        "ingest   {} x {} ({}) into {}: batches of {batch}, {writers} writers, {:?}, seal {} MiB, index {} MiB, maintain {maintain}",
+        "ingest   {} x {} ({}) into {}: batches of {batch}, {writers} writers, {:?}, seal {} MiB, index {} MiB, maintain {maintain}, background {}",
         base.len(),
         base.dim,
         cfg.metric.name(),
@@ -71,6 +79,7 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
         opts.durability,
         cfg.seal_bytes >> 20,
         cfg.index_bytes >> 20,
+        opts.background,
     );
     let write_rows = |start: usize, end: usize| -> vecdb_core::Result<()> {
         let attrs: Vec<Attrs> = match &labels {
@@ -104,6 +113,10 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
                             break;
                         }
                         let end = (start + batch).min(base.len());
+                        if rate > 0.0 {
+                            let due = start as f64 / rate - t0.elapsed().as_secs_f64();
+                            std::thread::sleep(Duration::from_secs_f64(due.max(0.0)));
+                        }
                         let tb = Instant::now();
                         write_rows(start, end).map_err(|e| e.to_string())?;
                         lat.push(tb.elapsed().as_secs_f64() * 1e3);
@@ -131,13 +144,27 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     lat.sort_by(f64::total_cmp);
     let pct = |p: f64| lat[((p / 100.0) * (lat.len() - 1) as f64).round() as usize];
     println!(
-        "wrote    {rows} rows in {ingest_s:.2} s = {:.0} rows/s ({:.1} MB/s of vectors); batch ms p50 {:.3} p99 {:.3} max {:.1}",
+        "wrote    {rows} rows in {ingest_s:.2} s = {:.0} rows/s ({:.1} MB/s of vectors); batch ms p50 {:.3} p99 {:.3} p99.9 {:.1} max {:.1}",
         rows as f64 / ingest_s,
         rows as f64 * base.dim as f64 * 4.0 / ingest_s / 1e6,
         pct(50.0),
         pct(99.0),
+        pct(99.9),
         pct(100.0),
     );
+    if opts.background {
+        let before = c.stats();
+        let t = Instant::now();
+        c.wait_idle()?;
+        println!(
+            "idle     after {:.1} s more; {} flushes and {} builds by the end of the ingest, then {} and {}",
+            t.elapsed().as_secs_f64(),
+            before.flushes,
+            before.builds,
+            c.stats().flushes - before.flushes,
+            c.stats().builds - before.builds,
+        );
+    }
     let st = c.stats();
     println!(
         "wal      {} batches in {} writes, {} fsyncs: {:.1} batches per write",
@@ -175,9 +202,10 @@ fn print_stats(c: &Collection) {
     let st = c.stats();
     let segs: Vec<String> = st.segments.iter().map(|s| format!("{} {} ({} deleted)", s.kind, s.rows, s.deleted)).collect();
     println!(
-        "state    {} live; growing {} rows; WAL {:.1} MB; segments: {}",
+        "state    {} live; growing {} rows; frozen {}; WAL {:.1} MB; segments: {}",
         st.live,
         st.growing_rows,
+        st.frozen,
         st.wal_bytes as f64 / 1e6,
         if segs.is_empty() { "none".into() } else { segs.join(", ") }
     );
@@ -264,7 +292,7 @@ fn ground_truth(base: &Vecs<f32>, live: &[bool], metric: vecdb_core::Metric, que
 pub(crate) fn search(a: &Args) -> AnyResult<()> {
     a.allow(&[
         "from", "dir", "base", "query", "k", "l", "w", "nq", "delete", "seed", "compact", "adapt", "threads",
-        "build-mem", "direct", "limit",
+        "build-mem", "direct", "limit", "pool", "pool-cpus",
     ])?;
     let (from, dir) = (a.req_path("from")?, a.req_path("dir")?);
     let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
@@ -381,7 +409,7 @@ fn bench_filter(kind: &str, width: i64, q: &[f32], lb: &Labels) -> AnyResult<(&'
 /// of growing selectivity, in each filter mode, against exact search over
 /// the matching rows.
 pub(crate) fn filter(a: &Args) -> AnyResult<()> {
-    a.allow(&["dir", "base", "query", "k", "l", "w", "nq", "filter", "select", "mode", "threads", "direct", "limit", "warm"])?;
+    a.allow(&["dir", "base", "query", "k", "l", "w", "nq", "filter", "select", "mode", "threads", "direct", "limit", "warm", "pool", "pool-cpus"])?;
     let dir = a.req_path("dir")?;
     let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
     let queries = load_vectors(&a.req_path("query")?, Some(a.num("nq", 300)?))?;
@@ -520,6 +548,8 @@ struct Bench<'a> {
     write_batch: usize,
     /// Rows per second over all writers; 0: as fast as they go.
     write_rate: f64,
+    /// Searches per second over all readers; 0: as fast as they go.
+    read_rate: f64,
 }
 
 /// coll-concurrent: copies a collection, then searches it from several
@@ -530,7 +560,7 @@ pub(crate) fn concurrent(a: &Args) -> AnyResult<()> {
     a.allow(&[
         "from", "dir", "base", "query", "k", "l", "w", "nq", "readers", "secs", "writers", "write-batch",
         "write-rate", "durability", "churn", "growing", "build", "windows", "threads", "build-mem", "direct",
-        "limit",
+        "limit", "pool", "pool-cpus", "background", "unindexed-mb", "read-rate",
     ])?;
     let (from, dir) = (a.req_path("from")?, a.req_path("dir")?);
     let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
@@ -590,9 +620,10 @@ pub(crate) fn concurrent(a: &Args) -> AnyResult<()> {
         secs: a.num("secs", 5.0)?,
         write_batch: a.num("write-batch", 100)?,
         write_rate: a.num("write-rate", 0.0)?,
+        read_rate: a.num("read-rate", 0.0)?,
     };
     println!(
-        "  phase   readers writers      QPS  recall@{k}  mean ms  p50 ms  p99 ms  write rows/s  batch p50 ms  p99 ms  batches/write"
+        "  phase   readers writers      QPS  recall@{k}  mean ms  p50 ms  p99 ms  cpu ms/q  write rows/s  batch p50 ms  p99 ms  max ms  batches/write  flushes  builds"
     );
     for &r in &readers {
         measure(&b, if writers > 0 { "writes" } else { "alone" }, r, writers)?;
@@ -622,10 +653,20 @@ pub(crate) fn concurrent(a: &Args) -> AnyResult<()> {
     Ok(())
 }
 
+/// CPU time this process has used, all threads (0 where there is no /proc).
+fn cpu_seconds() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Fields after the name, which ends with the last ')': utime and stime
+    // are the 12th and 13th, in ticks of 10 ms.
+    let rest = stat.rsplit(')').next().unwrap_or_default();
+    rest.split_whitespace().skip(11).take(2).filter_map(|x| x.parse::<f64>().ok()).sum::<f64>() / 100.0
+}
+
 /// One measurement: `readers` threads search (each through the queries
 /// from its own offset) and `writers` threads upsert, for `secs` seconds.
 fn measure(b: &Bench, phase: &str, readers: usize, writers: usize) -> AnyResult<()> {
     let before = b.c.stats();
+    let cpu0 = cpu_seconds();
     let t0 = Instant::now();
     let done = AtomicBool::new(false);
     let nq = b.queries.len();
@@ -637,8 +678,15 @@ fn measure(b: &Bench, phase: &str, readers: usize, writers: usize) -> AnyResult<
                 s.spawn(move || -> Result<(Vec<f64>, usize, usize), String> {
                     let (mut lat, mut hits, mut want) = (Vec::new(), 0, 0);
                     let mut i = t * nq / readers.max(1);
+                    // Each reader its own times, one after the other.
+                    let every = if b.read_rate > 0.0 { readers as f64 / b.read_rate } else { 0.0 };
+                    let mut due = every * t as f64 / readers as f64;
                     while !done.load(Ordering::Relaxed) {
                         let qi = i % nq;
+                        if every > 0.0 {
+                            std::thread::sleep(Duration::from_secs_f64((due - t0.elapsed().as_secs_f64()).max(0.0)));
+                            due = (due + every).max(t0.elapsed().as_secs_f64());
+                        }
                         let tq = Instant::now();
                         let res = b.c.search(b.queries.row(qi), b.k, b.so).map_err(|e| e.to_string())?;
                         lat.push(tq.elapsed().as_secs_f64() * 1e3);
@@ -689,6 +737,7 @@ fn measure(b: &Bench, phase: &str, readers: usize, writers: usize) -> AnyResult<
         (reads, writes)
     });
     let secs = t0.elapsed().as_secs_f64();
+    let cpu = cpu_seconds() - cpu0;
     let (mut lat, mut hits, mut want) = (Vec::new(), 0, 0);
     for r in reads {
         let (l, h, w) = r?;
@@ -714,16 +763,20 @@ fn measure(b: &Bench, phase: &str, readers: usize, writers: usize) -> AnyResult<
     let groups = after.write_groups - before.write_groups;
     let mean = lat.iter().sum::<f64>() / lat.len().max(1) as f64;
     println!(
-        "  {phase:7} {readers:7} {writers:7} {:8.0}  {:9.4}  {:7.3}  {:6.3}  {:6.3}  {:12.0}  {:12.3}  {:6.3}  {:13.1}",
+        "  {phase:7} {readers:7} {writers:7} {:8.0}  {:9.4}  {:7.3}  {:6.3}  {:6.3}  {:8.2}  {:12.0}  {:12.3}  {:6.3}  {:6.1}  {:13.1}  {:7}  {:6}",
         lat.len() as f64 / secs,
         hits as f64 / want.max(1) as f64,
         mean,
         pct(&mut lat, 50.0),
         pct(&mut lat, 99.0),
+        cpu * 1e3 / lat.len().max(1) as f64,
         rows as f64 / secs,
         pct(&mut wlat, 50.0),
         pct(&mut wlat, 99.0),
+        pct(&mut wlat, 100.0),
         batches as f64 / groups.max(1) as f64,
+        after.flushes - before.flushes,
+        after.builds - before.builds,
     );
     Ok(())
 }
