@@ -133,16 +133,8 @@ fn random_writes_match_the_model() {
         assert!(st.segments.iter().any(|s| s.deleted > 0));
         // Each id has one live row at most.
         let mut seen = std::collections::HashSet::new();
-        for s in &c.state.sealed {
-            for p in 0..s.positions() {
-                if !s.tomb.is_set(p) {
-                    assert!(seen.insert(s.id_at(p)), "id {} live twice", s.id_at(p));
-                }
-            }
-        }
-        let g = &c.state.growing;
-        for r in (0..g.rows()).filter(|&r| !g.is_dead(r)) {
-            assert!(seen.insert(g.ids[r]));
+        for id in c.live_ids() {
+            assert!(seen.insert(id), "id {id} live twice");
         }
         drop(c);
         let _ = fs::remove_dir_all(&dir);
@@ -164,7 +156,7 @@ fn copy_dir(from: &Path, to: &Path) {
 fn wal_cut_at_every_byte_keeps_whole_batches() {
     let dir = test_dir("coll-walcut");
     let dim = 3;
-    let mut c = Collection::create(&dir, small_config(dim, Metric::L2, 1000), test_opts()).unwrap();
+    let c = Collection::create(&dir, small_config(dim, Metric::L2, 1000), test_opts()).unwrap();
     let mut rng = SplitMix64::new(5);
     let mut models = vec![Model::default()];
     let mut ends = vec![wal::HEADER_LEN as u64];
@@ -180,9 +172,9 @@ fn wal_cut_at_every_byte_keeps_whole_batches() {
         let mut m = models.last().unwrap().clone();
         ops.iter().for_each(|op| m.apply(op));
         models.push(m);
-        ends.push(c.wal.bytes());
+        ends.push(c.wal_bytes());
     }
-    let wal_path = c.wal.path().to_path_buf();
+    let wal_path = c.wal_path();
     drop(c);
     let full = fs::read(&wal_path).unwrap();
     assert_eq!(full.len() as u64, *ends.last().unwrap());
@@ -206,7 +198,7 @@ fn wal_cut_at_every_byte_keeps_whole_batches() {
     let mut bytes = fs::read(&wp).unwrap();
     bytes[(ends[2] + 20) as usize] ^= 0x40;
     fs::write(&wp, &bytes).unwrap();
-    let (mut c, report) = Collection::open(&cut_dir, test_opts()).unwrap();
+    let (c, report) = Collection::open(&cut_dir, test_opts()).unwrap();
     assert_eq!(report.replay.batches, 2);
     assert_eq!(report.replay.cut_bytes, full.len() as u64 - ends[2]);
     check(&c, &models[2], &mut rng);
@@ -230,7 +222,7 @@ fn wal_cut_at_every_byte_keeps_whole_batches() {
 fn open_removes_only_unreferenced_files_of_ours() {
     let dir = test_dir("coll-orphans");
     let dim = 4;
-    let mut c = Collection::create(&dir, small_config(dim, Metric::L2, 10), test_opts()).unwrap();
+    let c = Collection::create(&dir, small_config(dim, Metric::L2, 10), test_opts()).unwrap();
     let mut model = Model::default();
     let mut rng = SplitMix64::new(9);
     for id in 0..25 {
@@ -290,9 +282,9 @@ fn bad_writes_change_nothing() {
     let dir = test_dir("coll-bad");
     let mut cfg = small_config(3, Metric::L2, 10);
     cfg.fields = vec![Field::int("year")];
-    let mut c = Collection::create(&dir, cfg, test_opts()).unwrap();
+    let c = Collection::create(&dir, cfg, test_opts()).unwrap();
     c.upsert(1, &[1.0, 2.0, 3.0], &Attrs::new().int("year", 2020)).unwrap();
-    let wal_bytes = c.wal.bytes();
+    let wal_bytes = c.wal_bytes();
     let good = [1.0, 1.0, 1.0];
     let bad: Vec<Vec<WriteOp>> = vec![
         vec![WriteOp::Upsert { id: 2, vector: &[1.0, 2.0], attrs: &NO_ATTRS }],
@@ -309,7 +301,7 @@ fn bad_writes_change_nothing() {
     let wrong_type = Attrs::new().keyword("year", "2020");
     assert!(c.upsert(2, &good, &unknown).is_err());
     assert!(c.upsert(2, &good, &wrong_type).is_err());
-    assert_eq!(c.wal.bytes(), wal_bytes);
+    assert_eq!(c.wal_bytes(), wal_bytes);
     assert_eq!(c.len(), 1);
     assert!(c.search(&[1.0, 2.0], 1, &SearchOptions::default()).is_err());
     assert!(c.search(&[1.0, 2.0, f32::NAN], 1, &SearchOptions::default()).is_err());
@@ -409,10 +401,8 @@ fn check_approx(c: &Collection, model: &Model, rng: &mut SplitMix64, min_recall:
     assert!(recall >= min_recall, "recall {recall}");
     // Each id is live in one place at most.
     let mut seen = std::collections::HashSet::new();
-    for s in &c.state.sealed {
-        for p in (0..s.positions()).filter(|&p| !s.tomb.is_set(p)) {
-            assert!(seen.insert(s.id_at(p)), "id {} live twice", s.id_at(p));
-        }
+    for id in c.live_ids() {
+        assert!(seen.insert(id), "id {id} live twice");
     }
 }
 
@@ -452,7 +442,7 @@ fn maintain_builds_compacts_and_merges() {
         model.rows.remove(&id);
     }
     drop(c);
-    let (mut c, report) = Collection::open(&dir, test_opts()).unwrap();
+    let (c, report) = Collection::open(&dir, test_opts()).unwrap();
     assert_eq!(report.replay.ops, 4);
     check_approx(&c, &model, &mut rng, 0.95);
     c.flush().unwrap();
@@ -489,10 +479,8 @@ fn maintain_builds_compacts_and_merges() {
     check_approx(&c, &model, &mut rng, 0.95);
 
     // Everything deleted from a segment: it is dropped.
-    let first: Vec<u64> = (0..c.state.sealed[0].positions())
-        .filter(|&p| !c.state.sealed[0].tomb.is_set(p))
-        .map(|p| c.state.sealed[0].id_at(p))
-        .collect();
+    let s0 = c.sealed()[0].clone();
+    let first: Vec<u64> = (0..s0.positions()).filter(|&p| !s0.tomb.is_set(p)).map(|p| s0.id_at(p)).collect();
     let ops: Vec<WriteOp> = first.iter().map(|&id| WriteOp::Delete { id }).collect();
     c.write(&ops).unwrap();
     first.iter().for_each(|id| {
@@ -570,7 +558,7 @@ fn identical_vectors_keep_their_own_rows() {
     let dim = 8;
     let mut cfg = ssd_config(dim, Metric::L2, 5000, 1 << 20);
     cfg.fields = vec![Field::keyword("name"), Field::int("n")];
-    let mut c = Collection::create(&dir, cfg, test_opts()).unwrap();
+    let c = Collection::create(&dir, cfg, test_opts()).unwrap();
     let mut rng = SplitMix64::new(8);
     let base: Vec<Vec<f32>> = (0..2500).map(|_| float_vector(&mut rng, dim)).collect();
     // Ids 2i and 2i+1 hold the same vector with different attributes.
@@ -583,7 +571,8 @@ fn identical_vectors_keep_their_own_rows() {
         c.write(chunk).unwrap();
     }
     c.optimize().unwrap();
-    let Body::Disk { index, .. } = &c.state.sealed[0].body else { panic!("not an SSD segment") };
+    let s0 = c.sealed()[0].clone();
+    let Body::Disk { index, .. } = &s0.body else { panic!("not an SSD segment") };
     assert_eq!((index.len(), index.nodes()), (5000, 2500));
     for i in (0..5000u64).step_by(3) {
         assert!(c.delete(i).unwrap());
@@ -722,7 +711,7 @@ fn damage_before_synced_writes_refuses_to_open() {
     let dir = test_dir("coll-syncdamage");
     let dim = 3;
     let opts = OpenOptions { durability: Durability::Sync, ..test_opts() };
-    let mut c = Collection::create(&dir, small_config(dim, Metric::L2, 1000), opts.clone()).unwrap();
+    let c = Collection::create(&dir, small_config(dim, Metric::L2, 1000), opts.clone()).unwrap();
     let mut rng = SplitMix64::new(6);
     let mut models = vec![Model::default()];
     let mut ends = vec![wal::HEADER_LEN as u64];
@@ -732,9 +721,9 @@ fn damage_before_synced_writes_refuses_to_open() {
         let mut m = models.last().unwrap().clone();
         m.apply(&WriteOp::Upsert { id, vector: &v, attrs: &NO_ATTRS });
         models.push(m);
-        ends.push(c.wal.bytes());
+        ends.push(c.wal_bytes());
     }
-    let wal_path = c.wal.path().to_path_buf();
+    let wal_path = c.wal_path();
     drop(c);
     let mut bytes = fs::read(&wal_path).unwrap();
     bytes[ends[2] as usize + 30] ^= 1;
@@ -760,7 +749,7 @@ fn small_flat_segments_and_delete_only_writes() {
     let dim = 4;
     let mut cfg = small_config(dim, Metric::L2, 50);
     cfg.index_bytes = (10 * dim * 4) as u64;
-    let mut c = Collection::create(&dir, cfg, test_opts()).unwrap();
+    let c = Collection::create(&dir, cfg, test_opts()).unwrap();
     let mut model = Model::default();
     let mut rng = SplitMix64::new(2);
     for id in 0..400 {
@@ -776,7 +765,7 @@ fn small_flat_segments_and_delete_only_writes() {
     let seal = c.config().seal_bytes;
     for id in 10_000..20_000u64 {
         c.delete(id).unwrap();
-        assert!(c.wal.bytes() < 2 * seal + 64, "WAL {} bytes", c.wal.bytes());
+        assert!(c.wal_bytes() < 2 * seal + 64, "WAL {} bytes", c.wal_bytes());
     }
     check(&c, &model, &mut rng);
     drop(c);
@@ -803,18 +792,18 @@ fn create_refuses_collection_files_without_a_manifest() {
 fn damage_is_found_past_buffered_records() {
     let dir = test_dir("coll-mixeddamage");
     let dim = 3;
-    let mut c = Collection::create(&dir, small_config(dim, Metric::L2, 1000), test_opts()).unwrap();
+    let c = Collection::create(&dir, small_config(dim, Metric::L2, 1000), test_opts()).unwrap();
     let mut rng = SplitMix64::new(7);
     let mut ends = vec![wal::HEADER_LEN as u64];
     for id in 0..3 {
         c.upsert(id, &int_vector(&mut rng, dim), &NO_ATTRS).unwrap();
-        ends.push(c.wal.bytes());
+        ends.push(c.wal_bytes());
     }
     drop(c);
     let sync = OpenOptions { durability: Durability::Sync, ..test_opts() };
-    let (mut c, _) = Collection::open(&dir, sync.clone()).unwrap();
+    let (c, _) = Collection::open(&dir, sync.clone()).unwrap();
     c.upsert(3, &int_vector(&mut rng, dim), &NO_ATTRS).unwrap();
-    let wal_path = c.wal.path().to_path_buf();
+    let wal_path = c.wal_path();
     drop(c);
     let mut bytes = fs::read(&wal_path).unwrap();
     bytes[ends[0] as usize + 30] ^= 1;
@@ -825,4 +814,5 @@ fn damage_is_found_past_buffered_records() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+mod concurrent;
 mod filters;

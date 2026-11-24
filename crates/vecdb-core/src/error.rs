@@ -16,6 +16,22 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// A copy, for reporting one failure to several callers (an I/O error
+    /// keeps its kind and message).
+    pub fn duplicate(&self) -> Error {
+        match self {
+            Error::DimensionMismatch { expected, got } => Error::DimensionMismatch { expected: *expected, got: *got },
+            Error::NonFiniteValue => Error::NonFiniteValue,
+            Error::DuplicateId(id) => Error::DuplicateId(*id),
+            Error::InvalidArgument(m) => Error::InvalidArgument(m.clone()),
+            Error::Corrupt(m) => Error::Corrupt(m.clone()),
+            Error::Unsupported(m) => Error::Unsupported(m.clone()),
+            Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

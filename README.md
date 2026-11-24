@@ -12,7 +12,10 @@ with direct I/O and io_uring, and a partitioned build that needs RAM for one
 partition rather than the whole collection. The 100M-vectors-per-node target
 has not been attempted yet: it needs a dedicated machine. Step 6 is done:
 collections with a write-ahead log, segments, deletes, compaction, crash
-recovery and attribute filters.
+recovery and attribute filters. Step 7 is under way: a collection is shared
+between threads, with snapshot reads, index builds beside writes and group
+commit (7a); a catalog, background flushes and builds, and a server are
+next.
 
 ## Goals
 
@@ -678,7 +681,7 @@ segment files plus a write-ahead log (WAL), tied together by a manifest.
 ```rust
 let mut cfg = CollectionConfig::new(768, Metric::Cosine);
 cfg.fields = vec![Field::keyword("lang"), Field::int("year")];
-let mut c = Collection::create("data/docs", cfg, OpenOptions::default())?;
+let c = Collection::create("data/docs", cfg, OpenOptions::default())?;
 c.upsert(42, &vector, &Attrs::new().keyword("lang", "en").int("year", 2024))?;
 c.delete(7)?;
 let hits = c.search(&query, 10, &SearchOptions::default())?;
@@ -742,10 +745,9 @@ c.maintain()?; // the index builds and compactions that are due
   writes, and names the byte to cut the log at. A failed fsync poisons the
   log until the collection is reopened. The WAL is also rotated once it
   reaches twice `seal_bytes`, so a workload of deletes alone flushes too.
-- **One writer.** Writes take `&mut self`, searches `&self`, and nothing runs
-  in the background yet. Sealed segments are shared through `Arc` and only
-  their tombstones change (atomically), so step 7 can search a snapshot of
-  the segment list while a writer works.
+- **Shared between threads** (step 7a, see [Concurrency](#concurrency-step-7a)):
+  every method takes `&self`; searches read a snapshot, writers share WAL
+  writes and fsyncs, and `maintain` runs beside both.
 - **RAM per row of an SSD segment**, beyond the index: 4 bytes for the
   id lookup (positions sorted by id) and 1 bit of tombstone. Flat and
   growing segments hold their vectors. With fields declared, every sealed
@@ -774,12 +776,13 @@ Ingest, with the growing segment sealed at 64 MiB:
 | sync | 1,000 | 90,800 | 8.9 / 16.8 ms |
 
 - An fsync on this machine's RAID takes about 5.6 ms, so durable writes need
-  batches; combining concurrent writers' batches into one fsync (group
-  commit) comes with step 7.
+  batches, or several writers: since step 7a their batches share fsyncs
+  (group commit, see [Concurrency](#concurrency-step-7a)).
 - A flush (64 MiB written and fsynced) stalls its batch for 0.24-0.3 s.
 - Reopening took 0.08 s with an empty WAL and 0.30 s to replay 76,000
   writes (40 MB).
-- Index builds run inside `maintain`, so they block writes. Ingest with
+- Index builds run inside `maintain`. In these step 6 runs they blocked
+  writes (since step 7a they run beside them). Ingest with
   `maintain` after every batch (index at 128 MiB) averaged 4,950 rows/s:
   three builds of 264,000 rows took 199 of the 202 s. Merging all 1M rows
   into one SSD index (`optimize`) took 172 s; step 5's build of the same
@@ -835,7 +838,7 @@ Direct I/O here is capped at 100,000 reads/s, as in step 5.
   one segment. Each segment is searched with the full L, so more segments
   give higher recall at a fixed L, but one segment at L 160 (0.9989, 6.3 ms)
   beats seven at L 40 (0.9975, 15.3 ms). `max_indexed_segments` (default 8)
-  trades rebuild work against this. Step 7 is to search segments
+  trades rebuild work against this. Step 7b is to search segments
   concurrently, with their reads in flight together, to scan in parallel,
   and to build indexes in the background.
 
@@ -997,8 +1000,7 @@ Limits:
   entry points or label-aware edges (as in Filtered-DiskANN) would avoid
   the wasted walk.
 
-Not yet: group commit, and inserting into an SSD index in place instead of
-rebuilding it.
+Not yet: inserting into an SSD index in place instead of rebuilding it.
 
 Commands (`B`, `S` as above):
 
@@ -1013,6 +1015,169 @@ $B coll-filter --dir sift1m-labels --base $S/sift_base.fvecs --query $S/sift_que
    --filter u,p,near --select 0.001,0.01,0.05,0.1,0.2,0.5 --mode graph,scan,auto --direct false
 $B coll-filter --dir sift1m-labels --base $S/sift_base.fvecs --query $S/sift_query.fvecs --l 40 \
    --filter none,u,none,u --select 1.0 --mode graph --direct false   # overhead of a filter
+```
+
+## Concurrency (step 7a)
+
+A `Collection` is `Send + Sync` and every method takes `&self`, so threads
+share one through an `Arc` (or a scoped borrow). Searches, writes and
+`maintain` run at the same time:
+
+```rust
+let c = Arc::new(Collection::open("data/docs", OpenOptions::default())?.0);
+let builder = { let c = c.clone(); std::thread::spawn(move || c.maintain()) };
+c.upsert(42, &vector, &Attrs::default())?;               // during the build
+let hits = c.search(&query, 10, &SearchOptions::default())?; // sees the upsert
+```
+
+- **Snapshot reads.** Every write batch gets a sequence number. A search
+  reads the segment list and the last applied sequence number together and
+  sees exactly the batches up to it: a batch is there whole or not at all,
+  and each id at most once (an upsert that moves an id to the growing
+  segment is one batch). Growing rows carry the sequence numbers that
+  inserted and deleted them. A delete in a sealed segment sets a tombstone
+  bit in place, but first records its sequence number in a side table, so a
+  search older than the delete still reads the bit as clear. Searches
+  register their snapshots, and the side table keeps an entry only while a
+  search older than it is open; `stats().delete_records` shows its size.
+- **Index builds beside writes.** `maintain` takes the live rows of its
+  input segments under the writer lock, builds without any lock, and
+  commits under the writer lock against the state at that moment. Rows
+  deleted while it ran are deleted in the new segment too (and written to
+  its tombstone file, so a crash right after the commit keeps them deleted).
+  Segments flushed in the meantime keep their place. Files the build
+  replaces are removed from the directory but stay open, so searches that
+  started before the commit finish on them.
+- **Group commit.** A writer prepares its batch outside any lock (vectors
+  normalized, rows encoded, the WAL record built) and queues it. One
+  waiting writer takes every queued batch (up to 16 MiB), writes them with
+  one WAL write and, under `Sync`, one fsync, applies them, and wakes the
+  others. Each batch stays its own WAL record, so a crash keeps or drops
+  batches whole. Records after the first of a group are flagged: the
+  recovery rule that a good `Sync` record after a bad one proves damage
+  counts only a later group, because the rest of the bad record's own group
+  shared its fsync and may be the torn part of the same write.
+- **Short lock holds.** A search scans the growing segment 1 MiB of vectors
+  at a time, each chunk under its own read lock, so a write waits for one
+  chunk rather than a whole scan. The price: a search pauses at its next
+  chunk for every write that queues meanwhile (measured below). Reading the
+  growing segment without a lock would avoid both waits.
+- **Not yet:** sealing the growing segment still runs inside the write that
+  fills it, and `maintain` runs on the caller's thread; background threads
+  for both are step 7b. Segments are still searched one after another.
+
+The tests:
+- an old snapshot keeps its view (search, filtered search by walk and by
+  scan, `get`) after upserts and deletes in each kind of segment, a flush,
+  and a rebuild that removed the files it reads; its delete records are
+  dropped once it closes;
+- two writers upserting groups of 8 ids, three searching threads and a
+  `maintain` loop (flushes, builds, compactions, merges): every search
+  returns each id once, each group's 8 rows from one batch, and no group
+  from an older batch than an earlier search saw; then a reopen;
+- deletes and upserts during an index build, with flushes in between: the
+  new segment leaves the deleted rows out in memory, after a crash right
+  after the commit, and after a reopen;
+- 16 writers with `Sync`: fewer fsyncs than batches, and every
+  acknowledged write survives a reopen;
+- the WAL damage rule with groups.
+
+Each was checked against a broken engine: reading tombstones without
+snapshots, not carrying deletes into a build, carrying them without writing
+the tombstone file, and the step 6 damage rule each make a test fail.
+
+Results on SIFT1M: one SSD segment of 1M rows, L 40, W 4, page cache,
+i7-8700 (6 cores, 12 threads), this loaded machine, 4-5 s per row.
+Searches from several threads (recall@10 0.9648 throughout):
+
+| search threads | QPS | p50 ms | p99 ms |
+|---:|---:|---:|---:|
+| 1 | 4,365 | 0.228 | 0.345 |
+| 2 | 8,599 | 0.232 | 0.329 |
+| 4 | 16,592 | 0.240 | 0.347 |
+| 8 | 25,260 | 0.312 | 0.449 |
+
+With fresh rows and a writer. First 25,000 rows upserted into the growing
+segment (rows already in the index, so also 25,000 tombstones), then a
+writer upserting 5,000 rows/s in batches of 100 (`Buffered`):
+
+| search threads | 25k growing rows: QPS / p50 ms | + writer: QPS / p50 ms | write batch p50 / p99 ms |
+|---:|---:|---:|---:|
+| 1 | 1,059 / 0.913 | 782 / 1.271 | 0.76 / 1.61 |
+| 4 | 3,613 / 1.074 | 2,641 / 1.502 | 0.43 / 0.64 |
+| 8 | 6,194 / 1.239 | 4,616 / 1.685 | 0.51 / 1.41 |
+
+- **The scan of the fresh rows is the cost, not the locks.** 25,000 rows
+  are 12.8 MB, more than the 12 MiB L3, and are scanned at about 29 ns per
+  row, as in step 2: 0.7 ms per search. During the writer's 4 s the growing
+  segment grows to 45,100 rows, which accounts for most of the added
+  0.36-0.45 ms (about 0.28 ms of scan at the midpoint).
+- **Scanning in chunks trades a little search tail for much shorter
+  writes.** Against one read lock per scan, in interleaved runs with 4
+  searching threads (6 runs each): write batch p99 0.58-0.95 ms against
+  1.84-2.02 ms, and search p99 2.11-2.63 ms (median 2.22) against 1.96-2.22
+  ms (median 2.04); QPS and p50 the same within 2%. With 8 searching
+  threads (3 runs each): write p99 0.84-1.43 against 2.21-2.52 ms, search
+  p99 2.78-3.03 against 2.60-3.01 ms. Chunks of 8 MiB kept most of the
+  write cost (p99 1.36-1.78 ms) without a better search p99.
+- **A writer going flat out, with nothing building indexes, is a limit:**
+  one writer at 59,600 rows/s (batches of 100, 5 s, starting from the
+  indexed 1M) left 4 searching threads at 716 QPS, p99 20 ms, against
+  16,592 alone, because every sealed segment stays flat and is scanned in
+  full until `maintain` indexes it. Index builds ran at 4,000-5,800 rows/s
+  with 6 threads in step 6, far slower than such a writer, so a background
+  `maintain` (step 7b) bounds the unindexed rows only while ingest is
+  slower than the builds.
+- Fresh rows are therefore the next search cost to cut: an interim index or
+  int8 codes for growing and flat rows (a quarter of the memory traffic), or
+  smaller seals.
+
+Durable writes from several threads (`Sync`, batches of 100, 5 s each):
+
+| writer threads | rows/s | batches per fsync | batch p50 / p99 ms |
+|---:|---:|---:|---:|
+| 1 | 15,137 | 1.0 | 6.6 / 10.8 |
+| 2 | 16,265 | 1.1 | 12.5 / 19.4 |
+| 4 | 27,632 | 2.0 | 14.0 / 21.9 |
+| 8 | 45,913 | 4.0 | 16.2 / 145 |
+| 16 | 73,353 | 8.0 | 19.0 / 161 |
+
+- **Two writers gain little:** each prepares its next batch while the
+  other's fsync runs, so each logs alone. From four on, a group holds the
+  batches that arrived during the previous fsync.
+- **The maximum of 120-190 ms at every count is the inline seal:** writing
+  and fsyncing a 32 MiB segment stalls every waiting writer. With 8 writers
+  and seals off (`--seal-mb 1024`), the maximum was 36-47 ms against
+  149-188 ms with them (2 interleaved runs each). A seal stalls about 1% of
+  the batches at 8 writers, so it reaches the p99 in some runs (145 ms in
+  the table) and not in others (22-27 ms in the runs with and without
+  seals). Step 7b moves it to a background thread.
+
+Search during an index build. 25% of the rows deleted at random, then
+`maintain` compacts the segment to 750,000 rows with 2 build threads while 4
+threads search, measured in 25 s windows:
+
+| | QPS | recall@10 | p50 ms | p99 ms |
+|---|---:|---:|---:|---:|
+| before the build | 13,986 | 0.9716 | 0.286 | 0.414 |
+| during the build (10 windows) | 11,512-13,537 | 0.9716 | 0.290-0.343 | 0.446-0.517 |
+| after (750,000 rows, no tombstones) | 20,565 | 0.9684 | 0.190 | 0.287 |
+
+- Searches slowed by up to 18% while the build used two of the six cores;
+  the build took 260 s with the searches running throughout (207 s in a run
+  that searched during its first 30 s only).
+- Recall before the build is higher than after it because L is scaled up
+  for the deleted rows (step 6), and those searches read more.
+
+Commands (`B`, `S` as above; `--direct false` = page cache):
+
+```
+$B coll-concurrent --from sift1m --dir work --base $S/sift_base.fvecs --query $S/sift_query.fvecs \
+   --l 40 --direct false --readers 1,2,4,8
+$B coll-concurrent ... --readers 1,4,8 --secs 4 --growing 25000
+$B coll-concurrent ... --readers 4 --secs 4 --growing 25000 --writers 1 --write-rate 5000   # also 1, 8
+$B coll-ingest --base $S/sift_base.fvecs --dir work --durability sync --batch 100 --secs 5 --writers 16
+$B coll-concurrent ... --readers 4 --secs 25 --churn 0.25 --build true --windows 10 --threads 2
 ```
 
 ## Designing for billions
@@ -1123,12 +1288,19 @@ Within a shard:
    index per segment and a walk-or-scan choice per SSD segment; ingest,
    delete, multi-segment and filtered search measured on SIFT1M.
    Follow-ups:
-   - background builds and group commit (step 7);
+   - background builds (step 7b; group commit is done, step 7a);
    - filters evaluated lazily, or as sorted lists, instead of a bitmap per
      segment (needed for segments of 100M rows);
    - a graph that knows the labels (per-label entry points or edges), for
      filters whose matches lie away from the query
-7. Server and single-node mode: gRPC/HTTP API, collections, the shard
-   interface, concurrent reads and writes
+7. ◐ Server and single-node mode. Done (7a): a collection shared between
+   threads, with snapshot reads, index builds and compactions beside writes
+   and searches (deletes made meanwhile carried into the new segment), and
+   group commit; concurrent search, durable writes and search during a build
+   measured on SIFT1M. Still to do:
+   - 7b: a catalog of named collections and the shard interface; flushes and
+     index builds on background threads; segments searched in parallel
+   - 7c: the server (proposed, not decided: HTTP/JSON first, gRPC for the
+     shard interface in step 8)
 8. Distributed mode: remote shards, query nodes, metadata service,
    replication, rebalancing

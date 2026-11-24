@@ -472,8 +472,11 @@ const HEADER: u64 = 48;
 const REC_HEAD: usize = 16;
 
 /// A sealed segment's attributes: the columns in RAM, rows in the file.
+/// The file stays open, so rows can still be read after a build replaced
+/// the segment and removed its files.
 pub(crate) struct SegmentAttrs {
     path: PathBuf,
+    file: File,
     positions: usize,
     rows_len: u64,
     pub columns: Columns,
@@ -510,12 +513,12 @@ impl SegmentAttrs {
         let mut d = Dec::checked(&cols, "attribute columns")?;
         let columns = Columns::decode(&mut d, fields, positions)?;
         d.done()?;
-        Ok(Self { path: path.to_path_buf(), positions, rows_len, columns })
+        Ok(Self { path: path.to_path_buf(), file: f, positions, rows_len, columns })
     }
 
     /// Reads the row at `pos` from the file.
     pub fn row(&self, pos: usize, fields: &[Field]) -> Result<Attrs> {
-        let f = File::open(&self.path)?;
+        let f = &self.file;
         let mut b8 = [0u8; 8];
         f.read_exact_at(&mut b8, HEADER + self.rows_len + 8 * pos as u64)?;
         let off = u64::from_le_bytes(b8);
@@ -546,9 +549,8 @@ impl SegmentAttrs {
     /// Calls `f(pos, row)` for every row, in file order (checksums checked,
     /// every position exactly once).
     pub fn for_each_row(&self, mut f: impl FnMut(usize, &[u8]) -> Result<()>) -> Result<()> {
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(HEADER))?;
-        let mut r = BufReader::with_capacity(1 << 20, file.take(self.rows_len));
+        let rows = PreadReader { file: &self.file, at: HEADER, end: HEADER + self.rows_len };
+        let mut r = BufReader::with_capacity(1 << 20, rows);
         let corrupt = |m: &str| Error::Corrupt(format!("attribute file {}: {m}", self.path.display()));
         let mut seen = Bitmap::empty(self.positions);
         let mut body = Vec::new();
@@ -581,6 +583,25 @@ impl SegmentAttrs {
     }
 }
 
+/// Reads `file[at..end]` by positioned reads (no shared file cursor).
+struct PreadReader<'a> {
+    file: &'a File,
+    at: u64,
+    end: u64,
+}
+
+impl Read for PreadReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = buf.len().min((self.end - self.at) as usize);
+        if want == 0 {
+            return Ok(0);
+        }
+        let n = self.file.read_at(&mut buf[..want], self.at)?;
+        self.at += n as u64;
+        Ok(n)
+    }
+}
+
 fn crc32c_parts(a: &[u8], b: &[u8]) -> u32 {
     let mut c = Crc32c::new();
     c.update(a);
@@ -605,7 +626,7 @@ impl AttrWriter {
         if positions > u32::MAX as usize {
             return Err(Error::InvalidArgument("segment too large for its attribute file".into()));
         }
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
         let mut out = BufWriter::with_capacity(1 << 20, file);
         out.write_all(&[0u8; HEADER as usize])?;
         let mut builder = ColumnBuilder::new(fields);
@@ -670,6 +691,6 @@ impl AttrWriter {
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&h.buf)?;
         file.sync_all()?;
-        Ok(SegmentAttrs { path: self.path, positions, rows_len: self.rows_len, columns })
+        Ok(SegmentAttrs { path: self.path, file, positions, rows_len: self.rows_len, columns })
     }
 }

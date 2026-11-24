@@ -1,7 +1,8 @@
 //! Collection benchmarks: ingest through the WAL, and search with deletes.
 
 use std::path::Path;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use vecdb_core::collection::NO_ATTRS;
 use vecdb_core::disk::IoMode;
@@ -34,7 +35,7 @@ fn open_options(a: &Args) -> AnyResult<OpenOptions> {
 pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     a.allow(&[
         "base", "dir", "metric", "limit", "batch", "durability", "seal-mb", "index-mb", "max-ssd", "pq-m", "threads",
-        "build-mem", "maintain", "optimize", "secs", "direct", "labels",
+        "build-mem", "maintain", "optimize", "secs", "direct", "labels", "writers",
     ])?;
     let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
     let dir = a.req_path("dir")?;
@@ -56,9 +57,13 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     let batch: usize = a.num("batch", 1000)?;
     let maintain: bool = a.num("maintain", false)?;
     let secs: f64 = a.num("secs", f64::INFINITY)?;
-    let mut c = Collection::create(&dir, cfg.clone(), opts.clone())?;
+    let writers: usize = a.num("writers", 1)?;
+    if writers > 1 && maintain {
+        return Err("--maintain runs with one writer only".into());
+    }
+    let c = Collection::create(&dir, cfg.clone(), opts.clone())?;
     println!(
-        "ingest   {} x {} ({}) into {}: batches of {batch}, {:?}, seal {} MiB, index {} MiB, maintain {maintain}",
+        "ingest   {} x {} ({}) into {}: batches of {batch}, {writers} writers, {:?}, seal {} MiB, index {} MiB, maintain {maintain}",
         base.len(),
         base.dim,
         cfg.metric.name(),
@@ -67,33 +72,61 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
         cfg.seal_bytes >> 20,
         cfg.index_bytes >> 20,
     );
-    let t0 = Instant::now();
-    let mut lat = Vec::new();
-    let (mut maintain_s, mut jobs) = (0.0, 0);
-    let mut rows = 0;
-    while rows < base.len() && t0.elapsed().as_secs_f64() < secs {
-        let end = (rows + batch).min(base.len());
+    let write_rows = |start: usize, end: usize| -> vecdb_core::Result<()> {
         let attrs: Vec<Attrs> = match &labels {
-            Some(lb) => (rows..end).map(|i| Attrs::new().int("u", lb.u[i]).int("p", lb.p[i])).collect(),
+            Some(lb) => (start..end).map(|i| Attrs::new().int("u", lb.u[i]).int("p", lb.p[i])).collect(),
             None => Vec::new(),
         };
-        let ops: Vec<WriteOp> = (rows..end)
+        let ops: Vec<WriteOp> = (start..end)
             .map(|i| WriteOp::Upsert {
                 id: i as u64,
                 vector: base.row(i),
-                attrs: attrs.get(i - rows).unwrap_or(&NO_ATTRS),
+                attrs: attrs.get(i - start).unwrap_or(&NO_ATTRS),
             })
             .collect();
-        let tb = Instant::now();
-        c.write(&ops)?;
-        lat.push(tb.elapsed().as_secs_f64() * 1e3);
-        if maintain {
-            let tm = Instant::now();
-            jobs += c.maintain()?.len();
-            maintain_s += tm.elapsed().as_secs_f64();
-        }
-        rows = end;
+        c.write(&ops)
+    };
+    let t0 = Instant::now();
+    let mut lat = Vec::new();
+    let (mut maintain_s, mut jobs) = (0.0, 0);
+    // Writers take the next batch of rows until all are written (or time
+    // is up); one writer goes through them in order.
+    let next = AtomicUsize::new(0);
+    let written = AtomicUsize::new(0);
+    let lats = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..writers)
+            .map(|_| {
+                s.spawn(|| -> Result<(Vec<f64>, usize, f64), String> {
+                    let (mut lat, mut jobs, mut maintain_s) = (Vec::new(), 0, 0.0);
+                    while t0.elapsed().as_secs_f64() < secs {
+                        let start = next.fetch_add(batch, Ordering::Relaxed);
+                        if start >= base.len() {
+                            break;
+                        }
+                        let end = (start + batch).min(base.len());
+                        let tb = Instant::now();
+                        write_rows(start, end).map_err(|e| e.to_string())?;
+                        lat.push(tb.elapsed().as_secs_f64() * 1e3);
+                        written.fetch_add(end - start, Ordering::Relaxed);
+                        if maintain {
+                            let tm = Instant::now();
+                            jobs += c.maintain().map_err(|e| e.to_string())?.len();
+                            maintain_s += tm.elapsed().as_secs_f64();
+                        }
+                    }
+                    Ok((lat, jobs, maintain_s))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("writer thread")).collect::<Vec<_>>()
+    });
+    for l in lats {
+        let (l, j, m) = l?;
+        lat.extend(l);
+        jobs += j;
+        maintain_s += m;
     }
+    let rows = written.load(Ordering::Relaxed);
     let ingest_s = t0.elapsed().as_secs_f64();
     lat.sort_by(f64::total_cmp);
     let pct = |p: f64| lat[((p / 100.0) * (lat.len() - 1) as f64).round() as usize];
@@ -104,6 +137,14 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
         pct(50.0),
         pct(99.0),
         pct(100.0),
+    );
+    let st = c.stats();
+    println!(
+        "wal      {} batches in {} writes, {} fsyncs: {:.1} batches per write",
+        st.write_batches,
+        st.write_groups,
+        st.wal_syncs,
+        st.write_batches as f64 / st.write_groups.max(1) as f64
     );
     if maintain {
         println!("maintain {jobs} jobs, {maintain_s:.1} s of the ingest time");
@@ -239,7 +280,7 @@ pub(crate) fn search(a: &Args) -> AnyResult<()> {
     };
     copy_dir(&from, &dir)?;
     let opts = open_options(a)?;
-    let (mut c, _) = Collection::open(&dir, opts)?;
+    let (c, _) = Collection::open(&dir, opts)?;
     let metric = c.config().metric;
     print_stats(&c);
 
@@ -462,5 +503,227 @@ pub(crate) fn filter(a: &Args) -> AnyResult<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// What one coll-concurrent measurement needs.
+struct Bench<'a> {
+    c: &'a Collection,
+    base: &'a Vecs<f32>,
+    /// Rows not deleted by --churn: writers upsert only these.
+    live: &'a [bool],
+    queries: &'a Vecs<f32>,
+    gt: &'a [Vec<u64>],
+    so: &'a SearchOptions,
+    k: usize,
+    secs: f64,
+    write_batch: usize,
+    /// Rows per second over all writers; 0: as fast as they go.
+    write_rate: f64,
+}
+
+/// coll-concurrent: copies a collection, then searches it from several
+/// threads at once for a few seconds each: alone, with writers upserting
+/// rows (the same vectors again, so the ground truth holds), and while an
+/// index build runs.
+pub(crate) fn concurrent(a: &Args) -> AnyResult<()> {
+    a.allow(&[
+        "from", "dir", "base", "query", "k", "l", "w", "nq", "readers", "secs", "writers", "write-batch",
+        "write-rate", "durability", "churn", "growing", "build", "windows", "threads", "build-mem", "direct",
+        "limit",
+    ])?;
+    let (from, dir) = (a.req_path("from")?, a.req_path("dir")?);
+    let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
+    let queries = load_vectors(&a.req_path("query")?, Some(a.num("nq", 1000)?))?;
+    let k: usize = a.num("k", 10)?;
+    let so = SearchOptions { l: a.num("l", 40)?, beam_width: a.num("w", 4)?, ..Default::default() };
+    let readers: Vec<usize> = parse_list(a, "readers", "1,2,4,8")?;
+    let writers: usize = a.num("writers", 0)?;
+    let churn: f64 = a.num("churn", 0.0)?;
+    copy_dir(&from, &dir)?;
+    let (c, _) = Collection::open(&dir, open_options(a)?)?;
+    print_stats(&c);
+    let n = base.len();
+    let mut live = vec![true; n];
+    if churn > 0.0 {
+        // Deletes of random rows: tombstones (a compaction falls due at
+        // 20%), and no rows left to scan in full.
+        let mut rng = SplitMix64::new(7);
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            order.swap(i, (rng.next_u64() % (i as u64 + 1)) as usize);
+        }
+        let gone = &order[..(churn * n as f64) as usize];
+        for chunk in gone.chunks(10_000) {
+            let ops: Vec<WriteOp> = chunk.iter().map(|&i| WriteOp::Delete { id: i as u64 }).collect();
+            c.write(&ops)?;
+        }
+        c.flush()?;
+        gone.iter().for_each(|&i| live[i] = false);
+        println!("churn    deleted {} random rows", gone.len());
+        print_stats(&c);
+    }
+    let gt = ground_truth(&base, &live, c.config().metric, &queries, k)?;
+    for i in 0..queries.len() {
+        c.search(queries.row(i), k, &so)?;
+    }
+    let growing: usize = a.num("growing", 0)?;
+    if growing > 0 {
+        // Rows left in the growing segment: what searches scan in full.
+        let mut rng = SplitMix64::new(8);
+        let ids: Vec<usize> = (0..growing).map(|_| (rng.next_u64() % n as u64) as usize).filter(|&i| live[i]).collect();
+        for chunk in ids.chunks(1000) {
+            let ops: Vec<WriteOp> =
+                chunk.iter().map(|&i| WriteOp::Upsert { id: i as u64, vector: base.row(i), attrs: &NO_ATTRS }).collect();
+            c.write(&ops)?;
+        }
+        print_stats(&c);
+    }
+    let b = Bench {
+        c: &c,
+        base: &base,
+        live: &live,
+        queries: &queries,
+        gt: &gt,
+        so: &so,
+        k,
+        secs: a.num("secs", 5.0)?,
+        write_batch: a.num("write-batch", 100)?,
+        write_rate: a.num("write-rate", 0.0)?,
+    };
+    println!(
+        "  phase   readers writers      QPS  recall@{k}  mean ms  p50 ms  p99 ms  write rows/s  batch p50 ms  p99 ms  batches/write"
+    );
+    for &r in &readers {
+        measure(&b, if writers > 0 { "writes" } else { "alone" }, r, writers)?;
+    }
+    if a.num("build", false)? {
+        // Searches while maintain() builds what is due, in windows of
+        // --secs, then once it is done.
+        let r = *readers.last().unwrap_or(&1);
+        let windows: usize = a.num("windows", 3)?;
+        let t = Instant::now();
+        let jobs = std::thread::scope(|s| -> AnyResult<_> {
+            let job = s.spawn(|| c.maintain().map_err(|e| e.to_string()));
+            let mut done = 0;
+            while !job.is_finished() && done < windows {
+                measure(&b, "build", r, 0)?;
+                done += 1;
+            }
+            Ok(job.join().expect("maintain thread")?)
+        })?;
+        let summary: Vec<String> = jobs.iter().map(|j| format!("{} {} rows {:.1} s", j.reason, j.rows, j.seconds)).collect();
+        println!("  maintain {:.1} s: {}", t.elapsed().as_secs_f64(), summary.join(", "));
+        measure(&b, "after", r, 0)?;
+    }
+    print_stats(&c);
+    drop(c);
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// One measurement: `readers` threads search (each through the queries
+/// from its own offset) and `writers` threads upsert, for `secs` seconds.
+fn measure(b: &Bench, phase: &str, readers: usize, writers: usize) -> AnyResult<()> {
+    let before = b.c.stats();
+    let t0 = Instant::now();
+    let done = AtomicBool::new(false);
+    let nq = b.queries.len();
+    let n = b.base.len();
+    let (reads, writes) = std::thread::scope(|s| {
+        let rh: Vec<_> = (0..readers)
+            .map(|t| {
+                let done = &done;
+                s.spawn(move || -> Result<(Vec<f64>, usize, usize), String> {
+                    let (mut lat, mut hits, mut want) = (Vec::new(), 0, 0);
+                    let mut i = t * nq / readers.max(1);
+                    while !done.load(Ordering::Relaxed) {
+                        let qi = i % nq;
+                        let tq = Instant::now();
+                        let res = b.c.search(b.queries.row(qi), b.k, b.so).map_err(|e| e.to_string())?;
+                        lat.push(tq.elapsed().as_secs_f64() * 1e3);
+                        hits += res.iter().filter(|r| b.gt[qi].contains(&r.id)).count();
+                        want += b.gt[qi].len();
+                        i += 1;
+                    }
+                    Ok((lat, hits, want))
+                })
+            })
+            .collect();
+        let wh: Vec<_> = (0..writers)
+            .map(|t| {
+                let done = &done;
+                s.spawn(move || -> Result<(Vec<f64>, usize), String> {
+                    let mut rng = SplitMix64::new(100 + t as u64);
+                    let per_writer = b.write_rate / writers as f64;
+                    let (mut lat, mut rows) = (Vec::new(), 0usize);
+                    while !done.load(Ordering::Relaxed) {
+                        if per_writer > 0.0 {
+                            let due = rows as f64 / per_writer - t0.elapsed().as_secs_f64();
+                            if due > 0.0 {
+                                std::thread::sleep(Duration::from_secs_f64(due.min(0.02)));
+                                continue;
+                            }
+                        }
+                        let ids: Vec<usize> = (0..b.write_batch)
+                            .map(|_| (rng.next_u64() % n as u64) as usize)
+                            .filter(|&i| b.live[i])
+                            .collect();
+                        let ops: Vec<WriteOp> = ids
+                            .iter()
+                            .map(|&i| WriteOp::Upsert { id: i as u64, vector: b.base.row(i), attrs: &NO_ATTRS })
+                            .collect();
+                        let tb = Instant::now();
+                        b.c.write(&ops).map_err(|e| e.to_string())?;
+                        lat.push(tb.elapsed().as_secs_f64() * 1e3);
+                        rows += ops.len();
+                    }
+                    Ok((lat, rows))
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs_f64(b.secs));
+        done.store(true, Ordering::Relaxed);
+        let reads: Vec<_> = rh.into_iter().map(|h| h.join().expect("reader thread")).collect();
+        let writes: Vec<_> = wh.into_iter().map(|h| h.join().expect("writer thread")).collect();
+        (reads, writes)
+    });
+    let secs = t0.elapsed().as_secs_f64();
+    let (mut lat, mut hits, mut want) = (Vec::new(), 0, 0);
+    for r in reads {
+        let (l, h, w) = r?;
+        lat.extend(l);
+        hits += h;
+        want += w;
+    }
+    let (mut wlat, mut rows) = (Vec::new(), 0);
+    for w in writes {
+        let (l, r) = w?;
+        wlat.extend(l);
+        rows += r;
+    }
+    let pct = |v: &mut Vec<f64>, p: f64| {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(f64::total_cmp);
+        v[((p / 100.0) * (v.len() - 1) as f64).round() as usize]
+    };
+    let after = b.c.stats();
+    let batches = after.write_batches - before.write_batches;
+    let groups = after.write_groups - before.write_groups;
+    let mean = lat.iter().sum::<f64>() / lat.len().max(1) as f64;
+    println!(
+        "  {phase:7} {readers:7} {writers:7} {:8.0}  {:9.4}  {:7.3}  {:6.3}  {:6.3}  {:12.0}  {:12.3}  {:6.3}  {:13.1}",
+        lat.len() as f64 / secs,
+        hits as f64 / want.max(1) as f64,
+        mean,
+        pct(&mut lat, 50.0),
+        pct(&mut lat, 99.0),
+        rows as f64 / secs,
+        pct(&mut wlat, 50.0),
+        pct(&mut wlat, 99.0),
+        batches as f64 / groups.max(1) as f64,
+    );
     Ok(())
 }

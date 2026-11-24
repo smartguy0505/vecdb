@@ -315,7 +315,7 @@ fn ssd_filters_in_every_mode() {
         let mut cfg = ssd_config(dim, Metric::L2, 10_000, 2500);
         cfg.index.layout = Some(layout);
         cfg.fields = vec![Field::int("g"), Field::keyword("rare")];
-        let mut c = Collection::create(&dir, cfg, test_opts()).unwrap();
+        let c = Collection::create(&dir, cfg, test_opts()).unwrap();
         let mut model = Model::default();
         let mut rng = SplitMix64::new(9);
         let vs: Vec<Vec<f32>> = (0..3000).map(|_| float_vector(&mut rng, dim)).collect();
@@ -409,7 +409,7 @@ fn ssd_filters_in_every_mode() {
 #[test]
 fn bad_filters_and_wal_attributes_are_errors() {
     let dir = test_dir("coll-filter-bad");
-    let mut c = Collection::create(&dir, small_config(3, Metric::L2, 100), test_opts()).unwrap();
+    let c = Collection::create(&dir, small_config(3, Metric::L2, 100), test_opts()).unwrap();
     c.upsert(1, &[1.0, 2.0, 3.0], &NO_ATTRS).unwrap();
     let q = [0.0; 3];
     assert!(c.search(&q, 5, &filtered(&Filter::int_eq("x", 1), 10, FilterMode::Auto)).is_err());
@@ -422,9 +422,9 @@ fn bad_filters_and_wal_attributes_are_errors() {
     let other = test_dir("coll-filter-bad-2");
     let mut cfg = small_config(3, Metric::L2, 100);
     cfg.fields = vec![Field::int("a")];
-    let mut c = Collection::create(&other, cfg.clone(), test_opts()).unwrap();
+    let c = Collection::create(&other, cfg.clone(), test_opts()).unwrap();
     c.upsert(1, &[1.0, 2.0, 3.0], &Attrs::new().int("a", 4)).unwrap();
-    let wal = c.wal.path().to_path_buf();
+    let wal = c.wal_path();
     drop(c);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();

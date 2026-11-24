@@ -48,10 +48,24 @@
 //! after that. Opening replays the WAL on top of the manifest's state and
 //! removes files no manifest refers to.
 //!
-//! **Concurrency.** One writer: writes take `&mut self` and searches `&self`,
-//! and nothing runs in the background. Sealed segments are shared through
-//! `Arc` and only their tombstones change (atomically), so a later version
-//! can search a snapshot of the segment list while a writer works.
+//! **Concurrency.** A collection is shared by threads through `&self`.
+//! Writes are applied one batch at a time, in sequence-number order, under
+//! a writer lock; a batch becomes visible to searches all at once. A
+//! search reads a snapshot: the segment list current when it starts (a
+//! flush or a build replaces the list, never changes it) and the writes up
+//! to the last one applied then. Later writes stay invisible to it, though
+//! they change shared state: growing rows carry the sequence numbers of
+//! the writes that inserted and deleted them, and deletes in sealed
+//! segments keep their numbers until no open search predates them. So a
+//! search never sees part of a batch, an id twice, or an upserted id
+//! missing. [`Collection::get`] and [`Collection::contains`] read the same
+//! way.
+//!
+//! **Group commit.** Writers that arrive while a batch is being logged
+//! queue up; the next of them logs every waiting batch with one WAL write
+//! and, under [`Durability::Sync`], one fsync. Each batch is still its own
+//! WAL record, so a crash keeps or drops batches whole. Index builds run while searches and writes go on; only their
+//! commit takes the writer lock (see `maintain`).
 
 mod bitmap;
 mod bytes;
@@ -63,9 +77,11 @@ pub mod meta;
 mod segment;
 mod wal;
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::disk::{DiskIndex, DiskOpenOptions, DiskSearchParams, IoMode, Layout};
 use crate::distance::{Metric, check_finite, normalize};
@@ -80,7 +96,7 @@ use manifest::{MANIFEST, Manifest, SegmentEntry, SegmentKind};
 use bitmap::Bitmap;
 use columns::{AttrWriter, SegmentAttrs, decode_row, encode_row};
 use filter::Compiled;
-use segment::{Body, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
+use segment::{AsOf, Body, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
 use wal::{LoggedOp, Wal, wal_name};
 
 pub use filter::Filter;
@@ -328,6 +344,15 @@ pub struct CollectionStats {
     pub wal_bytes: u64,
     /// Sequence number the next write gets.
     pub next_seq: u64,
+    /// Deletes kept with their sequence numbers for open searches.
+    pub delete_records: usize,
+    /// Why the last flush a write started failed, until one succeeds.
+    pub flush_error: Option<String>,
+    /// Since the collection was opened: write batches, the groups they
+    /// were logged in (one WAL write each), and WAL fsyncs.
+    pub write_batches: u64,
+    pub write_groups: u64,
+    pub wal_syncs: u64,
 }
 
 /// What [`Collection::open`] found.
@@ -338,74 +363,140 @@ pub struct OpenReport {
     pub removed: Vec<String>,
 }
 
-/// The in-memory state: segments and the next sequence number.
-struct State {
-    config: CollectionConfig,
-    growing: Growing,
+/// The segments a search reads. Flushes and builds replace the view (they
+/// never change one in place), so a search keeps a consistent list of
+/// segments for as long as it runs.
+pub(crate) struct View {
     /// Oldest first, in manifest order.
     sealed: Vec<Arc<Sealed>>,
+    /// Appended to by the writer.
+    growing: Arc<RwLock<Growing>>,
+}
+
+/// What only the writer touches.
+struct Writer {
+    /// The manifest on disk (its `segments` in the same order as the
+    /// view's sealed segments).
+    manifest: Manifest,
+    wal: Wal,
+    /// Sequence number the next write gets.
     next_seq: u64,
-    scratch: Vec<f32>,
-    row_buf: Vec<u8>,
+    /// The last flush that a write started and that failed, if the next
+    /// one has not succeeded yet.
+    flush_error: Option<String>,
+    /// Since the collection was opened: batches logged, groups they were
+    /// logged in, fsyncs.
+    batches: u64,
+    groups: u64,
+    syncs: u64,
 }
 
-impl State {
-    fn contains(&self, id: u64) -> bool {
-        self.growing.row_of(id).is_some() || self.sealed.iter().any(|s| s.find(id).is_some())
-    }
+/// A write batch checked and encoded by its caller, ready to log and apply.
+#[derive(Default)]
+struct Prepared {
+    /// Per op: the id, and whether it is an upsert.
+    ops: Vec<(u64, bool)>,
+    /// Upserts: prepared vectors and encoded attribute rows, in order.
+    vectors: Vec<f32>,
+    rows: Vec<u8>,
+    row_end: Vec<usize>,
+    /// The ops as the WAL records them.
+    wal: Vec<u8>,
+}
 
-    /// Deletes the live row of `id`, if any.
-    fn delete(&mut self, id: u64) -> bool {
-        if self.growing.delete(id) {
-            return true;
-        }
-        // Newest first: a re-inserted id is most likely in a recent segment.
-        for s in self.sealed.iter().rev() {
-            if let Some(pos) = s.find(id) {
-                s.tomb.set(pos);
-                return true;
-            }
-        }
-        false
-    }
+/// Write batches waiting for the writer lock (group commit).
+#[derive(Default)]
+struct Queue {
+    /// In arrival order, with their tickets.
+    pending: VecDeque<(u64, Prepared)>,
+    /// Results of batches logged and applied, by ticket.
+    done: HashMap<u64, Result<Vec<bool>>>,
+    next_ticket: u64,
+    /// A writer is logging a group.
+    leading: bool,
+}
 
-    /// `attrs` must already be valid for the collection's fields.
-    fn upsert(&mut self, id: u64, vector: &[f32], attrs: &Attrs) {
-        self.delete(id);
-        let mut v = std::mem::take(&mut self.scratch);
-        v.clear();
-        v.extend_from_slice(vector);
-        if self.config.metric.needs_normalization() {
-            normalize(&mut v);
-        }
-        let mut row = std::mem::take(&mut self.row_buf);
-        row.clear();
-        if !self.config.fields.is_empty() {
-            encode_row(attrs, &self.config.fields, &mut row);
-        }
-        self.growing.push(id, &v, &row);
-        self.scratch = v;
-        self.row_buf = row;
-    }
+/// Vector bytes of the growing segment a search scans per read lock.
+const GROWING_CHUNK_BYTES: usize = 1 << 20;
 
-    fn apply(&mut self, op: &WriteOp) {
-        match *op {
-            WriteOp::Upsert { id, vector, attrs } => self.upsert(id, vector, attrs),
-            WriteOp::Delete { id } => {
-                self.delete(id);
+/// Rows of the growing segment a search scans per read lock: whole blocks
+/// of the scan, about `GROWING_CHUNK_BYTES` of vectors. Tests use 3 rows,
+/// so their few growing rows still cross chunk boundaries.
+fn growing_chunk_rows(dim: usize) -> usize {
+    if cfg!(test) {
+        return 3;
+    }
+    (GROWING_CHUNK_BYTES / (dim * 4)).max(256) / 256 * 256
+}
+
+/// Most WAL bytes logged as one group (a single larger batch goes alone).
+const GROUP_BYTES: usize = 16 << 20;
+
+/// Set while a writer logs a group: if it panics, the group's writers get
+/// an error instead of waiting forever.
+struct Leading<'a> {
+    c: &'a Collection,
+    tickets: Vec<u64>,
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        if self.tickets.is_empty() {
+            return;
+        }
+        let mut q = self.c.queue.lock().unwrap_or_else(|e| e.into_inner());
+        for &t in &self.tickets {
+            q.done.insert(t, Err(Error::InvalidArgument("the writer logging this batch panicked".into())));
+        }
+        q.leading = false;
+        self.c.queue_cv.notify_all();
+    }
+}
+
+/// A search's view of the collection: the segments, and the last write it
+/// sees. Registered while it lives, so deletes it predates keep their
+/// sequence numbers.
+struct Snapshot<'a> {
+    c: &'a Collection,
+    view: Arc<View>,
+    seq: u64,
+}
+
+impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        let mut open = self.c.snapshots.lock().unwrap();
+        if let Some(n) = open.get_mut(&self.seq) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.seq);
             }
         }
     }
 }
 
+/// A collection: shared by any number of threads (`&self` everywhere).
+/// Writes are applied one batch at a time, in order; each search reads a
+/// snapshot (see the module docs).
 pub struct Collection {
     dir: PathBuf,
     _lock: File,
     opts: OpenOptions,
-    /// The manifest on disk.
-    manifest: Manifest,
-    wal: Wal,
-    state: State,
+    config: CollectionConfig,
+    /// Held while a batch is logged and applied, and while a flush or an
+    /// index build commits.
+    writer: Mutex<Writer>,
+    /// Batches waiting to be logged; one waiting writer at a time logs all
+    /// that are waiting, with one WAL write and (under `Sync`) one fsync.
+    queue: Mutex<Queue>,
+    queue_cv: Condvar,
+    /// The segments searches start from.
+    view: RwLock<Arc<View>>,
+    /// The last write applied: new snapshots read as of it.
+    visible: AtomicU64,
+    /// Open snapshots: sequence number -> how many.
+    snapshots: Mutex<BTreeMap<u64, usize>>,
+    /// One `maintain` or `optimize` at a time.
+    maintaining: Mutex<()>,
 }
 
 impl Collection {
@@ -443,15 +534,8 @@ impl Collection {
         let wal = Wal::create(dir, 1, config.dim)?;
         sync_parent_dir(wal.path())?;
         manifest.write(dir)?;
-        let state = State {
-            growing: Growing::new(config.dim, &config.fields),
-            config,
-            sealed: Vec::new(),
-            next_seq: 1,
-            scratch: Vec::new(),
-            row_buf: Vec::new(),
-        };
-        Ok(Self { dir: dir.to_path_buf(), _lock: lock, opts, manifest, wal, state })
+        let growing = Growing::new(config.dim, &config.fields);
+        Ok(Self::assemble(dir, lock, opts, config, manifest, wal, Vec::new(), growing, 1))
     }
 
     /// Opens the collection in `dir`: loads its segments, replays the WAL
@@ -465,60 +549,113 @@ impl Collection {
         for e in &manifest.segments {
             sealed.push(Arc::new(load_segment(dir, &config, e, &opts)?));
         }
-        let mut state = State {
-            growing: Growing::new(config.dim, &config.fields),
-            config,
-            sealed,
-            next_seq: manifest.flushed_seq + 1,
-            scratch: Vec::new(),
-            row_buf: Vec::new(),
-        };
-        let fields = state.config.fields.clone();
-        let (wal, replay) =
-            Wal::replay(dir, manifest.wal_gen, state.config.dim, state.next_seq, |seq, op| {
-                match op {
-                    LoggedOp::Upsert { id, vector, attrs } => {
-                        let a = Attrs::decode(attrs)?;
-                        a.validate(&fields).map_err(|e| Error::Corrupt(format!("WAL write {seq}: {e}")))?;
-                        state.upsert(id, vector, &a);
+        let mut growing = Growing::new(config.dim, &config.fields);
+        let mut next_seq = manifest.flushed_seq + 1;
+        let (mut vector, mut row) = (Vec::new(), Vec::new());
+        let (wal, replay) = Wal::replay(dir, manifest.wal_gen, config.dim, next_seq, |seq, op| {
+            match op {
+                LoggedOp::Upsert { id, vector: v, attrs } => {
+                    let a = Attrs::decode(attrs)?;
+                    a.validate(&config.fields).map_err(|e| Error::Corrupt(format!("WAL write {seq}: {e}")))?;
+                    prepare_vector(config.metric, v, &mut vector);
+                    row.clear();
+                    if !config.fields.is_empty() {
+                        encode_row(&a, &config.fields, &mut row);
                     }
-                    LoggedOp::Delete { id } => {
-                        state.delete(id);
-                    }
+                    delete_live(&sealed, &mut growing, id, seq);
+                    growing.push(id, &vector, &row, seq);
                 }
-                state.next_seq = seq + 1;
-                Ok(())
-            })?;
+                LoggedOp::Delete { id } => {
+                    delete_live(&sealed, &mut growing, id, seq);
+                }
+            }
+            next_seq = seq + 1;
+            Ok(())
+        })?;
         // Only once everything the manifest names has loaded.
         let removed = remove_unreferenced(dir, &manifest)?;
-        let c = Self { dir: dir.to_path_buf(), _lock: lock, opts, manifest, wal, state };
+        let c = Self::assemble(dir, lock, opts, config, manifest, wal, sealed, growing, next_seq);
         Ok((c, OpenReport { replay, removed }))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        dir: &Path,
+        lock: File,
+        opts: OpenOptions,
+        config: CollectionConfig,
+        manifest: Manifest,
+        wal: Wal,
+        sealed: Vec<Arc<Sealed>>,
+        growing: Growing,
+        next_seq: u64,
+    ) -> Self {
+        let view = View { sealed, growing: Arc::new(RwLock::new(growing)) };
+        Self {
+            dir: dir.to_path_buf(),
+            _lock: lock,
+            opts,
+            config,
+            writer: Mutex::new(Writer { manifest, wal, next_seq, flush_error: None, batches: 0, groups: 0, syncs: 0 }),
+            queue: Mutex::new(Queue::default()),
+            queue_cv: Condvar::new(),
+            view: RwLock::new(Arc::new(view)),
+            visible: AtomicU64::new(next_seq - 1),
+            snapshots: Mutex::new(BTreeMap::new()),
+            maintaining: Mutex::new(()),
+        }
+    }
+
     pub fn config(&self) -> &CollectionConfig {
-        &self.state.config
+        &self.config
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// Live rows.
+    /// The current view (not registered as a snapshot).
+    fn view(&self) -> Arc<View> {
+        self.view.read().unwrap().clone()
+    }
+
+    /// The view and the last write applied, read together (no flush or
+    /// build can swap the view in between), and registered.
+    fn snapshot(&self) -> Snapshot<'_> {
+        let mut open = self.snapshots.lock().unwrap();
+        let (view, seq) = {
+            let v = self.view.read().unwrap();
+            (v.clone(), self.visible.load(Ordering::Acquire))
+        };
+        *open.entry(seq).or_insert(0) += 1;
+        drop(open);
+        Snapshot { c: self, view, seq }
+    }
+
+    /// Live rows now.
     pub fn len(&self) -> usize {
-        self.state.growing.live() + self.state.sealed.iter().map(|s| s.live()).sum::<usize>()
+        let v = self.view();
+        let g = v.growing.read().unwrap().live();
+        g + v.sealed.iter().map(|s| s.live()).sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Whether `id` has a live row (as of the last write applied).
     pub fn contains(&self, id: u64) -> bool {
-        self.state.contains(id)
+        let snap = self.snapshot();
+        locate_at(&snap.view, id, snap.seq).is_some()
     }
 
     pub fn stats(&self) -> CollectionStats {
-        let segments = self
-            .state
+        let (wal_bytes, next_seq, flush_error, writes) = {
+            let w = self.writer.lock().unwrap();
+            (w.wal.bytes(), w.next_seq, w.flush_error.clone(), (w.batches, w.groups, w.syncs))
+        };
+        let v = self.view();
+        let segments = v
             .sealed
             .iter()
             .map(|s| SegmentInfo {
@@ -534,36 +671,91 @@ impl Collection {
                 attr_values: s.attrs.as_ref().map_or(0, |a| a.columns.values()),
             })
             .collect();
+        let g = v.growing.read().unwrap();
         CollectionStats {
-            live: self.len(),
-            growing_rows: self.state.growing.rows(),
-            growing_live: self.state.growing.live(),
-            growing_attr_bytes: self.state.growing.attr_ram(),
+            live: g.live() + v.sealed.iter().map(|s| s.live()).sum::<usize>(),
+            growing_rows: g.rows(),
+            growing_live: g.live(),
+            growing_attr_bytes: g.attr_ram(),
             segments,
-            wal_bytes: self.wal.bytes(),
-            next_seq: self.state.next_seq,
+            wal_bytes,
+            next_seq,
+            delete_records: v.sealed.iter().map(|s| s.tomb.recent_len()).sum(),
+            flush_error,
+            write_batches: writes.0,
+            write_groups: writes.1,
+            wal_syncs: writes.2,
         }
     }
 
-    pub fn upsert(&mut self, id: u64, vector: &[f32], attrs: &Attrs) -> Result<()> {
+    pub fn upsert(&self, id: u64, vector: &[f32], attrs: &Attrs) -> Result<()> {
         self.write(&[WriteOp::Upsert { id, vector, attrs }])
     }
 
-    /// Deletes `id`; returns whether it was there.
-    pub fn delete(&mut self, id: u64) -> Result<bool> {
-        let had = self.contains(id);
-        self.write(&[WriteOp::Delete { id }])?;
-        Ok(had)
+    /// Deletes `id`; returns whether it had a live row.
+    pub fn delete(&self, id: u64) -> Result<bool> {
+        Ok(self.write_ops(&[WriteOp::Delete { id }])?[0])
     }
 
     /// Applies `ops` in order as one batch: logged as one WAL record, so a
-    /// crash keeps all of them or none. Seals the growing segment when it
-    /// is full; if that fails, the batch is still applied and logged.
-    pub fn write(&mut self, ops: &[WriteOp]) -> Result<()> {
+    /// crash keeps all of them or none, and searches see all of them or
+    /// none. Seals the growing segment when it is full; a failed seal does
+    /// not fail the write (it is logged and applied), and is retried by
+    /// the next write (see [`CollectionStats::flush_error`]).
+    pub fn write(&self, ops: &[WriteOp]) -> Result<()> {
+        self.write_ops(ops).map(|_| ())
+    }
+
+    /// As `write`; per op, whether its id had a live row.
+    fn write_ops(&self, ops: &[WriteOp]) -> Result<Vec<bool>> {
         if ops.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        let cfg = &self.state.config;
+        let p = self.prepare(ops)?;
+        let mut q = self.queue.lock().unwrap();
+        let ticket = q.next_ticket;
+        q.next_ticket += 1;
+        q.pending.push_back((ticket, p));
+        loop {
+            if let Some(r) = q.done.remove(&ticket) {
+                return r;
+            }
+            if q.leading {
+                q = self.queue_cv.wait(q).unwrap();
+                continue;
+            }
+            // Log everything waiting (up to GROUP_BYTES), this batch
+            // included unless older ones fill the group.
+            q.leading = true;
+            let mut group = Vec::new();
+            let mut bytes = 0;
+            while let Some((_, p)) = q.pending.front() {
+                if !group.is_empty() && bytes + p.wal.len() > GROUP_BYTES {
+                    break;
+                }
+                bytes += p.wal.len();
+                group.push(q.pending.pop_front().unwrap());
+            }
+            drop(q);
+            let mut leading = Leading { c: self, tickets: group.iter().map(|(t, _)| *t).collect() };
+            let results = {
+                let batches: Vec<&Prepared> = group.iter().map(|(_, p)| p).collect();
+                let mut w = self.writer.lock().unwrap();
+                self.commit(&mut w, &batches)
+            };
+            q = self.queue.lock().unwrap();
+            assert_eq!(results.len(), leading.tickets.len(), "one result per batch");
+            for (t, r) in leading.tickets.drain(..).zip(results) {
+                q.done.insert(t, r);
+            }
+            q.leading = false;
+            self.queue_cv.notify_all();
+        }
+    }
+
+    /// Checks `ops` and encodes them, outside any lock.
+    fn prepare(&self, ops: &[WriteOp]) -> Result<Prepared> {
+        let cfg = &self.config;
         for op in ops {
             if let WriteOp::Upsert { vector, attrs, .. } = op {
                 if vector.len() != cfg.dim {
@@ -576,60 +768,141 @@ impl Collection {
         if ops.len() > u32::MAX as usize || Wal::record_bytes(cfg.dim, ops) > wal::MAX_BATCH_BYTES {
             return Err(Error::InvalidArgument("write batch too large: split it".into()));
         }
-        self.wal.append(self.state.next_seq, ops, self.opts.durability)?;
+        let mut p = Prepared::default();
+        Wal::encode_ops(ops, &mut p.wal);
+        let mut v = Vec::new();
         for op in ops {
-            self.state.apply(op);
+            match *op {
+                WriteOp::Upsert { id, vector, attrs } => {
+                    p.ops.push((id, true));
+                    prepare_vector(cfg.metric, vector, &mut v);
+                    p.vectors.extend_from_slice(&v);
+                    if !cfg.fields.is_empty() {
+                        encode_row(attrs, &cfg.fields, &mut p.rows);
+                    }
+                    p.row_end.push(p.rows.len());
+                }
+                WriteOp::Delete { id } => p.ops.push((id, false)),
+            }
         }
-        self.state.next_seq += ops.len() as u64;
-        // The WAL check bounds the log of a workload that mostly deletes.
-        let seal = self.state.config.seal_bytes;
-        if self.state.growing.bytes() >= seal || self.wal.bytes() >= seal.saturating_mul(2) {
-            self.flush()?;
-        }
-        Ok(())
+        Ok(p)
     }
 
-    /// The stored vector and attributes of `id`. Vectors come back as
-    /// stored: unit length for cosine, rounded by f16 / bf16 storage.
-    pub fn get(&self, id: u64) -> Result<Option<(Vec<f32>, Attrs)>> {
-        let g = &self.state.growing;
-        let fields = &self.state.config.fields;
-        if let Some(r) = g.row_of(id) {
-            let attrs = if fields.is_empty() { Attrs::default() } else { decode_row(g.attrs(r), fields)? };
-            return Ok(Some((g.vector(r).to_vec(), attrs)));
+    /// Logs `batches` (with one fsync under `Sync`), applies them in order
+    /// and makes them visible; then seals the growing segment if it is
+    /// full. Per batch: per op, whether its id had a live row.
+    fn commit(&self, w: &mut Writer, batches: &[&Prepared]) -> Vec<Result<Vec<bool>>> {
+        let first = w.next_seq;
+        let mut records = Vec::with_capacity(batches.len());
+        let mut seq = first;
+        for p in batches {
+            records.push((seq, p.ops.len() as u32, &p.wal[..]));
+            seq += p.ops.len() as u64;
         }
-        for s in self.state.sealed.iter().rev() {
-            let Some(pos) = s.find(id) else { continue };
-            let attrs = match &s.attrs {
-                Some(a) => a.row(pos, fields)?,
-                None => Attrs::default(),
-            };
-            let v = match &s.body {
-                Body::Flat(store) => store.vector(pos).to_vec(),
-                Body::Disk { index, .. } => {
-                    let mut v = vec![0.0; index.dim()];
-                    let f = File::open(&s.files[0])?;
-                    index.read_node_vectors(&f, index.node_of(pos), &mut v)?;
-                    v
+        if let Err(e) = w.wal.append_group(&records, self.opts.durability) {
+            return batches.iter().map(|_| Err(e.duplicate())).collect();
+        }
+        w.batches += batches.len() as u64;
+        w.groups += 1;
+        w.syncs += (self.opts.durability == Durability::Sync) as u64;
+        let view = self.view();
+        let dim = self.config.dim;
+        let mut out = Vec::with_capacity(batches.len());
+        {
+            let mut g = view.growing.write().unwrap();
+            let mut seq = first;
+            for p in batches {
+                let mut had = Vec::with_capacity(p.ops.len());
+                let mut u = 0;
+                for &(id, upsert) in &p.ops {
+                    had.push(delete_live(&view.sealed, &mut g, id, seq));
+                    if upsert {
+                        let row = &p.rows[if u == 0 { 0 } else { p.row_end[u - 1] }..p.row_end[u]];
+                        g.push(id, &p.vectors[u * dim..(u + 1) * dim], row, seq);
+                        u += 1;
+                    }
+                    seq += 1;
                 }
-            };
-            return Ok(Some((v, attrs)));
+                out.push(Ok(had));
+            }
         }
-        Ok(None)
+        w.next_seq = seq;
+        self.visible.store(seq - 1, Ordering::Release);
+        self.prune(&view);
+        // The WAL check bounds the log of a workload that mostly deletes.
+        let seal = self.config.seal_bytes;
+        let full = view.growing.read().unwrap().bytes() >= seal || w.wal.bytes() >= seal.saturating_mul(2);
+        if full {
+            w.flush_error = self.flush_locked(w).err().map(|e| e.to_string());
+        }
+        out
+    }
+
+    /// Drops the sequence numbers of deletes that no open snapshot predates.
+    fn prune(&self, view: &View) {
+        let oldest = self.snapshots.lock().unwrap().keys().next().copied();
+        let upto = oldest.unwrap_or_else(|| self.visible.load(Ordering::Acquire));
+        view.sealed.iter().for_each(|s| s.tomb.prune(upto));
+    }
+
+    /// The stored vector and attributes of `id` (as of the last write
+    /// applied). Vectors come back as stored: unit length for cosine,
+    /// rounded by f16 / bf16 storage.
+    pub fn get(&self, id: u64) -> Result<Option<(Vec<f32>, Attrs)>> {
+        self.get_in(&self.snapshot(), id)
+    }
+
+    fn get_in(&self, snap: &Snapshot, id: u64) -> Result<Option<(Vec<f32>, Attrs)>> {
+        let fields = &self.config.fields;
+        match locate_at(&snap.view, id, snap.seq) {
+            None => Ok(None),
+            Some(Place::Growing(r)) => {
+                let g = snap.view.growing.read().unwrap();
+                let attrs = if fields.is_empty() { Attrs::default() } else { decode_row(g.attrs(r), fields)? };
+                Ok(Some((g.vector(r).to_vec(), attrs)))
+            }
+            Some(Place::Sealed(i, pos)) => {
+                let s = &snap.view.sealed[i];
+                let attrs = match &s.attrs {
+                    Some(a) => a.row(pos, fields)?,
+                    None => Attrs::default(),
+                };
+                let v = match &s.body {
+                    Body::Flat(store) => store.vector(pos).to_vec(),
+                    Body::Disk { index, .. } => {
+                        let mut v = vec![0.0; index.dim()];
+                        index.read_node_vectors(s.raw.as_ref().expect("SSD segment"), index.node_of(pos), &mut v)?;
+                        v
+                    }
+                };
+                Ok(Some((v, attrs)))
+            }
+        }
     }
 
     pub fn search(&self, query: &[f32], k: usize, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
         Ok(self.search_with_stats(query, k, opts)?.0)
     }
 
-    /// The `k` nearest live rows over all segments, closest first.
+    /// The `k` nearest live rows over all segments, closest first, as of
+    /// the last write applied when the search starts.
     pub fn search_with_stats(
         &self,
         query: &[f32],
         k: usize,
         opts: &SearchOptions,
     ) -> Result<(Vec<SearchResult>, SearchStats)> {
-        let cfg = &self.state.config;
+        self.search_in(&self.snapshot(), query, k, opts)
+    }
+
+    fn search_in(
+        &self,
+        snap: &Snapshot,
+        query: &[f32],
+        k: usize,
+        opts: &SearchOptions,
+    ) -> Result<(Vec<SearchResult>, SearchStats)> {
+        let cfg = &self.config;
         if query.len() != cfg.dim {
             return Err(Error::DimensionMismatch { expected: cfg.dim, got: query.len() });
         }
@@ -652,29 +925,45 @@ impl Collection {
                 c => Some(c),
             },
         };
+        let seq = snap.seq;
 
-        let g = &self.state.growing;
-        if g.live() > 0 {
-            st.segments += 1;
-            let push = |r: usize, d: f32| top.push(g.ids[r], d);
-            match &filter {
-                None => st.scanned += segment::scan(kern, cfg.metric, &q, &g.data, |r| !g.is_dead(r), push),
-                Some(c) => {
-                    let m = c.eval(g.cols.as_ref().expect("a filter with fields"));
-                    let n = segment::scan(kern, cfg.metric, &q, &g.data, |r| m.get(r) && !g.is_dead(r), push);
-                    st.scanned += n;
-                    st.matched += n;
-                }
-            }
-        }
-        for s in &self.state.sealed {
-            if s.live() == 0 {
-                continue;
-            }
+        let n = snap.view.growing.read().unwrap().rows_at(seq);
+        if n > 0 {
             st.segments += 1;
             let matching = filter.as_ref().map(|c| {
+                c.eval(snap.view.growing.read().unwrap().cols.as_ref().expect("a filter with fields"))
+            });
+            // In chunks, each under its own read lock: a write waits for
+            // one chunk, not a whole scan (and searches arriving meanwhile
+            // wait for the write). Rows the writer adds or deletes between
+            // chunks are newer than the snapshot.
+            let chunk = growing_chunk_rows(cfg.dim);
+            let mut start = 0;
+            while start < n {
+                let end = (start + chunk).min(n);
+                let g = snap.view.growing.read().unwrap();
+                let rows = &g.data[start * cfg.dim..end * cfg.dim];
+                let push = |r: usize, d: f32| top.push(g.ids[start + r], d);
+                let scanned = match &matching {
+                    None => segment::scan(kern, cfg.metric, &q, rows, |r| g.live_at(start + r, seq), push),
+                    Some(m) => {
+                        let admit = |r: usize| m.get(start + r) && g.live_at(start + r, seq);
+                        segment::scan(kern, cfg.metric, &q, rows, admit, push)
+                    }
+                };
+                st.scanned += scanned;
+                if matching.is_some() {
+                    st.matched += scanned;
+                }
+                start = end;
+            }
+        }
+        for s in &snap.view.sealed {
+            st.segments += 1;
+            let deleted = AsOf::new(&s.tomb, seq);
+            let matching = filter.as_ref().map(|c| {
                 let mut m = c.eval(&s.attrs.as_ref().expect("a filter with fields").columns);
-                s.remove_deleted(&mut m);
+                deleted.remove_from(&mut m);
                 m
             });
             if let Some(m) = &matching {
@@ -688,7 +977,7 @@ impl Collection {
                 Body::Flat(store) => {
                     let push = |p: usize, d: f32| top.push(store.id(p), d);
                     st.scanned += match &matching {
-                        None => segment::scan(kern, cfg.metric, &q, store.raw_vectors(), |p| !s.tomb.is_set(p), push),
+                        None => segment::scan(kern, cfg.metric, &q, store.raw_vectors(), |p| !deleted.deleted(p), push),
                         Some(m) => segment::scan(kern, cfg.metric, &q, store.raw_vectors(), |p| m.get(p), push),
                     };
                 }
@@ -696,7 +985,7 @@ impl Collection {
                     let res = match &matching {
                         None => {
                             let live = s.live() as f64 / s.positions() as f64;
-                            self.search_graph(index, query, k, opts, live, &|p| !s.tomb.is_set(p), &mut st)?
+                            self.search_graph(index, query, k, opts, live, &|p| !deleted.deleted(p), &mut st)?
                         }
                         Some(m) => self.search_disk_filtered(index, query, k, opts, m, &mut st)?,
                     };
@@ -710,39 +999,49 @@ impl Collection {
     /// Seals the growing segment into a flat segment file and writes the
     /// tombstones of every segment that gained deletes, then commits both
     /// with a new manifest and starts a new WAL. Does nothing when there is
-    /// nothing to write.
-    pub fn flush(&mut self) -> Result<()> {
-        let dirty: Vec<usize> = (0..self.state.sealed.len())
-            .filter(|&i| self.state.sealed[i].tomb.count() as u64 != self.manifest.segments[i].deleted)
+    /// nothing to write. Searches go on meanwhile; writes wait.
+    pub fn flush(&self) -> Result<()> {
+        let mut w = self.writer.lock().unwrap();
+        let r = self.flush_locked(&mut w);
+        if r.is_ok() {
+            w.flush_error = None;
+        }
+        r
+    }
+
+    fn flush_locked(&self, w: &mut Writer) -> Result<()> {
+        let view = self.view();
+        let g = view.growing.read().unwrap();
+        let dirty: Vec<usize> = (0..view.sealed.len())
+            .filter(|&i| view.sealed[i].tomb.count() as u64 != w.manifest.segments[i].deleted)
             .collect();
-        if self.state.growing.rows() == 0 && dirty.is_empty() && self.wal.batches() == 0 {
+        if g.rows() == 0 && dirty.is_empty() && w.wal.batches() == 0 {
             return Ok(());
         }
-        let mut m = self.manifest.clone();
+        let cfg = &self.config;
+        let mut m = w.manifest.clone();
         m.generation += 1;
         let mut created: Vec<PathBuf> = Vec::new();
         let mut superseded: Vec<PathBuf> = Vec::new();
         let result = (|| -> Result<(Option<Sealed>, Wal)> {
             // 1. The growing segment's live rows, as a flat segment.
-            let fresh = if self.state.growing.live() > 0 {
-                let g = &self.state.growing;
-                let (store, live) = live_rows(g, self.state.config.dim)?;
+            let fresh = if g.live() > 0 {
+                let (store, live) = live_rows(&g, cfg.dim)?;
                 let id = m.next_segment;
                 m.next_segment += 1;
                 let path = self.dir.join(flat_name(id));
                 created.push(path.clone());
-                write_flat_segment(&path, self.state.config.metric, &store)?;
+                write_flat_segment(&path, cfg.metric, &store)?;
                 let mut files = vec![path];
                 let mut attrs = None;
-                let fields = &self.state.config.fields;
-                if !fields.is_empty() {
+                if !cfg.fields.is_empty() {
                     let ap = self.dir.join(attrs_name(id));
                     created.push(ap.clone());
-                    let mut w = AttrWriter::create(&ap, fields, live.len())?;
+                    let mut aw = AttrWriter::create(&ap, &cfg.fields, live.len())?;
                     for (pos, &r) in live.iter().enumerate() {
-                        w.push(pos, g.attrs(r))?;
+                        aw.push(pos, g.attrs(r))?;
                     }
-                    attrs = Some(w.finish()?);
+                    attrs = Some(aw.finish()?);
                     files.push(ap);
                 }
                 m.segments.push(SegmentEntry {
@@ -758,7 +1057,7 @@ impl Collection {
             };
             // 2. Tombstones that changed.
             for &i in &dirty {
-                let s = &self.state.sealed[i];
+                let s = &view.sealed[i];
                 let path = self.dir.join(del_name(s.id, m.generation));
                 created.push(path.clone());
                 let count = s.tomb.write(&path, s.id)?;
@@ -771,9 +1070,9 @@ impl Collection {
             }
             // 3. A new WAL for the writes after this flush.
             m.wal_gen += 1;
-            let wal = Wal::create(&self.dir, m.wal_gen, self.state.config.dim)?;
+            let wal = Wal::create(&self.dir, m.wal_gen, cfg.dim)?;
             created.push(wal.path().to_path_buf());
-            m.flushed_seq = self.state.next_seq - 1;
+            m.flushed_seq = w.next_seq - 1;
             // 4. Commit: the new files are fsynced, their names too, then
             // the manifest is renamed into place.
             sync_parent_dir(wal.path())?;
@@ -789,27 +1088,77 @@ impl Collection {
                 return Err(e);
             }
         };
+        drop(g);
         // The new manifest is in place, so the state follows it. Until the
         // directory fsync succeeds the rename may not survive a crash, so
         // the old files stay (the next open removes them).
         let durable = sync_parent_dir(&self.dir.join(MANIFEST));
-        superseded.push(self.wal.path().to_path_buf());
-        self.wal = wal;
-        self.manifest = m;
-        if let Some(s) = fresh {
-            self.state.sealed.push(Arc::new(s));
-        }
-        self.state.growing = Growing::new(self.state.config.dim, &self.state.config.fields);
+        superseded.push(w.wal.path().to_path_buf());
+        w.wal = wal;
+        w.manifest = m;
+        let mut sealed = view.sealed.clone();
+        sealed.extend(fresh.map(Arc::new));
+        let growing = Arc::new(RwLock::new(Growing::new(cfg.dim, &cfg.fields)));
+        *self.view.write().unwrap() = Arc::new(View { sealed, growing });
         if let Err(e) = durable {
             // A crash could bring back the old manifest, which does not know
             // the new WAL: take no writes that would go there.
-            self.wal.poison();
+            w.wal.poison();
             return Err(e);
         }
         for p in superseded {
             let _ = fs::remove_file(p);
         }
         Ok(())
+    }
+}
+
+/// Where a live row is.
+enum Place {
+    Growing(usize),
+    /// Index into the view's sealed segments, and the position.
+    Sealed(usize, usize),
+}
+
+/// The row of `id` live as of write `seq` in `view`. An id's rows are
+/// newer in newer segments, so the newest that is not deleted is the one.
+fn locate_at(view: &View, id: u64, seq: u64) -> Option<Place> {
+    if let Some(r) = view.growing.read().unwrap().row_at(id, seq) {
+        return Some(Place::Growing(r));
+    }
+    for (i, s) in view.sealed.iter().enumerate().rev() {
+        if let Some(pos) = s.locate(id)
+            && !s.tomb.deleted_as_of(pos, seq)
+        {
+            return Some(Place::Sealed(i, pos));
+        }
+    }
+    None
+}
+
+/// Deletes the live row of `id`, wherever it is, by write `seq`. Only the
+/// writer calls this, holding `g` (the growing segment of the view whose
+/// sealed segments are `sealed`).
+fn delete_live(sealed: &[Arc<Sealed>], g: &mut Growing, id: u64, seq: u64) -> bool {
+    if g.delete(id, seq) {
+        return true;
+    }
+    // Newest first: a re-inserted id is most likely in a recent segment.
+    for s in sealed.iter().rev() {
+        if let Some(pos) = s.find(id) {
+            s.tomb.delete(pos, seq);
+            return true;
+        }
+    }
+    false
+}
+
+/// `v` as stored: normalized for the metrics that need it.
+fn prepare_vector(metric: Metric, v: &[f32], out: &mut Vec<f32>) {
+    out.clear();
+    out.extend_from_slice(v);
+    if metric.needs_normalization() {
+        normalize(out);
     }
 }
 
@@ -958,7 +1307,7 @@ fn load_segment(dir: &Path, cfg: &CollectionConfig, e: &SegmentEntry, opts: &Ope
             if index.metric() != cfg.metric || index.dim() != cfg.dim {
                 return Err(mismatch("metric or dimension"));
             }
-            Sealed::disk(e.id, index, None, vec![path])
+            Sealed::disk(e.id, index, None, vec![path])?
         }
     };
     if s.positions() as u64 != e.positions {
@@ -1037,6 +1386,38 @@ fn is_ours(name: &str) -> bool {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Collection {
+    pub(crate) fn wal_path(&self) -> PathBuf {
+        self.writer.lock().unwrap().wal.path().to_path_buf()
+    }
+
+    pub(crate) fn wal_bytes(&self) -> u64 {
+        self.writer.lock().unwrap().wal.bytes()
+    }
+
+    /// Makes every later WAL append fail, as a failed fsync does.
+    pub(crate) fn poison_wal(&self) {
+        self.writer.lock().unwrap().wal.poison();
+    }
+
+    pub(crate) fn sealed(&self) -> Vec<Arc<Sealed>> {
+        self.view().sealed.clone()
+    }
+
+    /// Ids with a live row now, one entry per live row.
+    pub(crate) fn live_ids(&self) -> Vec<u64> {
+        let v = self.view();
+        let mut out = Vec::new();
+        for s in &v.sealed {
+            out.extend((0..s.positions()).filter(|&p| !s.tomb.is_set(p)).map(|p| s.id_at(p)));
+        }
+        let g = v.growing.read().unwrap();
+        out.extend((0..g.rows()).filter(|&r| !g.is_dead(r)).map(|r| g.ids[r]));
+        out
     }
 }
 

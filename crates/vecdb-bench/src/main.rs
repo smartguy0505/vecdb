@@ -66,9 +66,10 @@ commands:
   coll-ingest  --base F --dir D [--metric l2] [--batch 1000] [--durability buffered|sync]
                [--seal-mb 32] [--index-mb 64] [--max-ssd 8] [--pq-m M] [--threads 6]
                [--build-mem 2] [--maintain false] [--optimize false] [--secs S] [--limit N]
-               [--labels false]
+               [--labels false] [--writers 1]
                create a collection in D and upsert F (ids = row numbers) through the WAL:
-               rows/s and batch latency; --maintain runs index builds as they fall due,
+               rows/s and batch latency (--writers threads take batches in turn: their
+               batches share WAL writes and fsyncs); --maintain runs index builds as they fall due,
                --optimize merges everything into one SSD index at the end; then reopen.
                --labels adds int fields u (uniform 0..999) and p (bucket of a random
                projection) for coll-filter
@@ -86,6 +87,18 @@ commands:
                (matches far from most queries), near = a slab around each query's own
                projection, none = no filter (the baseline); recall against exact search
                over the matching rows
+  coll-concurrent --from D0 --dir D --base F --query Q [--k 10] [--l 40] [--w 4] [--nq 1000]
+               [--readers 1,2,4,8] [--secs 5] [--writers 0] [--write-batch 100]
+               [--write-rate 0] [--durability buffered|sync] [--churn 0] [--growing 0]
+               [--build false]
+               [--windows 3] [--threads 6] [--direct true]
+               copy collection D0 to D and search it from --readers threads at once for
+               --secs each: QPS, recall, latency; with --writers threads upserting random
+               rows of F (same vectors; --write-rate rows/s in all, 0 = flat out);
+               --churn first deletes that fraction of rows (0.2 or more makes a compaction
+               due; recall is against the rows left), --growing
+               leaves that many upserted rows unsealed (searched by a full scan), and
+               --build then searches while maintain() runs (--threads build threads)
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
@@ -122,6 +135,7 @@ fn run() -> AnyResult<()> {
         "coll-ingest" => coll::ingest(&args),
         "coll-search" => coll::search(&args),
         "coll-filter" => coll::filter(&args),
+        "coll-concurrent" => coll::concurrent(&args),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
