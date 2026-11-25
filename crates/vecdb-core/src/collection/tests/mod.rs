@@ -881,6 +881,39 @@ fn damage_is_found_past_buffered_records() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A merge takes as many of the smallest SSD segments as it has to.
+#[test]
+fn a_merge_takes_the_smallest_segments() {
+    let dir = test_dir("coll-merge-many");
+    let mut cfg = ssd_config(4, Metric::L2, 100_000, 100_000);
+    cfg.max_indexed_segments = 3;
+    let c = Collection::create(&dir, cfg, test_opts()).unwrap();
+    let mut rng = SplitMix64::new(8);
+    let mut model = Model::default();
+    let mut next = 0u64;
+    // By size, the smallest first: 1, 4, 2, 5, 0, 3.
+    for rows in [2500u64, 2100, 2300, 2600, 2200, 2400] {
+        let vs: Vec<Vec<f32>> = (0..rows).map(|_| float_vector(&mut rng, 4)).collect();
+        let ops: Vec<WriteOp> =
+            (next..).zip(&vs).map(|(id, v)| WriteOp::Upsert { id, vector: v, attrs: &NO_ATTRS }).collect();
+        c.write(&ops).unwrap();
+        ops.iter().for_each(|op| model.apply(op));
+        next += rows;
+        c.flush().unwrap();
+        let flat = c.sealed().last().unwrap().id;
+        c.rebuild(&[flat], "test", 2).unwrap();
+    }
+    let ids: Vec<u64> = c.sealed().iter().map(|s| s.id).collect();
+    let jobs = c.maintain().unwrap();
+    let inputs: Vec<(&str, Vec<u64>)> = jobs.iter().map(|j| (j.reason, j.inputs.clone())).collect();
+    assert_eq!(inputs, [("merge", vec![ids[1], ids[2], ids[4], ids[5]])]);
+    let rows: Vec<usize> = c.sealed().iter().map(|s| s.positions()).collect();
+    assert_eq!(rows, [2500, 9000, 2600]);
+    check_approx(&c, &model, &mut rng, 0.9);
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 mod background;
 mod concurrent;
 mod filters;

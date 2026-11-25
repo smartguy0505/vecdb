@@ -90,7 +90,8 @@ impl ProductQuantizer {
             for &r in &rows {
                 sub.extend_from_slice(&data[r * dim + lo..r * dim + hi]);
             }
-            let km = KMeansParams { k: KSUB, iters: p.iters, seed: p.seed.wrapping_add(i as u64 + 1), threads: p.threads };
+            let threads = cancel.threads(p.threads);
+            let km = KMeansParams { k: KSUB, iters: p.iters, seed: p.seed.wrapping_add(i as u64 + 1), threads };
             let centroids = kmeans::train(&sub, dsub, &km)?;
             codebooks[KSUB * lo..KSUB * hi].copy_from_slice(&centroids);
         }

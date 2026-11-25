@@ -87,12 +87,13 @@ pub(crate) mod search;
 mod segment;
 mod wal;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::disk::{DiskIndex, DiskOpenOptions, IoMode, Layout};
 use crate::distance::{Metric, check_finite, normalize};
@@ -102,7 +103,7 @@ use crate::graph::GraphParams;
 use crate::pool::SearchPool;
 use crate::quant::Codec;
 use crate::store::{VectorStore, check_dim};
-use background::{Background, Room, Workers};
+use background::{Background, Room, Waited, Workers};
 use columns::{SegmentAttrs, decode_row, encode_row};
 use manifest::{MANIFEST, Manifest, SegmentEntry, SegmentKind};
 use segment::{Body, Frozen, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
@@ -248,16 +249,23 @@ pub struct OpenOptions {
     pub background: bool,
     /// With `background`: writes wait while flat segments hold more than
     /// this many bytes of vectors (they are in RAM, and every search scans
-    /// them) and an index build or a merge that will take them is due.
-    /// Builds run one at a time, so that is after the one that is running,
-    /// whatever its size, and that of other collections sharing
-    /// [`builds`](Self::builds): minutes, if it is a compaction of a large
-    /// segment. 0 = no limit.
+    /// them) and an index build or a merge that will take them is due. That
+    /// is until the build of the first of them is done (an eighth of the
+    /// limit, or `index_bytes` if that is more), after those of other
+    /// collections that share [`builds`](Self::builds) and came before;
+    /// compactions do not hold it up, but take some of its CPUs. Segments a
+    /// running [`Engine::optimize`] has taken do not count. 0 = no limit.
     pub max_unindexed_bytes: u64,
+    /// Longest wait of a write for flushes or index builds to catch up; then
+    /// it fails with [`Error::Unavailable`], and nothing is written. `None`:
+    /// as long as it takes.
+    pub max_write_wait: Option<Duration>,
     /// Background builds that may run at once, over all collections given
-    /// the same limit. `None`: one per collection.
+    /// the same limit (so many index builds, and so many compactions and
+    /// merges besides). `None`: one of each per collection.
     pub builds: Option<Arc<BuildLimit>>,
-    /// Threads for index builds. 0 = one per CPU, or one per two CPUs for
+    /// Threads for index builds, shared by the builds that run at once under
+    /// one [`builds`](Self::builds). 0 = one per CPU, or one per two CPUs for
     /// background builds, which share the CPUs with searches.
     pub threads: usize,
     /// RAM an index build may use for one partition.
@@ -279,6 +287,7 @@ impl Default for OpenOptions {
             durability: Durability::Sync,
             background: true,
             max_unindexed_bytes: 1 << 30,
+            max_write_wait: None,
             builds: None,
             threads: 0,
             build_memory: 2 << 30,
@@ -513,7 +522,7 @@ impl Drop for Leading<'_> {
         }
         let mut q = self.c.queue.lock().unwrap_or_else(|e| e.into_inner());
         for &t in &self.tickets {
-            q.done.insert(t, Err(Error::InvalidArgument("the writer logging this batch panicked".into())));
+            q.done.insert(t, Err(Error::Unavailable("the writer logging this batch panicked".into())));
         }
         q.leading = false;
         self.c.queue_cv.notify_all();
@@ -598,9 +607,13 @@ pub struct Engine {
     visible: AtomicU64,
     /// Open snapshots: sequence number -> how many.
     snapshots: Mutex<BTreeMap<u64, usize>>,
-    /// One flush at a time, and one `maintain` or `optimize`.
+    /// One flush at a time, and one build per lane. (`optimize` takes both
+    /// lanes, the SSD one first.)
     flushing: Mutex<()>,
-    maintaining: Mutex<()>,
+    lanes: [Mutex<()>; 2],
+    /// The segments a running `optimize` replaces.
+    optimizing: Mutex<BTreeSet<u64>>,
+    limit: Arc<BuildLimit>,
     /// What the background threads, and those waiting for them, share.
     background: Background,
     #[cfg(test)]
@@ -618,7 +631,7 @@ impl Engine {
         fs::create_dir_all(dir)?;
         let lock = lock_dir(dir)?;
         if dir.join(MANIFEST).exists() {
-            return Err(Error::InvalidArgument(format!("{} already holds a collection", dir.display())));
+            return Err(Error::AlreadyExists(format!("collection in {}", dir.display())));
         }
         // Leftovers of a create that did not finish are its WAL and manifest
         // temp file; any other file of ours means a collection lost its
@@ -717,6 +730,7 @@ impl Engine {
         view: View,
         writer: Writer,
     ) -> Self {
+        let limit = opts.builds.clone().unwrap_or_else(|| BuildLimit::new(1));
         Self {
             dir: dir.to_path_buf(),
             _lock: lock,
@@ -730,7 +744,9 @@ impl Engine {
             view: RwLock::new(Arc::new(view)),
             snapshots: Mutex::new(BTreeMap::new()),
             flushing: Mutex::new(()),
-            maintaining: Mutex::new(()),
+            lanes: Default::default(),
+            optimizing: Mutex::default(),
+            limit,
             background: Background::default(),
             #[cfg(test)]
             hook: Mutex::new(None),
@@ -849,7 +865,7 @@ impl Engine {
             next_seq,
             delete_records: v.sealed.iter().map(|s| s.tomb.recent_len()).sum(),
             flush_error: bg.flush_error,
-            build_error: bg.build_error,
+            build_error: bg.build_error.into_iter().flatten().reduce(|a, b| format!("{a}; {b}")),
             flushes: bg.flushes,
             builds: bg.builds,
             write_batches: writes.0,
@@ -872,7 +888,8 @@ impl Engine {
     /// none.
     ///
     /// Waits for room first when flushes or index builds are far behind
-    /// ([`Error::Unavailable`] if that is because they keep failing). A
+    /// ([`Error::Unavailable`] if that is because they keep failing, or after
+    /// [`OpenOptions::max_write_wait`]). A
     /// failed flush alone does not fail a write, which is logged and
     /// applied; it is retried (see [`CollectionStats::flush_error`]).
     pub fn write(&self, ops: &[WriteOp]) -> Result<()> {
@@ -895,11 +912,15 @@ impl Engine {
 
     /// Waits, or fails, while there is no room for another write.
     fn make_room(&self) -> Result<()> {
+        let deadline = self.opts.max_write_wait.and_then(|w| Instant::now().checked_add(w));
         loop {
             match self.room(&self.background.progress()) {
                 Room::Yes => return Ok(()),
-                Room::Wait => {
-                    self.background.wait(|p| !matches!(self.room(p), Room::Wait));
+                Room::Wait(what) => {
+                    let more = |p: &_| !matches!(self.room(p), Room::Wait(_));
+                    if self.background.wait_until(deadline, more) == Waited::Late {
+                        return Err(Error::Unavailable(format!("{what} are behind")));
+                    }
                 }
                 Room::No(why) => {
                     // A last try, as only writes freeze (and, without
@@ -1059,25 +1080,27 @@ impl Engine {
     /// applied). Vectors come back as stored: unit length for cosine,
     /// rounded by f16 / bf16 storage.
     pub fn get(&self, id: u64) -> Result<Option<(Vec<f32>, Attrs)>> {
-        self.get_in(&self.snapshot(), id)
+        self.get_in(&self.snapshot(), id, Fetch::ALL)
     }
 
-    fn get_in(&self, snap: &Snapshot, id: u64) -> Result<Option<(Vec<f32>, Attrs)>> {
-        let fields = &self.config.fields;
+    /// The parts of `id`'s row that `what` asks for, as `snap` sees it.
+    pub(crate) fn get_in(&self, snap: &Snapshot, id: u64, what: Fetch) -> Result<Option<(Vec<f32>, Attrs)>> {
+        let fields: &[Field] = if what.attrs { &self.config.fields } else { &[] };
         match locate_at(&snap.view, id, snap.seq) {
             None => Ok(None),
             Some(Place::Memory(m, r)) => {
                 let g = m.read().unwrap();
                 let attrs = if fields.is_empty() { Attrs::default() } else { decode_row(g.attrs(r), fields)? };
-                Ok(Some((g.vector(r).to_vec(), attrs)))
+                Ok(Some((if what.vector { g.vector(r).to_vec() } else { Vec::new() }, attrs)))
             }
             Some(Place::Sealed(i, pos)) => {
                 let s = &snap.view.sealed[i];
                 let attrs = match &s.attrs {
-                    Some(a) => a.row(pos, fields)?,
-                    None => Attrs::default(),
+                    Some(a) if what.attrs => a.row(pos, fields)?,
+                    _ => Attrs::default(),
                 };
                 let v = match &s.body {
+                    _ if !what.vector => Vec::new(),
                     Body::Flat(store) => store.vector(pos).to_vec(),
                     Body::Disk { index, .. } => {
                         let mut v = vec![0.0; index.dim()];
@@ -1089,6 +1112,18 @@ impl Engine {
             }
         }
     }
+}
+
+/// What to read of a row besides its id.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fetch {
+    pub vector: bool,
+    pub attrs: bool,
+}
+
+impl Fetch {
+    pub const ALL: Self = Self { vector: true, attrs: true };
+    pub const NONE: Self = Self { vector: false, attrs: false };
 }
 
 /// Where a live row is.
@@ -1155,7 +1190,7 @@ pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
     match f.try_lock() {
         Ok(()) => Ok(f),
         Err(fs::TryLockError::WouldBlock) => {
-            Err(Error::InvalidArgument(format!("collection {} is already open", dir.display())))
+            Err(Error::Unavailable(format!("{} is already open", dir.display())))
         }
         Err(fs::TryLockError::Error(e)) => Err(e.into()),
     }

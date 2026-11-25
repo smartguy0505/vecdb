@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vecdb-core", "crates/vecdb-bench"]
+members = ["crates/vecdb-core", "crates/vecdb-server", "crates/vecdb-bench"]
 
 [workspace.package]
 version = "0.1.0"

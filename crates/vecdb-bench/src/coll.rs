@@ -26,6 +26,7 @@ fn open_options(a: &Args) -> AnyResult<OpenOptions> {
         durability,
         background: a.num("background", false)?,
         max_unindexed_bytes: (a.num::<f64>("unindexed-mb", 1024.0)? * (1 << 20) as f64) as u64,
+        max_write_wait: None,
         builds: None,
         pool: if pool > 0 { Some(SearchPool::new(pool, a.num("pool-cpus", 0)?)?) } else { None },
         threads: a.num("threads", 6)?,
@@ -262,7 +263,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     (vecdb_core::kernels::best().dot)(a, b)
 }
 
-fn copy_dir(from: &Path, to: &Path) -> AnyResult<()> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> AnyResult<()> {
     if to.exists() {
         std::fs::remove_dir_all(to)?;
     }
@@ -277,7 +278,7 @@ fn copy_dir(from: &Path, to: &Path) -> AnyResult<()> {
 }
 
 /// Exact top-k over the rows of `base` that `live` keeps, ids = row numbers.
-fn ground_truth(base: &Vecs<f32>, live: &[bool], metric: vecdb_core::Metric, queries: &Vecs<f32>, k: usize) -> AnyResult<Vec<Vec<u64>>> {
+pub(crate) fn ground_truth(base: &Vecs<f32>, live: &[bool], metric: vecdb_core::Metric, queries: &Vecs<f32>, k: usize) -> AnyResult<Vec<Vec<u64>>> {
     let mut flat = FlatIndex::with_capacity(base.dim, metric, live.iter().filter(|&&l| l).count())?;
     for (i, _) in live.iter().enumerate().filter(|(_, l)| **l) {
         flat.add(i as u64, base.row(i))?;

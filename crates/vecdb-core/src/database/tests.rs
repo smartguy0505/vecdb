@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use super::*;
-use crate::collection::{Attrs, Durability, Field, Filter, SearchOptions};
+use crate::collection::{Attrs, Durability, Fetch, Field, Filter, SearchOptions};
 use crate::disk::test_dir;
 use crate::distance::Metric;
 use crate::rng::SplitMix64;
@@ -36,9 +36,13 @@ fn upsert(id: u64, vector: Vec<f32>) -> Op {
     Op::Upsert(Row { id, vector, attrs: Attrs::new().int("n", (id % 10) as i64) })
 }
 
+fn request() -> SearchRequest {
+    SearchRequest::new(vec![0.0; DIM], 3, SearchOptions::default())
+}
+
 /// The ids of all rows, by searching.
 fn ids(c: &ShardedCollection) -> Vec<u64> {
-    let req = SearchRequest { vector: vec![0.0; DIM], k: 100_000, options: SearchOptions::default() };
+    let req = SearchRequest { vector: vec![0.0; DIM], k: 100_000, ..request() };
     let mut ids: Vec<u64> = c.search(&req).unwrap().results.iter().map(|r| r.id).collect();
     ids.sort_unstable();
     ids
@@ -145,8 +149,22 @@ fn shards_together_match_the_model() {
             want.truncate(12);
             let options =
                 SearchOptions { filter: filtered.then(|| Filter::range("n", 2..5)), ..SearchOptions::default() };
-            let got = c.search(&SearchRequest { vector: q, k: 12, options }).unwrap();
+            let fetch = Fetch { vector: rng.next_u64() % 2 == 0, attrs: rng.next_u64() % 2 == 0 };
+            let got = c.search(&SearchRequest { fetch, ..SearchRequest::new(q, 12, options) }).unwrap();
             assert_eq!(got.results.iter().map(|r| (r.distance, r.id)).collect::<Vec<_>>(), want);
+            let rows: Vec<Row> = want
+                .iter()
+                .filter(|_| fetch != Fetch::NONE)
+                .map(|(_, id)| match upsert(*id, model[id].clone()) {
+                    Op::Upsert(r) => Row {
+                        id: r.id,
+                        vector: if fetch.vector { r.vector } else { Vec::new() },
+                        attrs: if fetch.attrs { r.attrs } else { Attrs::new() },
+                    },
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert_eq!(got.rows, rows);
         }
     };
     for round in 0..300 {
@@ -231,11 +249,19 @@ fn shards_elsewhere_are_asked() {
             .map(|i| {
                 let filter = filter.clone().filter(|_| i % 2 == 0);
                 let options = SearchOptions { filter, ..SearchOptions::default() };
-                SearchRequest { vector: vector(&mut rng), k: 15, options }
+                let fetch = if i % 3 == 0 { Fetch::ALL } else { Fetch::NONE };
+                SearchRequest { fetch, ..SearchRequest::new(vector(&mut rng), 15, options) }
             })
             .collect();
         let want: Vec<SearchReply> = reqs.iter().map(|r| c.search(r).unwrap()).collect();
         assert!(want.iter().all(|r| r.results.len() == 15 && r.stats.segments >= 6));
+        assert!(want.iter().step_by(3).all(|r| r.rows.len() == 15) && want[1].rows.is_empty());
+        // As large as allowed, and more.
+        let max_row_bytes: usize = want[0].rows.iter().map(Row::bytes).sum();
+        assert!(max_row_bytes > 15 * (8 + DIM * 4));
+        assert_eq!(c.search(&SearchRequest { max_row_bytes, ..reqs[0].clone() }).unwrap(), want[0]);
+        let less = SearchRequest { max_row_bytes: max_row_bytes - 1, ..reqs[0].clone() };
+        assert!(matches!(c.search(&less), Err(Error::InvalidArgument(_))));
         let with = |away: &[usize], gone: bool| ShardedCollection {
             name: "c".into(),
             config: c.config.clone(),
@@ -263,6 +289,67 @@ fn shards_elsewhere_are_asked() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The rows of a search are as it found them, while others replace and
+/// delete them.
+#[test]
+fn rows_are_as_they_were_found() {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let dir = test_dir("db-rows");
+    let (db, _) = open(&dir);
+    let c = db.create_collection("c", config(60), 2).unwrap();
+    let row = |id: u64, round: u64| {
+        let vector = vec![round as f32, id as f32, 1.0, 0.0];
+        Op::Upsert(Row { id, vector, attrs: Attrs::new().int("n", round as i64) })
+    };
+    c.write((0..100).map(|id| row(id, 0)).collect()).unwrap();
+    let away = ShardedCollection {
+        name: "c".into(),
+        config: c.config.clone(),
+        shards: c.shards.iter().map(|s| Arc::new(Elsewhere(s.clone(), false)) as Arc<dyn Shard>).collect(),
+        pool: c.pool.clone(),
+        dir: PathBuf::new(),
+        dropped: false.into(),
+    };
+    let (stop, rounds) = (AtomicBool::new(false), AtomicU64::new(0));
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for round in 1.. {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                c.write((0..50).map(|id| row(id, round)).collect()).unwrap();
+                c.write((50..60).map(|id| Op::Delete { id }).collect()).unwrap();
+                c.write((50..60).map(|id| row(id, round)).collect()).unwrap();
+                rounds.store(round, Ordering::Relaxed);
+            }
+        });
+        for c in [&*c, &away] {
+            s.spawn(|| {
+                let mut n = 0;
+                while n < 300 || rounds.load(Ordering::Relaxed) < 100 {
+                    n += 1;
+                    let q = vec![0.0; DIM];
+                    let req = SearchRequest { fetch: Fetch::ALL, ..SearchRequest::new(q, 100, SearchOptions::default()) };
+                    let got = c.search(&req).unwrap_or_else(|e| {
+                        stop.store(true, Ordering::Relaxed);
+                        panic!("{e}")
+                    });
+                    assert!(got.results.len() >= 90 && got.results.len() == got.rows.len());
+                    for (found, row) in got.results.iter().zip(&got.rows) {
+                        let (round, id) = (row.vector[0], row.id as f32);
+                        assert_eq!((found.id, row.vector[1]), (row.id, id));
+                        assert_eq!(found.distance, round * round + id * id + 1.0);
+                        assert_eq!(row.attrs, Attrs::new().int("n", round as i64));
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+        }
+    });
+    drop((away, c, db));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// One bad op and nothing is applied, on any shard.
 #[test]
 fn a_bad_op_changes_nothing_on_any_shard() {
@@ -284,7 +371,7 @@ fn a_bad_op_changes_nothing_on_any_shard() {
         }
         c.write(good()).unwrap();
         assert_eq!(c.len().unwrap(), 40);
-        let req = SearchRequest { vector: vec![0.0; DIM + 1], k: 3, options: SearchOptions::default() };
+        let req = SearchRequest { vector: vec![0.0; DIM + 1], ..request() };
         assert!(matches!(c.search(&req), Err(Error::DimensionMismatch { .. })));
     }
     drop(db);
@@ -413,7 +500,7 @@ fn dropping_a_collection_in_use() {
     c.write((0..200).map(|id| upsert(id, vec![1.0; DIM])).collect()).unwrap();
     db.drop_collection("c").unwrap();
     assert!(matches!(db.collection("c"), Err(Error::NotFound(_))));
-    let req = SearchRequest { vector: vec![0.0; DIM], k: 3, options: SearchOptions::default() };
+    let req = request();
     assert!(matches!(c.search(&req), Err(Error::NotFound(_))));
     assert!(matches!(c.write(vec![upsert(1, vec![1.0; DIM])]), Err(Error::NotFound(_))));
     assert!(matches!(c.get(1), Err(Error::NotFound(_))));

@@ -1,6 +1,7 @@
 //! vecdb-bench: dataset tools and the recall/latency harness.
 
 mod coll;
+mod http;
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -106,6 +107,14 @@ commands:
                --background flushes and builds on background threads.
                For all of these, --pool N gives searches N threads to help them, which
                use up to --pool-cpus CPUs (default a quarter of them) for computing
+  http         --from D0 --dir D --base F --query Q --server PROGRAM [--k 10] [--l 40] [--w 4]
+               [--nq 1000] [--passes 2] [--clients 1,4,8] [--rounds 3] [--direct false]
+               [--rows 0] [--batch 100] [--durability buffered|sync]
+               copy collection D0 into two databases in D and search one in this process
+               and the other through the server PROGRAM (vecdb-server), with vectors as
+               JSON numbers and in base64: QPS, recall, latency, and CPU of the engine
+               with the server around it; --rows N also upserts N rows of F into RAM and
+               the log
   kernels      [--dims 32,64,...,8192] [--ms 200] [--repeat 5]
                ns per distance for every kernel set this CPU can run (data in cache)
 
@@ -143,6 +152,7 @@ fn run() -> AnyResult<()> {
         "coll-search" => coll::search(&args),
         "coll-filter" => coll::filter(&args),
         "coll-concurrent" => coll::concurrent(&args),
+        "http" => http::http(&args),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }

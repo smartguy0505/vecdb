@@ -3,8 +3,8 @@
 //! replies are plain owned data, so a shard in another process can stand in
 //! for it.
 
-use crate::collection::{Attrs, Collection, CollectionStats, SearchOptions, SearchStats, WriteOp};
-use crate::error::Result;
+use crate::collection::{Attrs, Collection, CollectionStats, Fetch, SearchOptions, SearchStats, WriteOp};
+use crate::error::{Error, Result};
 use crate::topk::SearchResult;
 
 /// One write.
@@ -33,17 +33,37 @@ pub struct Row {
     pub attrs: Attrs,
 }
 
+impl Row {
+    /// About its size.
+    pub fn bytes(&self) -> usize {
+        8 + self.vector.len() * 4 + self.attrs.encoded_len()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SearchRequest {
     pub vector: Vec<f32>,
     pub k: usize,
     pub options: SearchOptions,
+    /// Of the rows found, in the same snapshot.
+    pub fetch: Fetch,
+    /// Most those may take; the search fails beyond it.
+    pub max_row_bytes: usize,
+}
+
+impl SearchRequest {
+    /// For ids and distances only.
+    pub fn new(vector: Vec<f32>, k: usize, options: SearchOptions) -> Self {
+        Self { vector, k, options, fetch: Fetch::NONE, max_row_bytes: usize::MAX }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SearchReply {
     /// Closest first.
     pub results: Vec<SearchResult>,
+    /// Their rows, if any of them was asked for: what was not is empty.
+    pub rows: Vec<Row>,
     /// Summed over segments and shards.
     pub stats: SearchStats,
 }
@@ -82,8 +102,10 @@ impl Shard for Collection {
     }
 
     fn search(&self, req: &SearchRequest) -> Result<SearchReply> {
-        let (results, stats) = self.search_with_stats(&req.vector, req.k, &req.options)?;
-        Ok(SearchReply { results, stats })
+        let snap = self.snapshot();
+        let (results, stats) = self.search_in(&snap, &req.vector, req.k, &req.options)?;
+        let rows = fetch_rows(&results, req, |id| self.get_in(&snap, id, req.fetch))?;
+        Ok(SearchReply { results, rows, stats })
     }
 
     fn get(&self, id: u64) -> Result<Option<Row>> {
@@ -109,6 +131,30 @@ impl Shard for Collection {
     fn local(&self) -> Option<&Collection> {
         Some(self)
     }
+}
+
+/// The rows of `results`, by `get`, unless nothing is asked for.
+pub(super) fn fetch_rows(
+    results: &[SearchResult],
+    req: &SearchRequest,
+    get: impl Fn(u64) -> Result<Option<(Vec<f32>, Attrs)>>,
+) -> Result<Vec<Row>> {
+    if req.fetch == Fetch::NONE {
+        return Ok(Vec::new());
+    }
+    let mut left = req.max_row_bytes;
+    let row = |r: &SearchResult| {
+        let Some((vector, attrs)) = get(r.id)? else {
+            return Err(Error::Corrupt(format!("row {} was found by a search, but is not there", r.id)));
+        };
+        let row = Row { id: r.id, vector, attrs };
+        left = left.checked_sub(row.bytes()).ok_or_else(|| {
+            let m = format!("the rows found take more than {} bytes: ask for fewer", req.max_row_bytes);
+            Error::InvalidArgument(m)
+        })?;
+        Ok(row)
+    };
+    results.iter().map(row).collect()
 }
 
 /// The shard, of `shards`, that has the row `id`. Part of the format: rows

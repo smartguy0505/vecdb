@@ -103,7 +103,7 @@ pub(crate) fn build(points: &Points, p: &GraphParams, cancel: &Cancel) -> Result
     if n == 0 {
         return Ok((graph, 0));
     }
-    let entry = medoid(points, p.threads);
+    let entry = medoid(points, cancel.threads(p.threads));
     let max_batch = ((n as f64 * MAX_BATCH_FRACTION).ceil() as usize).max(1);
     for pass in 0..p.passes {
         // With two or more passes, all but the last use α = 1 (the paper's schedule).
@@ -122,7 +122,7 @@ pub(crate) fn build(points: &Points, p: &GraphParams, cancel: &Cancel) -> Result
     // Reverse edges may have left lists between R and SLACK * R.
     let over: Vec<u32> = (0..n as u32).filter(|&i| graph[i as usize].len() > p.max_degree).collect();
     let g = &graph;
-    let pruned = par::map_ranges(over.len(), p.threads, |range| {
+    let pruned = par::map_ranges(over.len(), cancel.threads(p.threads), |range| {
         let kern = kernels::best();
         let mut occl = Vec::new();
         range
@@ -215,7 +215,7 @@ fn insert_batch(
 
     // 1. Search and prune every point of the batch against the current graph.
     let g: &[Vec<u32>] = graph;
-    let lists = par::map_ranges(batch.len(), p.threads, |range| {
+    let lists = par::map_ranges(batch.len(), cancel.threads(p.threads), |range| {
         let kern = kernels::best();
         let mut scratch = Scratch::new();
         let mut occl = Vec::new();
@@ -263,7 +263,7 @@ fn insert_batch(
 
     // 3. Add reverse edges; re-prune targets whose lists grew past the slack.
     let g: &[Vec<u32>] = graph;
-    let updates = par::map_ranges(groups.len(), p.threads, |range| {
+    let updates = par::map_ranges(groups.len(), cancel.threads(p.threads), |range| {
         let kern = kernels::best();
         let mut occl = Vec::new();
         range

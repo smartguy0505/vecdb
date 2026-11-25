@@ -12,11 +12,12 @@ with direct I/O and io_uring, and a partitioned build that needs RAM for one
 partition rather than the whole collection. The 100M-vectors-per-node target
 has not been attempted yet: it needs a dedicated machine. Step 6 is done:
 collections with a write-ahead log, segments, deletes, compaction, crash
-recovery and attribute filters. Step 7 is under way: a collection is shared
+recovery and attribute filters. Step 7 is done: a collection is shared
 between threads, with snapshot reads, index builds beside writes and group
 commit (7a); it flushes and builds in the background and searches its
 segments in parallel, and databases hold named collections split into shards
-(7b). A server is next.
+(7b); a server offers them over HTTP (7c). Step 8, the distributed mode, is
+next.
 
 ## Goals
 
@@ -39,15 +40,17 @@ crates/vecdb-core    library: SIMD distance kernels, top-k, stores, flat index,
                      graph index (Vamana), SSD index, collections (WAL,
                      segments, deletes, compaction), databases (named,
                      sharded collections), file formats
+crates/vecdb-server  HTTP/JSON server for a database
 crates/vecdb-bench   CLI: synthetic data, ground truth, segment build, recall/latency runs,
-                     SSD index build and search, collection ingest and search,
-                     kernel micro-benchmark
+                     SSD index build and search, collection ingest and search, the
+                     server against calls in process, kernel micro-benchmark
 ```
 
 `vecdb-core` depends only on the standard library, plus `io-uring` and `libc`
 on Linux (for the SSD index's reads). On other platforms the SSD index is
 written to fall back to positioned reads through the page cache; that path
-has not been built or tested outside Linux yet.
+has not been built or tested outside Linux yet. The server adds `hyper`,
+`tokio`, `serde` and `serde_json`, and runs on Unix only.
 
 ## Build and test
 
@@ -1133,8 +1136,8 @@ writer upserting 5,000 rows/s in batches of 100 (`Buffered`):
   16,592 alone, because every sealed segment stays flat and is scanned in
   full until `maintain` indexes it. Index builds ran at 4,000-5,800 rows/s
   with 6 threads in step 6, far slower than such a writer. Background builds
-  (step 7b) bound the unindexed rows by making such a writer wait, which can
-  take minutes (see below).
+  (step 7b) bound the unindexed rows by making such a writer wait (see steps
+  7b and 7c).
 - Fresh rows are therefore the next search cost to cut: an interim index or
   int8 codes for growing and flat rows (a quarter of the memory traffic), or
   smaller seals.
@@ -1193,7 +1196,7 @@ $B coll-concurrent ... --readers 4 --secs 25 --churn 0.25 --build true --windows
 let (db, report) = Database::open("data", &DatabaseOptions::default())?;
 let c = db.create_collection("docs", CollectionConfig::new(128, Metric::L2), 4)?; // 4 shards
 c.write(vec![Op::Upsert(Row { id: 42, vector, attrs: Attrs::default() })])?;
-let reply = c.search(&SearchRequest { vector: query, k: 10, options: SearchOptions::default() })?;
+let reply = c.search(&SearchRequest::new(query, 10, SearchOptions::default()))?;
 ```
 
 **Flushes.** The write that fills the growing segment only freezes it: the
@@ -1215,11 +1218,15 @@ while writes and searches go on.
   the growing segment is left to grow to 4 times its size, and then writes
   get the error.
 
-**Builds.** Another thread per collection runs the index builds and
-compactions that are due, on half of the CPUs unless told otherwise. All
-collections of a database share a limit of builds at once (default 1).
+**Builds.** Two more threads per collection run the jobs that are due: one
+those of flat segments (index builds, and merges of flat segments that are
+mostly deleted), the other those of SSD segments (compactions and merges).
 Writes wait while the flat segments take more than `max_unindexed_bytes` (1
-GiB) and an index build is due. Dropping a collection stops its build early.
+GiB) and an index build is due, or fail with `Unavailable` after
+`max_write_wait` (off by default); see below for what they wait for.
+Dropping a collection stops its builds early. All collections of a database
+share a limit of builds at once (default 1) per kind, and the builds that run
+share the build threads (half of the CPUs unless told otherwise).
 
 **Parallel search.** A search is split into tasks: one per SSD segment, one
 per 4 MiB of vectors in RAM, and one per shard asked elsewhere. The calling
@@ -1384,17 +1391,16 @@ writer (an earlier build of this step, with an idle machine):
 - The default lets an ingest of up to 1 GiB of vectors go through at disk
   speed while the index catches up, and the fresh rows are searched by brute
   force until then.
-- **The limit works by making a write wait for a build to finish, and the
-  wait has no bound.** It is short only while the build that is due can
-  start. The builds of a collection run one at a time (and those of a
-  database share a limit, 1 by default), so a write waits behind whatever is
-  running. In the ingest above it waited 26 s for an index build of 128 MiB
-  of rows; with a 1M-row segment already there, upserts of its rows crossed
-  its 20% of deletes, its compaction (787,344 rows) took 224 s on this
-  loaded machine, and the write at the 128 MiB limit waited 213 s for it
-  (170 s in another run), although what it needed was a merge of the flat
-  segments. The wait grows with the size of the segments. This is the first
-  open item (see the roadmap).
+- **The limit works by making a write wait for a build to finish.** As of
+  step 7b that wait had no bound: the builds of a collection ran one at a time
+  (and those of a database shared a limit, 1 by default), so a write waited
+  behind whatever was running. In the ingest above it waited 26 s for an index
+  build of 128 MiB of rows; with a 1M-row segment already there, upserts of
+  its rows crossed its 20% of deletes, its compaction (787,344 rows) took 224
+  s on this loaded machine, and the write at the 128 MiB limit waited 213 s
+  for it (170 s in another run), although what it needed was a merge of the
+  flat segments. Step 7c took that wait away (and left the one for index
+  builds).
 
 Search with a writer going flat out, 4 threads searching (12 s, page cache,
 starting from the indexed 1M):
@@ -1404,7 +1410,7 @@ starting from the indexed 1M):
 | no background work | 102 | 39 | 26 / 132 | 115,000 | 412 ms |
 | flushes in the background | 90 | 44 | 29 / 182 | 107,000 | 78 ms |
 | and a pool | 91 | 44 | 32 / 154 | 119,000 | 78 ms |
-| and a 128 MiB limit | (see above) | 45 | 26 / 176 | | 170 s |
+| and a 128 MiB limit | (see above) | 45 | 26 / 176 | | 170 s (see 7c) |
 
 - One run each, with 4.5-5.3 other cores in use, so only the large
   differences count. No index build was due in any of them (the collection's
@@ -1424,6 +1430,261 @@ $B coll-ingest --base $S/sift_base.fvecs --dir work --durability sync --batch 10
    --index-mb 100000 --background true --seal-mb 32      # no builds; --background false: inline seal,
                                                          # --seal-mb 100000: no seals
 $B coll-ingest --base $S/sift_base.fvecs --dir work --threads 6 --background true --unindexed-mb 1024
+```
+
+## Server (step 7c)
+
+### Writes no longer wait behind compactions
+
+In step 7b a write that had reached `max_unindexed_bytes` waited for the one
+build thread of its collection, and so behind whatever that ran: minutes, if
+it was a compaction of a large segment. Now:
+
+- A collection has two build threads, or lanes, by what a job takes in. One
+  runs the jobs of flat segments, which are what makes room (index builds,
+  merges of flat segments that are mostly deleted); the other compacts and
+  merges SSD segments. Neither takes a segment that the other works on.
+- The limit of builds at once in a database (`builds`) holds per lane, so
+  compactions of one collection do not keep another from making room either.
+  Places are given in the order they were asked for.
+- An index build takes the oldest flat segments, up to `index_bytes` or an
+  eighth of `max_unindexed_bytes`, whichever is more, instead of all there
+  are. The price is more and smaller SSD segments, which merges put together
+  later.
+- `optimize` claims the segments it works on and leaves the lane of flat
+  segments to others.
+- `max_write_wait` bounds what is left of the wait: a write that has not got
+  room by then fails with `Unavailable` and has changed nothing in the shard
+  that made it wait. (Off by default in the library, 10 s in the server.)
+
+One writer upserts the rows of a 1M-row segment (`sift1m-1seg`, buffered, 20
+s, limit 128 MiB, 4 build threads, 4 threads searching; page cache), on the
+same shared machine as before. Its compaction becomes due, and then a merge of flat segments:
+
+| | slowest batch | rows/s written | p50 / p99 ms of a batch | mean ms of a search |
+|---|---:|---:|---:|---:|
+| 7b | 126 s | 11,595 | 0.37 / 5.9 | 52.9 |
+| 7c (before and after that run) | 2.3-2.4 s | 121,324-124,092 | 0.39-0.40 / 6.5-7.2 | 53.6-58.5 |
+
+- The writer waited for the compaction (126 s; 170 and 213 s on a more
+  loaded machine, step 7b) and waits for the merge of flat segments now. 7b's
+  rows/s are that low because the run lasts until the writer is back.
+- This is not what keeping to the limit costs. `index_bytes` of that
+  collection is 512 MiB, so no index build came due, and a write only waits
+  while a build is: both 7c runs ended with 829,321 flat rows (405 MiB). What
+  it costs when index builds are due is in the next table.
+
+Ingesting 1M rows from scratch, 6 build threads, one run each:
+
+| limit | | slowest batch | last batch done after | until idle | SSD segments | peak memory |
+|---|---|---:|---:|---:|---:|---:|
+| 128 MiB | 7b | 26.4 s | 92 s | 138 s | 6 | 1.08 GB |
+| | 7c | 20.7 s | 99 s | 136 s | 7 | 1.03 GB |
+| 1 GiB | 7b | 0.16 s | 2.4 s | 125 s | 2 | 2.04 GB |
+| | 7c | 0.16 s | 2.3 s | 122 s | 4 | 1.36 GB |
+
+- **Not fixed: a write still waits for the index build of its own rows**
+  (20.7 s at the 128 MiB limit, which is small for this rate), and with
+  `builds` at 1 for those of other shards before it. The writer runs at full
+  speed and then stops. Slowing it down before it reaches the limit is a
+  follow-up (see the roadmap); until then, `max_write_wait` bounds the wait,
+  and the default limit of 1 GiB takes this ingest (0.5 GB of vectors) without
+  one. That limit is per shard, so RAM has to cover it times the shards that
+  are written to.
+
+### HTTP
+
+`vecdb-server` offers a database over HTTP/1.1, with JSON requests and
+replies. (gRPC comes with the shard interface in step 8.)
+
+```
+target/release/vecdb-server --data data/db          # http://127.0.0.1:7410; --help lists the flags
+
+U=http://127.0.0.1:7410/v1/collections; J='Content-Type: application/json'
+curl -X PUT $U/docs -H "$J" -d '{"dim": 4, "metric": "cosine", "shards": 2,
+   "fields": {"year": "int", "tag": "keyword"}}'
+curl $U/docs/upsert -H "$J" -d '{"rows": [
+   {"id": 1, "vector": [0.1, 0.2, 0.3, 0.4], "attrs": {"year": 2024, "tag": ["a", "b"]}},
+   {"id": 2, "vector": "zczMPc3MTD6amZk+zczMPg=="}]}'
+curl $U/docs/search -H "$J" -d '{"vector": [0.1, 0.2, 0.3, 0.4], "k": 10, "with_attrs": true,
+   "filter": {"and": [{"field": "year", "gte": 2020}, {"field": "tag", "eq": "a"}]}}'
+```
+
+| request | body | reply |
+|---|---|---|
+| `GET /healthz` | | `{"status": "ok"}`, also without a key |
+| `GET /metrics` | | counters, in the Prometheus text format |
+| `GET /v1/collections` | | names and row counts |
+| `PUT /v1/collections/{name}` | `dim`, `metric` (`l2`, `ip`, `cosine`); optional `shards` (1), `fields` and the settings of `CollectionConfig` | 201, all settings |
+| `GET /v1/collections/{name}` | | settings (as `PUT` takes them), rows, segments, errors of background work |
+| `DELETE /v1/collections/{name}` | | drops the collection and its data |
+| `POST .../upsert` | `{"rows": [{"id", "vector", "attrs"}, ...]}` | how many, and how many of them replaced a row |
+| `POST .../delete` | `{"ids": [...]}` | how many were there |
+| `POST .../write` | `{"ops": [{"upsert": row}, {"delete": {"id"}}, ...]}` | per op, whether its id had a row before |
+| `POST .../get` | `{"ids": [...]}` | the rows there are |
+| `POST .../search` | `vector`; optional `k` (10), `l` (100), `beam_width`, `rerank`, `filter`, `filter_mode`, `with_attrs`, `with_vectors`, `with_stats` | `id` and `distance` of the closest, closest first |
+| `POST .../flush` | | writes what is in RAM to segment files |
+| `POST .../optimize` | | 202; merges each shard's segments in the background (`state.optimizing` says whether it runs) |
+
+- **Vectors** are arrays of numbers, or base64 strings of little-endian `f32`
+  values, which are shorter and faster to read. Every `f32` survives the trip
+  in both. Collections with `cosine` store, and return, them normalized.
+  Smaller distances are closer; with `ip` a distance is the negative product.
+- **Ids** are unsigned 64-bit integers, as JSON numbers. Clients in
+  languages whose numbers are doubles (JavaScript) have to stay below 2^53.
+- **Attributes** are integers (signed, 64 bits) or strings, or arrays of
+  them. A filter is `{"field": F, "eq": V}`, `{"field": F, "in": [...]}`,
+  `{"field": F, ...}` with `gt`, `gte`, `lt`, `lte`, or `{"and": [...]}`,
+  `{"or": [...]}`, `{"not": ...}`.
+- Unknown keys, keys given twice and parameters in the path are errors, so
+  that a typo does not change what a request does. An optional key with
+  `null` is as if left out.
+- **Errors** are `{"error": {"code", "message"}}`: 400 what was asked for is
+  wrong, 401 no key, 403 a browser without a key, 404, 405, 408 the body came
+  too slowly, 409 exists already (or runs already, or too many shards), 413,
+  415 not JSON, 500 the server's fault (it also logs it), 503 with
+  `Retry-After`: overloaded, or index builds are behind, or the collection
+  could not be opened.
+
+**Writes** are durable once answered (`--durability sync`; `buffered` leaves
+the fsync to the operating system). The ops of a request apply in order, all
+or none of those of a shard; across the shards of a collection they are not
+atomic. A request that fails with 5xx, or whose reply is lost, may have been
+applied in part or in whole. Sending it again is safe as long as nobody else
+wrote the same ids meanwhile: upserts replace, and deleting what is gone does
+nothing. A write that has to wait for index builds (see step 7b) gets 503
+after `--write-wait-secs` (10), without having changed anything in the shard
+that made it wait.
+
+**Overload.** The engine's calls block, so they run on threads of their own.
+Searches, writes, requests that can take long and requests that only look
+have separate limits of how many run at a time (two searches per CPU, 64
+writes) and how many wait (1,024 each, 10 s at most). Beyond those, requests
+get 503 at once. A search in progress is not cancelled when its client goes
+away.
+
+**Limits.** Bodies of writes may have 64 MiB, others 4 MiB; `k` and `l`
+10,000; a request 100,000 writes; a reply about 64 MiB, which limits how many
+rows with vectors one may ask for; a collection 64 shards, all of them 1,024
+(each has three threads). Large bodies (over 256 KiB) share 512 MiB, held
+until they have been written, and large replies another 512 MiB, held until
+their clients have them. What is parsed from a body can take several times
+its size (some 40 times, for rows with many attribute values). 4,096
+connections at most; idle ones are closed after 75 s, clients that send a
+body too slowly or do not take their reply as well.
+
+**Security.** The server listens on 127.0.0.1 and has no TLS: to serve other
+machines, put a reverse proxy in front of it. With `--api-key-file` (or
+`VECDB_API_KEY`) every request but `/healthz` has to carry `Authorization:
+Bearer <key>`; there is one key, and it allows everything. Without a key, the
+server refuses to listen beyond the machine, and web pages in a browser on it
+are kept out: requests with an `Origin` header or for a host name other than
+`localhost` are refused (pages whose own name was pointed at 127.0.0.1 have
+such a name), and bodies have to be `application/json`, which pages cannot
+send elsewhere without asking. Any program on the machine may use it, and a
+proxy is one: behind a proxy, give the server a key or let the proxy check who
+is asking, or everyone who reaches the proxy has full access.
+`--allow-unauthenticated true` answers anyone.
+
+**Stopping.** On SIGTERM or SIGINT the server stops accepting, closes idle
+connections, answers the requests it has for up to `--drain-secs` (30), then
+closes the database: flushes that run are waited for and builds are stopped,
+to be done after the next start. What is cut off (a request that takes
+longer, an `optimize`) ends as in a crash, which loses nothing that was
+answered.
+
+### Tests
+
+The tests talk to the server over real sockets, or run the program:
+
+- a collection from its creation to its drop, against a model: upserts,
+  deletes, writes in order, filters, flushes, index builds, `optimize`;
+- what is wrong with a request: some 80 of them, each with its status, and
+  none changes anything; nesting 50,000 deep;
+- 64-bit ids and integers, and every bit of a float, unchanged; a request
+  body in chunks of 1 byte, pipelined, after `Expect: 100-continue`;
+- keys and their near misses; origins and host names;
+- each limit at and beyond its value: bodies, replies, rows, places,
+  connections, shards; bodies that come too slowly, replies that are not
+  taken, clients that go away in between: what they held is given back, and
+  not before the engine is done with it;
+- overload: requests are answered or refused at once, and other kinds go on;
+- a write that waits for an index build of another collection is refused in
+  time, and accepted later;
+- drops and creates under searches and writes; a damaged collection fails
+  alone;
+- SIGTERM, SIGINT and SIGKILL in the middle of use: every row that was
+  answered is there after a restart.
+
+76 mutations of this step's code (19 of the build lanes, 5 of the rows found,
+52 of the server) were each run against the tests. Tests were added for those
+that were not caught at first. Still not caught: two narrow races (a
+`wait_idle` that does not look at one lane, missed in one run of two, and
+`lane_segments` reading the view before the claims), and a `--network-threads`
+without effect. Two were noticed because tests hung.
+
+### Results
+
+`sift1m-defaults` (page cache, k 10, L 40, recall@10 0.9975 throughout): the
+same collection in the same process as its clients, and in a server on the
+same machine, whose CPUs the clients share. One connection per client, 3
+rounds; i7-8700, shared with other work, load 3-5 before.
+
+| clients | in process: QPS | p50 / p99 ms | HTTP: QPS | p50 / p99 ms | HTTP, base64: QPS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 485-496 | 2.0 / 2.5-2.6 | 432-452 | 2.2-2.3 / 2.7-2.9 | 446-457 |
+| 4 | 932-983 | 4.0-4.1 / 5.0-7.4 | 749-778 | 4.9-5.1 / 8.1-8.7 | 734-782 |
+| 8 | 1,225-1,355 | 5.6-6.4 / 9.6-11.9 | 972-999 | 7.8-8.0 / 13.1-13.5 | 956-984 |
+
+One SSD segment alone (`sift1m-1seg`, recall@10 0.9648), where a search takes
+0.2 ms:
+
+| clients | in process: QPS | p50 / p99 ms | HTTP: QPS | p50 / p99 ms | CPU ms per search |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4,367-4,535 | 0.22 / 0.31-0.48 | 3,009-3,479 | 0.28-0.33 / 0.40-0.43 | 0.22-0.23, 0.28-0.29 |
+| 8 | 25,604-25,809 | 0.30-0.31 / 0.44-0.45 | 18,313-19,636 | 0.40-0.41 / 0.69-0.87 | 0.31-0.32, 0.39-0.40 |
+
+Writes of 128-dim rows, 100 per request, one collection of one shard:
+
+| clients | in process: rows/s | HTTP | HTTP, base64 | p99 ms: in process, HTTP, base64 |
+|---:|---:|---:|---:|---|
+| 1, buffered | 1,061,000-1,093,000 | 193,000-206,000 | 233,000-241,000 | 0.14-0.16, 0.64-0.69, 0.57-0.64 |
+| 4, buffered | 1,472,000-1,515,000 | 569,000-621,000 | 763,000-781,000 | 0.95-1.9, 1.1-1.3, 0.99-1.3 |
+| 8, buffered | 1,423,000-1,540,000 | 867,000-976,000 | 1,140,000-1,180,000 | 1.5-3.2, 1.7-2.3, 2.1-2.5 |
+| 1, sync | 15,700-16,500 | 13,000-14,200 | 12,600-13,700 | 10-11, 13, 12-14 |
+| 8, sync | 46,800-48,600 | 45,200-48,700 | 49,300-52,800 | 53-54, 25-27, 22-26 |
+
+- **With one client HTTP adds 0.06-0.25 ms, and with 4 or 8 it takes 20-26%
+  of the throughput** (client and server together on 12 threads). Why is not
+  established. Most of it does not seem to be HTTP: in process, handing each
+  search to one of 8 threads of a plain pool did as badly (`sift1m-defaults`
+  at 4 clients, with `--pool-cpus 1` so that searches get no help: 759-762 QPS
+  against 968-1,003 when each client searches itself, and 770-819 over HTTP).
+  Two changes to the server were tried and are not in the code: searching on
+  the network threads was worse (625-670 QPS, same setting), and an own pool
+  that reuses the thread that was busy last made no difference on
+  `sift1m-defaults` (753-755 at 4 clients, 938-970 at 8) and gained 2-4% on
+  `sift1m-1seg`, which is within the noise. Fewer network threads
+  (`--network-threads`) helped some runs and hurt others.
+- **Base64 halves the bytes of a write** (35 KB against 71 for 100 rows of 128
+  dimensions) **and takes about 20% off its time.** For searches it makes no
+  difference.
+- Durable writes lose 0-14% at one client (two runs: 11,800-15,900 rows/s in
+  process against 12,800-13,600 in the first, the table's in the second) and
+  nothing at 8, where the fsyncs are shared (the p99 in process is worse there;
+  that is not explained).
+- Not measured: single-row requests, hundreds of connections, anything but
+  loopback.
+
+Commands (`B`, `S` as above):
+
+```
+$B http --from sift1m-defaults --dir work --base $S/sift_base.fvecs --query $S/sift_query.fvecs \
+   --server target/release/vecdb-server --l 40 --clients 1,4,8 --rounds 3 --rows 100000 --batch 100
+$B http --from sift1m-1seg ... --clients 1,8 --rounds 3 --rows 50000 --durability sync
+$B coll-concurrent --from sift1m-1seg --dir work ... --l 40 --direct false --readers 4 --secs 20 \
+   --writers 1 --background true --pool 0 --unindexed-mb 128 --threads 4
+$B coll-ingest --base $S/sift_base.fvecs --dir work --threads 6 --background true --unindexed-mb 128
 ```
 
 ## Designing for billions
@@ -1538,7 +1799,7 @@ Within a shard:
      segment (needed for segments of 100M rows);
    - a graph that knows the labels (per-label entry points or edges), for
      filters whose matches lie away from the query
-7. ◐ Server and single-node mode. Done (7a): a collection shared between
+7. ✅ Server and single-node mode. Done (7a): a collection shared between
    threads, with snapshot reads, index builds and compactions beside writes
    and searches (deletes made meanwhile carried into the new segment), and
    group commit; concurrent search, durable writes and search during a build
@@ -1546,15 +1807,20 @@ Within a shard:
    threads, with writes that wait when the builds fall behind; a thread pool
    that searches segments, and shards, in parallel; a catalog of named
    collections split into shards, behind one `Shard` interface.
-   Still to do:
-   - 7c: the server (proposed, not decided: HTTP/JSON first, gRPC for the
-     shard interface in step 8)
+   Done (7c): writes that no longer wait behind compactions, and whose wait
+   can be bounded; an HTTP/JSON server. The shard interface over gRPC is part
+   of step 8.
 
    Follow-ups:
-   - first: writes wait behind whatever build is running (170-213 s behind a
-     compaction of about 780,000 rows; 26 s in an ingest that compacted
-     nothing, above). Jobs that free the limit need a lane of their own, or
-     the wait needs a bound;
+   - writers that are slowed down as the limit comes closer, instead of
+     stopped at it;
+   - a limit for all shards of a database, not for each;
+   - stopping an `optimize` of a collection that is dropped;
+   - server: TLS, a key per collection or user, streamed bulk imports, requests
+     that are cancelled when their client is gone, or take too long, HTTP/2,
+     compression, backups;
+   - the cost of handing a search to another thread (see 7c);
+   - rows with `with_vectors` read in batches;
    - cheaper scans of fresh rows (int8 codes, or scans shared by searches):
      memory bandwidth limits them;
    - growing rows read without a lock (7a measured about 10% of the search

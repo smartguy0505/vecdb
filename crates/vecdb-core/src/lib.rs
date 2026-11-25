@@ -29,8 +29,8 @@ pub mod topk;
 
 pub use cancel::Cancel;
 pub use collection::{
-    Attrs, Collection, CollectionConfig, Durability, Field, FieldType, Filter, FilterMode, IndexConfig, OpenOptions,
-    SearchOptions, Value, WriteOp,
+    Attrs, Collection, CollectionConfig, CollectionStats, Durability, Fetch, Field, FieldType, Filter, FilterMode,
+    IndexConfig, OpenOptions, SearchOptions, Value, WriteOp,
 };
 pub use database::{
     Database, DatabaseOptions, Op, Row, SearchReply, SearchRequest, Shard, ShardedCollection,

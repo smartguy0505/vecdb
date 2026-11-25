@@ -77,11 +77,11 @@ fn old_snapshots_keep_their_view() {
     let check_old = |c: &Collection| {
         assert_eq!(ids_of(&search_all(c, Some(&old), 3110)), before);
         for id in moved.iter().chain(&gone) {
-            let (v, a) = c.get_in(&old, *id).unwrap().unwrap();
+            let (v, a) = c.get_in(&old, *id, Fetch::ALL).unwrap().unwrap();
             assert_eq!(v, vectors[id], "id {id}");
             assert_eq!(a, Attrs::new().int("g", (id % 50) as i64));
         }
-        assert!(c.get_in(&old, 9999).unwrap().is_none());
+        assert!(c.get_in(&old, 9999, Fetch::ALL).unwrap().is_none());
         // Its filters see the old rows too: the scan and the walk.
         for mode in [FilterMode::Scan, FilterMode::Graph] {
             let opts = SearchOptions {

@@ -379,13 +379,14 @@ fn plan_partitions(
                 k * 8
             )));
         }
-        let km = KMeansParams { k, iters: PARTITION_ITERS, seed: p.graph.seed ^ 0x9a27_17c3, threads: p.graph.threads };
+        let threads = p.cancel.threads(p.graph.threads);
+        let km = KMeansParams { k, iters: PARTITION_ITERS, seed: p.graph.seed ^ 0x9a27_17c3, threads };
         let centroids = kmeans::train(&space, dim, &km)?;
         let Some(budget) = budget_nodes else {
             return Ok((k, centroids));
         };
         // Largest partition, estimated from the sample.
-        let counts = par::map_ranges(s, p.graph.threads, |range| {
+        let counts = par::map_ranges(s, threads, |range| {
             let mut counts = vec![0usize; k];
             let mut dists = vec![0.0f32; k];
             let mut near = vec![0u16; p.overlap];
@@ -651,7 +652,7 @@ pub(crate) fn build(
     p: &PartitionedBuildParams,
 ) -> Result<PartitionedBuildReport> {
     let (n, dim) = (src.len(), src.dim());
-    let threads = p.graph.threads;
+    let threads = || p.cancel.threads(p.graph.threads);
     let r = p.graph.max_degree;
     let part_r = if p.partition_degree == 0 { r } else { p.partition_degree };
     check_dim(dim)?;
@@ -694,7 +695,7 @@ pub(crate) fn build(
     };
 
     // 1. Scan.
-    let map = scan(src, metric, threads, &p.cancel)?;
+    let map = scan(src, metric, threads(), &p.cancel)?;
     let nodes = map.nodes();
     log(format!("scan: {n} rows, {nodes} distinct"));
     step("scan", &mut t);
@@ -710,7 +711,7 @@ pub(crate) fn build(
         (0..nodes as u32).collect()
     };
     let mut sample = Vec::new();
-    read_nodes(src, &map, metric, &sample_nodes, threads, &mut sample)?;
+    read_nodes(src, &map, metric, &sample_nodes, threads(), &mut sample)?;
     drop(sample_nodes);
     let pq = ProductQuantizer::train_until(dim, &sample, &p.pq, &p.cancel)?;
     let budget_nodes = (p.partitions == 0).then(|| (p.memory_budget / partition_node_bytes(dim, part_r)) as usize);
@@ -770,9 +771,9 @@ pub(crate) fn build(
         let v1 = (v0 + batch).min(nodes);
         batch_nodes.clear();
         batch_nodes.extend(v0 as u32..v1 as u32);
-        read_nodes(src, &map, metric, &batch_nodes, threads, &mut buf)?;
+        read_nodes(src, &map, metric, &batch_nodes, threads(), &mut buf)?;
         let rows = &buf;
-        let sums = par::map_ranges((v1 - v0).div_ceil(MEAN_CHUNK), threads, |range| {
+        let sums = par::map_ranges((v1 - v0).div_ceil(MEAN_CHUNK), threads(), |range| {
             range
                 .map(|c| {
                     let (a, b) = (c * MEAN_CHUNK, ((c + 1) * MEAN_CHUNK).min(v1 - v0));
@@ -785,13 +786,13 @@ pub(crate) fn build(
                 *acc += v;
             }
         }
-        par::map_rows_mut(&mut codes[v0 * m..v1 * m], m, threads, |first, out| {
+        par::map_rows_mut(&mut codes[v0 * m..v1 * m], m, threads(), |first, out| {
             for (i, code) in out.chunks_exact_mut(m).enumerate() {
                 pq.encode(&rows[(first + i) * dim..(first + i + 1) * dim], code);
             }
         });
         if k > 1 {
-            par::map_rows_mut(&mut assign[v0 * overlap..v1 * overlap], overlap, threads, |first, out| {
+            par::map_rows_mut(&mut assign[v0 * overlap..v1 * overlap], overlap, threads(), |first, out| {
                 let kern = kernels::best();
                 let mut dists = vec![0.0f32; k];
                 for (i, near) in out.chunks_exact_mut(overlap).enumerate() {
@@ -828,18 +829,18 @@ pub(crate) fn build(
         }
         let mut w = BufWriter::with_capacity(1 << 20, File::create(part_path(s))?);
         if !members.is_empty() {
-            read_nodes(src, &map, metric, &members, threads, &mut buf)?;
-            let points = Points::new(&buf, dim, metric, threads);
+            read_nodes(src, &map, metric, &members, threads(), &mut buf)?;
+            let points = Points::new(&buf, dim, metric, threads());
             let gp = GraphParams { max_degree: part_r, seed: p.graph.seed.wrapping_add(s as u64), ..p.graph.clone() };
             let (lists, _) = build_graph(&points, &gp, &p.cancel)?;
-            let best = par::map_ranges(members.len(), threads, |range| {
+            let best = par::map_ranges(members.len(), threads(), |range| {
                 let kern = kernels::best();
                 range.map(|i| (points.dist_to(kern, &mean, mean_inv_norm, i as u32), members[i])).min_by(by_distance)
             });
             entry = entry.into_iter().chain(best.into_iter().flatten()).min_by(by_distance);
             for b0 in (0..members.len()).step_by(BATCH) {
                 let b1 = (b0 + BATCH).min(members.len());
-                let chunks = par::map_ranges(b1 - b0, threads, |range| {
+                let chunks = par::map_ranges(b1 - b0, threads(), |range| {
                     let kern = kernels::best();
                     let mut bytes = Vec::new();
                     for u in range.map(|i| b0 + i) {
@@ -896,7 +897,7 @@ pub(crate) fn build(
                 readers[s as usize].read(v as u32, part_r, nodes, out)?;
             }
         }
-        let lists = par::map_ranges(v1 - v0, threads, |range| {
+        let lists = par::map_ranges(v1 - v0, threads(), |range| {
             let kern = kernels::best();
             let mut buf = Vec::new();
             range
@@ -935,7 +936,7 @@ pub(crate) fn build(
         let v1 = (v0 + batch).min(nodes);
         batch_nodes.clear();
         batch_nodes.extend(v0 as u32..v1 as u32);
-        read_nodes(src, &map, metric, &batch_nodes, threads, &mut buf)?;
+        read_nodes(src, &map, metric, &batch_nodes, threads(), &mut buf)?;
         for row in buf.chunks_exact(dim) {
             adj_in.read_exact(&mut rec)?;
             parse_adjacency(&rec, &mut list);

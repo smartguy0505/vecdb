@@ -52,7 +52,7 @@ impl Engine {
         self.search_in(&self.snapshot(), query, k, opts)
     }
 
-    pub(super) fn search_in(
+    pub(crate) fn search_in(
         &self,
         snap: &Snapshot,
         query: &[f32],

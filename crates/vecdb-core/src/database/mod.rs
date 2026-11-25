@@ -31,7 +31,8 @@
 //! let (db, _report) = Database::open(&data, &DatabaseOptions::default())?;
 //! let c = db.create_collection("docs", CollectionConfig::new(4, Metric::L2), 2)?; // 2 shards
 //! c.write(vec![Op::Upsert(Row { id: 42, vector, attrs: Attrs::default() })])?;
-//! let reply = c.search(&SearchRequest { vector: query, k: 10, options: SearchOptions::default() })?;
+//! let options = SearchOptions::default();
+//! let reply = c.search(&SearchRequest::new(query, 10, options))?;
 //! assert_eq!(reply.results[0].id, 42);
 //! # drop((c, db));
 //! # std::fs::remove_dir_all(&data)?;
@@ -42,7 +43,7 @@
 mod catalog;
 mod shard;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,6 +61,7 @@ use catalog::{CATALOG, Catalog, Entry, check_name};
 
 pub use catalog::{MAX_NAME, MAX_SHARDS};
 pub use shard::{Op, Row, SearchReply, SearchRequest, Shard, shard_of};
+use shard::fetch_rows;
 
 /// How this process uses a database (not stored).
 #[derive(Clone, Debug)]
@@ -406,21 +408,29 @@ impl ShardedCollection {
     /// answers as of the last write it has applied.
     pub fn search(&self, req: &SearchRequest) -> Result<SearchReply> {
         self.check()?;
-        let mut snaps = Vec::new();
+        // Per shard; of those that are elsewhere, the rows they found.
+        let mut snaps: Vec<Option<(&Collection, Snapshot)>> = Vec::new();
         let mut asks: Vec<Ask> = Vec::new();
+        let elsewhere: Arc<Mutex<HashMap<u64, Row>>> = Arc::default();
         for s in &self.shards {
-            match s.local() {
-                Some(c) => snaps.push(c.snapshot()),
-                None => {
-                    let (s, req) = (s.clone(), req.clone());
-                    asks.push(Box::new(move || s.search(&req).map(|r| (r.results, r.stats))));
-                }
+            snaps.push(s.local().map(|c| (c, c.snapshot())));
+            if s.local().is_none() {
+                let (s, req, rows) = (s.clone(), req.clone(), elsewhere.clone());
+                asks.push(Box::new(move || {
+                    let r = s.search(&req)?;
+                    rows.lock().unwrap().extend(r.rows.into_iter().map(|r| (r.id, r)));
+                    Ok((r.results, r.stats))
+                }));
             }
         }
-        let snaps: Vec<&Snapshot> = snaps.iter().collect();
+        let here: Vec<&Snapshot> = snaps.iter().flatten().map(|(_, s)| s).collect();
         let pool = self.pool.as_deref();
-        let (results, stats) = search_all(&self.config, &snaps, asks, pool, &req.vector, req.k, &req.options)?;
-        Ok(SearchReply { results, stats })
+        let (results, stats) = search_all(&self.config, &here, asks, pool, &req.vector, req.k, &req.options)?;
+        let rows = fetch_rows(&results, req, |id| match &snaps[shard_of(id, snaps.len())] {
+            Some((c, snap)) => c.get_in(snap, id, req.fetch),
+            None => Ok(elsewhere.lock().unwrap().remove(&id).map(|r| (r.vector, r.attrs))),
+        })?;
+        Ok(SearchReply { results, rows, stats })
     }
 
     pub fn get(&self, id: u64) -> Result<Option<Row>> {

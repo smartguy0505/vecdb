@@ -65,7 +65,7 @@ impl Engine {
     /// On error nothing has changed.
     pub(super) fn freeze(&self, w: &mut Writer) -> Result<()> {
         if w.wal.is_poisoned() {
-            return Err(Error::InvalidArgument("an earlier WAL write failed: reopen the collection".into()));
+            return Err(Error::Unavailable("an earlier WAL write failed: reopen the collection".into()));
         }
         let cfg = &self.config;
         let generation = w.wal.generation() + 1;

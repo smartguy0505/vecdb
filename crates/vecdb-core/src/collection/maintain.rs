@@ -1,19 +1,30 @@
 //! Index builds and compaction: replacing sealed segments with one new
 //! segment built from their live rows.
 //!
-//! Jobs are run one at a time, by the background builder (see `background`)
-//! or by [`Engine::maintain`], until none is due, in this order:
+//! Jobs are run by the background builders (see `background`) or by
+//! [`Engine::maintain`], until none is due. There are two lanes, by what a
+//! job replaces, with one job at a time in each. On flat segments ([`Lane`]),
+//! in this order:
 //!
-//! 1. **index:** the flat segments hold `index_bytes` of live vectors:
-//!    build one SSD index from all of them.
-//! 2. **drop:** a segment has no live rows left: remove it.
-//! 3. **shrink:** the flat segments take `index_bytes`, and at least half of
-//!    that is deleted rows: merge them into one flat segment. (So they never
-//!    take much more than twice `index_bytes`, whatever is upserted.)
-//! 4. **compact:** an SSD segment has `compact_deleted` of its rows
-//!    deleted: rebuild it without them.
-//! 5. **merge:** there are more than `max_indexed_segments` SSD segments:
-//!    merge the two smallest.
+//! 1. **index:** they hold `index_bytes` of live vectors: build an SSD index
+//!    from them. In the background not from all of them if they are far
+//!    behind, but from the oldest, an eighth of `max_unindexed_bytes` (or
+//!    `index_bytes`, if that is more): writes that wait have less to wait for.
+//! 2. **drop:** one has no live rows left: remove it.
+//! 3. **shrink:** they take `index_bytes`, and at least half of that is
+//!    deleted rows: merge them into one flat segment. (So they never take
+//!    much more than twice `index_bytes`, whatever is upserted.)
+//!
+//! On SSD segments:
+//!
+//! 1. **drop:** as above.
+//! 2. **compact:** one has `compact_deleted` of its rows deleted: rebuild it
+//!    without them.
+//! 3. **merge:** there are more than `max_indexed_segments`: merge the
+//!    smallest, so many that there are not.
+//!
+//! [`Engine::optimize`] takes the segments of both lanes, as they are when it
+//! starts; later ones are left to the lanes.
 //!
 //! An output with fewer than [`MIN_SSD_ROWS`] rows is always a flat segment.
 //! Each job commits with one manifest write; the files of the segments it
@@ -33,9 +44,9 @@
 //! back). That is fine for a reopen, which replays them: deleting a row that
 //! is already gone does nothing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 
 use super::manifest::{MANIFEST, SegmentEntry, SegmentKind};
@@ -52,6 +63,20 @@ use crate::store::{InMemoryStore, VectorStore};
 
 /// Smallest output written as an SSD index; smaller ones stay flat.
 pub const MIN_SSD_ROWS: usize = 2048;
+
+/// Jobs are of two kinds, by the segments they replace. One of each can run
+/// at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Lane {
+    Flat = 0,
+    Ssd = 1,
+}
+
+impl Lane {
+    fn has(self, s: &Sealed) -> bool {
+        matches!(s.body, Body::Flat(_)) == (self == Lane::Flat)
+    }
+}
 
 /// One job that [`Engine::maintain`] ran.
 #[derive(Clone, Debug, PartialEq)]
@@ -74,73 +99,117 @@ impl Engine {
     /// is due. Searches and writes go on meanwhile. Not needed with
     /// background threads, which do the same as it becomes due.
     pub fn maintain(&self) -> Result<Vec<JobReport>> {
-        let _one = self.maintaining.lock().unwrap();
-        if self.next_job().is_none() {
+        if self.no_job() {
             return Ok(Vec::new());
         }
         self.flush()?;
         let mut done = Vec::new();
-        while let Some((reason, job)) = self.next_job() {
-            done.push(self.rebuild(&job, reason, self.opts.threads)?);
+        loop {
+            let before = done.len();
+            for lane in [Lane::Flat, Lane::Ssd] {
+                let _one = self.lane(lane);
+                while let Some((reason, inputs)) = self.next_job(lane) {
+                    done.push(self.rebuild(&inputs, reason, self.opts.threads)?);
+                }
+            }
+            if done.len() == before {
+                return Ok(done);
+            }
         }
-        Ok(done)
     }
 
     /// Flushes, then merges every sealed segment into one, built from the
-    /// live rows (an SSD index unless there are very few).
+    /// live rows (an SSD index unless there are very few). Segments flushed
+    /// meanwhile are not part of it.
     pub fn optimize(&self) -> Result<Option<JobReport>> {
-        let _one = self.maintaining.lock().unwrap();
+        // In this order, as a job on SSD segments can take hours, and index
+        // builds have to go on until it is done.
+        let _ssd = self.lane(Lane::Ssd);
+        let flat = self.lane(Lane::Flat);
         self.flush()?;
         let all: Vec<u64> = self.view().sealed.iter().map(|s| s.id).collect();
         if all.is_empty() {
             return Ok(None);
         }
+        let _taken = Taken::new(self, &all);
+        drop(flat);
         Ok(Some(self.rebuild(&all, "optimize", self.opts.threads)?))
     }
 
-    /// The next job that is due: its reason and its input segments' ids.
-    pub(super) fn next_job(&self) -> Option<(&'static str, Vec<u64>)> {
-        let cfg = &self.config;
+    /// Waits for its turn to run jobs of `lane`.
+    fn lane(&self, lane: Lane) -> MutexGuard<'_, ()> {
+        self.lanes[lane as usize].lock().unwrap()
+    }
+
+    /// The sealed segments of `lane` that no `optimize` has taken, oldest
+    /// first.
+    pub(super) fn lane_segments(&self, lane: Lane) -> Vec<Arc<Sealed>> {
+        // In this order: what is taken is let go of after it has left the
+        // view.
+        let taken = self.optimizing.lock().unwrap();
         let view = self.view();
-        let sealed = &view.sealed;
-        let ids = |idx: Vec<usize>| idx.iter().map(|&i| sealed[i].id).collect::<Vec<u64>>();
-        let is_flat = |i: &usize| matches!(sealed[*i].body, Body::Flat(_));
-        let flats: Vec<usize> = (0..sealed.len()).filter(is_flat).collect();
-        let flat_bytes: u64 = flats.iter().map(|&i| sealed[i].live() as u64 * cfg.dim as u64 * 4).sum();
+        view.sealed.iter().filter(|s| lane.has(s) && !taken.contains(&s.id)).cloned().collect()
+    }
+
+    pub(super) fn no_job(&self) -> bool {
+        [Lane::Flat, Lane::Ssd].iter().all(|&l| self.next_job(l).is_none())
+    }
+
+    /// The next job due in `lane`: its reason and its input segments' ids.
+    /// It stays so until its segments are replaced, so whoever runs it holds
+    /// the lane.
+    pub(super) fn next_job(&self, lane: Lane) -> Option<(&'static str, Vec<u64>)> {
+        let cfg = &self.config;
+        let segs = self.lane_segments(lane);
+        let ids = |segs: &[Arc<Sealed>]| segs.iter().map(|s| s.id).collect::<Vec<u64>>();
+        let bytes = |rows: usize| rows as u64 * cfg.dim as u64 * 4;
+        let live: usize = segs.iter().map(|s| s.live()).sum();
         // Below MIN_SSD_ROWS the output would be flat again: not a job.
-        let flat_rows: usize = flats.iter().map(|&i| sealed[i].live()).sum();
-        if flat_bytes >= cfg.index_bytes && flat_rows >= MIN_SSD_ROWS {
-            return Some(("index", ids(flats)));
-        }
-        if let Some(i) = (0..sealed.len()).find(|&i| sealed[i].live() == 0) {
-            return Some(("drop", ids(vec![i])));
-        }
-        let flat_rows: usize = flats.iter().map(|&i| sealed[i].positions()).sum();
-        let taken = flat_rows as u64 * cfg.dim as u64 * 4;
-        if taken >= cfg.index_bytes && taken >= flat_bytes.saturating_mul(2) {
-            return Some(("shrink", ids(flats)));
-        }
-        let ssd: Vec<usize> = (0..sealed.len()).filter(|i| !is_flat(i)).collect();
-        for &i in &ssd {
-            let s = &sealed[i];
-            if s.tomb.count() as f64 >= cfg.compact_deleted as f64 * s.positions() as f64 {
-                return Some(("compact", ids(vec![i])));
+        if lane == Lane::Flat && bytes(live) >= cfg.index_bytes && live >= MIN_SSD_ROWS {
+            let (most, mut rows, mut n) = (self.index_batch(), 0, 0);
+            while n < segs.len() && (bytes(rows) < most || rows < MIN_SSD_ROWS) {
+                rows += segs[n].live();
+                n += 1;
             }
+            return Some(("index", ids(&segs[..n])));
         }
-        if ssd.len() > cfg.max_indexed_segments {
-            let mut by_size = ssd;
-            by_size.sort_by_key(|&i| (sealed[i].live(), i));
-            let mut two = vec![by_size[0], by_size[1]];
-            two.sort_unstable();
-            return Some(("merge", ids(two)));
+        if let Some(s) = segs.iter().find(|s| s.live() == 0) {
+            return Some(("drop", vec![s.id]));
+        }
+        if lane == Lane::Flat {
+            let taken = bytes(segs.iter().map(|s| s.positions()).sum());
+            let shrink = taken >= cfg.index_bytes && taken >= bytes(live).saturating_mul(2);
+            return shrink.then(|| ("shrink", ids(&segs)));
+        }
+        let deleted = |s: &&Arc<Sealed>| s.tomb.count() as f64 >= cfg.compact_deleted as f64 * s.positions() as f64;
+        if let Some(s) = segs.iter().find(deleted) {
+            return Some(("compact", vec![s.id]));
+        }
+        if segs.len() > cfg.max_indexed_segments {
+            let mut smallest: Vec<usize> = (0..segs.len()).collect();
+            smallest.sort_by_key(|&i| (segs[i].live(), i));
+            smallest.truncate(segs.len() - cfg.max_indexed_segments + 1);
+            smallest.sort_unstable();
+            return Some(("merge", smallest.iter().map(|&i| segs[i].id).collect()));
         }
         None
     }
 
+    /// The bytes of vectors one index build takes from the flat segments, if
+    /// there are more.
+    fn index_batch(&self) -> u64 {
+        match self.opts.max_unindexed_bytes {
+            limit if self.opts.background && limit != 0 => (limit / 8).max(self.config.index_bytes),
+            _ => u64::MAX,
+        }
+    }
+
     /// Replaces the segments `inputs` (ids, oldest first) with one segment
-    /// of their live rows (see the module docs), built by `threads` threads.
+    /// of their live rows (see the module docs), built by `threads` threads
+    /// (fewer while other builds run).
     pub(super) fn rebuild(&self, inputs: &[u64], reason: &'static str, threads: usize) -> Result<JobReport> {
         let t0 = Instant::now();
+        let running = self.limit.running();
         let cfg = self.config.clone();
         // 1. The inputs and the rows live in them, and an id for the output:
         // taken now, so a flush during the build numbers its segment after
@@ -190,7 +259,7 @@ impl Engine {
             } else {
                 let path = self.dir.join(disk_name(id));
                 created.push(path.clone());
-                let params = build_params(&cfg, &self.opts, threads, self.background.cancel());
+                let params = build_params(&cfg, &self.opts, threads, self.background.cancel_build(&running));
                 DiskIndex::build_partitioned(&src, Some(&ids), cfg.metric, &path, &params)?;
                 let index = DiskIndex::open(&path, &DiskOpenOptions { direct: self.opts.direct_io, io: self.opts.io })?;
                 // The index orders ids by node.
@@ -358,13 +427,14 @@ impl Engine {
         *man = m;
         drop(man);
         drop(snap);
+        let lanes = [Lane::Flat, Lane::Ssd].map(|l| segs.iter().any(|s| l.has(s)));
         drop(segs);
         self.at("build: replaced");
         durable?;
         for p in old_files {
             let _ = fs::remove_file(p);
         }
-        self.background.built(&Ok(()));
+        self.background.built(lanes);
         Ok(JobReport {
             reason,
             inputs: inputs.to_vec(),
@@ -373,6 +443,23 @@ impl Engine {
             carried_deletes: carried,
             seconds: t0.elapsed().as_secs_f64(),
         })
+    }
+}
+
+/// The segments a running `optimize` replaces: not for the lanes.
+struct Taken<'a>(&'a Engine);
+
+impl<'a> Taken<'a> {
+    fn new(e: &'a Engine, ids: &[u64]) -> Self {
+        *e.optimizing.lock().unwrap() = ids.iter().copied().collect::<BTreeSet<u64>>();
+        Self(e)
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        self.0.optimizing.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.0.background.notify();
     }
 }
 

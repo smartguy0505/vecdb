@@ -209,7 +209,7 @@ impl Wal {
     /// fsync fails, the log refuses further writes.
     pub fn append_group(&mut self, batches: &[(u64, u32, &[u8])], durability: Durability) -> Result<()> {
         if self.poisoned {
-            return Err(Error::InvalidArgument("an earlier WAL write failed: reopen the collection".into()));
+            return Err(Error::Unavailable("an earlier WAL write failed: reopen the collection".into()));
         }
         let mut buf = std::mem::take(&mut self.buf);
         buf.clear();
