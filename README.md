@@ -63,6 +63,9 @@ Distance kernels are chosen at runtime for the CPU, so a default build is
 portable and still uses AVX2/FMA where available. `VECDB_KERNELS=scalar` (or
 `avx2-fma`) forces a kernel set, so A/B runs can use the same binary.
 
+[CONTRIBUTING.md](CONTRIBUTING.md) says how to work on this code, for people and
+for coding agents.
+
 ## Benchmarks
 
 ```
