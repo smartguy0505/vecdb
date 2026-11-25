@@ -586,23 +586,33 @@ fn writes_that_wait() {
     // Another collection that needs one.
     let settings = json!({"dim": DIM, "metric": "l2", "seal_bytes": 1 << 20, "index_bytes": 2200 << 10});
     c.put("/v1/collections/c", &settings).ok();
-    let mut rows = 0;
+    let (mut rows, mut last) = (0, 200);
     let refused = loop {
         let (path, body) = upsert("c", rows);
         let start = Instant::now();
         let reply = c.post(&path, &body);
-        if reply.status != 200 {
-            assert!(start.elapsed() > Duration::from_millis(1400), "{:?}", start.elapsed());
-            break reply;
+        match (reply.status, last) {
+            (200, _) => rows += 500,
+            (_, 200) => assert!(start.elapsed() > Duration::from_millis(1400), "{:?}", start.elapsed()),
+            // (After one refusal the next may go. Not after two.)
+            _ => break reply,
         }
-        rows += 500;
+        last = reply.status;
         assert!(rows < 20_000);
     };
     assert_eq!(refused.header("retry-after"), Some("1"));
     let why = refused.err(503, "unavailable");
     assert!(why.contains("index builds are behind"), "{why}");
-    assert!((8000..13_000).contains(&rows), "{rows}");
-    assert_eq!(c.get("/v1/collections/c").ok()["rows"], rows);
+    // (Slowed down from 6144 rows on; 8192 are the limit. The last 500 took
+    // 3 s, the next would take 44.)
+    assert_eq!(rows, 8000);
+    let info = c.get("/v1/collections/c").ok();
+    assert_eq!((&info["rows"], &info["state"]["slowing_writes"]), (&json!(rows), &json!(true)));
+    assert_eq!(server.metric("vecdb_shards_slowing_writes{collection=\"c\"}"), 1.0);
+    assert_eq!(server.metric("vecdb_shards_slowing_writes{collection=\"slow\"}"), 0.0);
+    assert_eq!(server.metric("vecdb_write_wait_seconds_total{collection=\"slow\"}"), 0.0);
+    let waited = server.metric("vecdb_write_wait_seconds_total{collection=\"c\"}");
+    assert!((1.4..10.0).contains(&waited), "{waited}");
     let (path, body) = upsert("c", rows);
     std::thread::scope(|s| {
         s.spawn(|| server.client().post(&path, &body).err(503, "unavailable"));
@@ -629,6 +639,8 @@ fn writes_that_wait() {
     c.delete("/v1/collections/slow").ok();
     wait("a write", || c.post(&path, &body).status == 200);
     assert_eq!(c.get("/v1/collections/c").ok()["rows"], rows + 500);
+    server.wait_metric("vecdb_shards_slowing_writes{collection=\"c\"}", |n| n == 0.0);
+    assert_eq!(c.get("/v1/collections/c").ok()["state"]["slowing_writes"], false);
     server.wait_metric("vecdb_large_body_bytes", |n| n == 0.0);
 }
 

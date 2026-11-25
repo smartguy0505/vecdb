@@ -9,7 +9,8 @@
 //! 1. **index:** they hold `index_bytes` of live vectors: build an SSD index
 //!    from them. In the background not from all of them if they are far
 //!    behind, but from the oldest, an eighth of `max_unindexed_bytes` (or
-//!    `index_bytes`, if that is more): writes that wait have less to wait for.
+//!    `index_bytes`, if that is more): what a build takes in can be in RAM
+//!    beyond that limit (see `pace`), and is given back at its end only.
 //! 2. **drop:** one has no live rows left: remove it.
 //! 3. **shrink:** they take `index_bytes`, and at least half of that is
 //!    deleted rows: merge them into one flat segment. (So they never take
@@ -49,10 +50,11 @@ use std::fs;
 use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 
+use super::background::Way;
 use super::manifest::{MANIFEST, SegmentEntry, SegmentKind};
 use super::columns::AttrWriter;
 use super::segment::{Body, Sealed, attrs_name, del_name, disk_name, flat_name};
-use super::{CollectionConfig, Engine, OpenOptions, Snapshot};
+use super::{CollectionConfig, Engine, OpenOptions, Snapshot, View};
 use crate::cancel::Cancel;
 use crate::dataset::VectorSource;
 use crate::disk::{DiskIndex, DiskOpenOptions, DiskWriteOptions, MergePrune, PartitionedBuildParams};
@@ -144,11 +146,45 @@ impl Engine {
     /// The sealed segments of `lane` that no `optimize` has taken, oldest
     /// first.
     pub(super) fn lane_segments(&self, lane: Lane) -> Vec<Arc<Sealed>> {
+        self.lane_view(lane).1
+    }
+
+    /// The same, and the view they are of.
+    pub(super) fn lane_view(&self, lane: Lane) -> (Arc<View>, Vec<Arc<Sealed>>) {
         // In this order: what is taken is let go of after it has left the
         // view.
         let taken = self.optimizing.lock().unwrap();
         let view = self.view();
-        view.sealed.iter().filter(|s| lane.has(s) && !taken.contains(&s.id)).cloned().collect()
+        let segs = view.sealed.iter().filter(|s| lane.has(s) && !taken.contains(&s.id)).cloned().collect();
+        (view, segs)
+    }
+
+    /// The bytes of vectors that are in no SSD index, as far as they count
+    /// towards `max_unindexed_bytes`: not those a running `optimize` has
+    /// taken, nor the share of its input that an index build has come
+    /// through, on its way there or at work.
+    pub(super) fn unindexed(&self) -> f64 {
+        // In this order: a build is over after its input has left the view.
+        let build = self.indexing.lock().unwrap().now();
+        let (view, flat) = self.lane_view(Lane::Flat);
+        let far = build.as_ref().map_or(0.0, |b| b.way.far());
+        let left = |s: &Sealed| match &build {
+            Some(b) if b.inputs.contains(&s.id) => 1.0 - far,
+            _ => 1.0,
+        };
+        let rows: f64 = flat.iter().map(|s| s.positions() as f64 * left(s)).sum();
+        let memory: u64 = view.memory().map(|g| g.read().unwrap().bytes()).sum();
+        rows * self.config.dim as f64 * 4.0 + memory as f64
+    }
+
+    /// The bytes of vectors a job puts into an SSD index, if that is what it
+    /// does.
+    pub(super) fn index_bytes_of(&self, reason: &str, inputs: &[u64]) -> u64 {
+        let live = |s: &Arc<Sealed>| if inputs.contains(&s.id) { s.live() as u64 } else { 0 };
+        match reason {
+            "index" => self.lane_segments(Lane::Flat).iter().map(live).sum::<u64>() * self.config.dim as u64 * 4,
+            _ => 0,
+        }
     }
 
     pub(super) fn no_job(&self) -> bool {
@@ -208,8 +244,21 @@ impl Engine {
     /// of their live rows (see the module docs), built by `threads` threads
     /// (fewer while other builds run).
     pub(super) fn rebuild(&self, inputs: &[u64], reason: &'static str, threads: usize) -> Result<JobReport> {
+        self.rebuild_on(inputs, reason, threads, &Arc::default())
+    }
+
+    /// The same, for a build that is `way` far.
+    pub(super) fn rebuild_on(
+        &self,
+        inputs: &[u64],
+        reason: &'static str,
+        threads: usize,
+        way: &Arc<Way>,
+    ) -> Result<JobReport> {
         let t0 = Instant::now();
         let running = self.limit.running();
+        let build = || IndexBuild::new(inputs.to_vec(), way);
+        let _runs = (reason == "index").then(|| IndexingNow::new(self, |i| &mut i.runs, Some(build())));
         let cfg = self.config.clone();
         // 1. The inputs and the rows live in them, and an id for the output:
         // taken now, so a flush during the build numbers its segment after
@@ -259,7 +308,8 @@ impl Engine {
             } else {
                 let path = self.dir.join(disk_name(id));
                 created.push(path.clone());
-                let params = build_params(&cfg, &self.opts, threads, self.background.cancel_build(&running));
+                let cancel = self.background.cancel_build(&running).reporting(&way.done);
+                let params = build_params(&cfg, &self.opts, threads, cancel);
                 DiskIndex::build_partitioned(&src, Some(&ids), cfg.metric, &path, &params)?;
                 let index = DiskIndex::open(&path, &DiskOpenOptions { direct: self.opts.direct_io, io: self.opts.io })?;
                 // The index orders ids by node.
@@ -421,7 +471,7 @@ impl Engine {
                     sealed.push(s.clone());
                 }
             }
-            let next = super::View { sealed, frozen: view.frozen.clone(), growing: view.growing.clone() };
+            let next = View { sealed, frozen: view.frozen.clone(), growing: view.growing.clone() };
             *self.view.write().unwrap() = Arc::new(next);
         }
         *man = m;
@@ -443,6 +493,55 @@ impl Engine {
             carried_deletes: carried,
             seconds: t0.elapsed().as_secs_f64(),
         })
+    }
+}
+
+/// An index build, and how far it is.
+pub(super) struct IndexBuild {
+    /// The segments it replaces.
+    pub inputs: Vec<u64>,
+    way: Arc<Way>,
+}
+
+impl IndexBuild {
+    pub fn new(inputs: Vec<u64>, way: &Arc<Way>) -> Arc<Self> {
+        Arc::new(Self { inputs, way: way.clone() })
+    }
+}
+
+/// The index build that runs, and the one that waits for its turn.
+#[derive(Default)]
+pub(super) struct Indexing {
+    pub runs: Option<Arc<IndexBuild>>,
+    pub waits: Option<Arc<IndexBuild>>,
+}
+
+impl Indexing {
+    fn now(&self) -> Option<Arc<IndexBuild>> {
+        self.runs.as_ref().or(self.waits.as_ref()).cloned()
+    }
+}
+
+type Slot = fn(&mut Indexing) -> &mut Option<Arc<IndexBuild>>;
+
+/// What is in this place of [`Indexing`] is gone when this is dropped.
+pub(super) struct IndexingNow<'a>(&'a Engine, Slot);
+
+impl<'a> IndexingNow<'a> {
+    pub fn new(e: &'a Engine, slot: Slot, build: Option<Arc<IndexBuild>>) -> Self {
+        let now = Self(e, slot);
+        now.set(build);
+        now
+    }
+
+    pub fn set(&self, build: Option<Arc<IndexBuild>>) {
+        *self.1(&mut self.0.indexing.lock().unwrap_or_else(|e| e.into_inner())) = build;
+    }
+}
+
+impl Drop for IndexingNow<'_> {
+    fn drop(&mut self) {
+        self.set(None);
     }
 }
 

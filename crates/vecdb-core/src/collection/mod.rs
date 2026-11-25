@@ -83,6 +83,7 @@ mod flush;
 mod maintain;
 mod manifest;
 pub mod meta;
+mod pace;
 pub(crate) mod search;
 mod segment;
 mod wal;
@@ -105,7 +106,9 @@ use crate::quant::Codec;
 use crate::store::{VectorStore, check_dim};
 use background::{Background, Room, Waited, Workers};
 use columns::{SegmentAttrs, decode_row, encode_row};
+use maintain::Indexing;
 use manifest::{MANIFEST, Manifest, SegmentEntry, SegmentKind};
+use pace::{Line, Zone};
 use segment::{Body, Frozen, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
 use wal::{Event, LoggedOp, Wal, replay_chain, wal_generation, wal_name};
 
@@ -247,14 +250,21 @@ pub struct OpenOptions {
     /// the write that fills a segment flushes it, and indexes are built by
     /// [`Engine::maintain`] only.
     pub background: bool,
-    /// With `background`: writes wait while flat segments hold more than
-    /// this many bytes of vectors (they are in RAM, and every search scans
-    /// them) and an index build or a merge that will take them is due. That
-    /// is until the build of the first of them is done (an eighth of the
-    /// limit, or `index_bytes` if that is more), after those of other
-    /// collections that share [`builds`](Self::builds) and came before;
-    /// compactions do not hold it up, but take some of its CPUs. Segments a
-    /// running [`Engine::optimize`] has taken do not count. 0 = no limit.
+    /// With `background`: the bytes of vectors that may be in no SSD index
+    /// (they are in RAM, and every search scans them). Over the last quarter
+    /// before it, writes are slowed down to what index builds keep up with;
+    /// at it they wait. That is only as long as a build that makes room is
+    /// due: compactions do not hold writes up.
+    ///
+    /// What the next build takes in counts as gone little by little, as the
+    /// build gets closer to its end (and, before that, to its turn, if it
+    /// waits for others: see [`builds`](Self::builds)), so that writes need
+    /// not wait for all of it. So there may be that much more than the limit
+    /// in RAM: `index_bytes`, or an eighth of the limit if that is more. And
+    /// the limit is taken to be `index_bytes` and a quarter at least (or
+    /// `index_bytes` and two segments): with less, builds would stand idle,
+    /// or writes stop for them. Segments a running [`Engine::optimize`] has
+    /// taken do not count. 0 = no limit.
     pub max_unindexed_bytes: u64,
     /// Longest wait of a write for flushes or index builds to catch up; then
     /// it fails with [`Error::Unavailable`], and nothing is written. `None`:
@@ -417,6 +427,12 @@ pub struct CollectionStats {
     pub write_batches: u64,
     pub write_groups: u64,
     pub wal_syncs: u64,
+    /// The bytes of vectors per second that writes are slowed down to now, if
+    /// they are (see [`OpenOptions::max_unindexed_bytes`]).
+    pub write_rate: Option<u64>,
+    /// How long writes have waited because of that, or for flushes, all
+    /// together, since the collection was opened.
+    pub write_wait: Duration,
 }
 
 /// What [`Collection::open`] found.
@@ -613,6 +629,14 @@ pub struct Engine {
     lanes: [Mutex<()>; 2],
     /// The segments a running `optimize` replaces.
     optimizing: Mutex<BTreeSet<u64>>,
+    /// The index builds that run or wait for their turn.
+    indexing: Mutex<Indexing>,
+    /// Where writes are slowed down and stopped, if they ever are; the line
+    /// they wait in then; and how long they have waited, for that or for
+    /// flushes (in microseconds).
+    zone: Option<Zone>,
+    line: Line,
+    write_wait: AtomicU64,
     limit: Arc<BuildLimit>,
     /// What the background threads, and those waiting for them, share.
     background: Background,
@@ -731,6 +755,8 @@ impl Engine {
         writer: Writer,
     ) -> Self {
         let limit = opts.builds.clone().unwrap_or_else(|| BuildLimit::new(1));
+        let most = opts.max_unindexed_bytes;
+        let zone = (opts.background && most != 0).then(|| Zone::new(most, &config));
         Self {
             dir: dir.to_path_buf(),
             _lock: lock,
@@ -746,6 +772,10 @@ impl Engine {
             flushing: Mutex::new(()),
             lanes: Default::default(),
             optimizing: Mutex::default(),
+            indexing: Mutex::default(),
+            zone,
+            line: Line::default(),
+            write_wait: AtomicU64::new(0),
             limit,
             background: Background::default(),
             #[cfg(test)]
@@ -831,6 +861,7 @@ impl Engine {
             (w.logs_mut().map(|l| l.bytes()).sum(), w.next_seq, (w.batches, w.groups, w.syncs))
         };
         let bg = self.background.progress();
+        let write_rate = self.write_rate().map(|r| r as u64);
         let v = self.view();
         let segments = v
             .sealed
@@ -871,6 +902,8 @@ impl Engine {
             write_batches: writes.0,
             write_groups: writes.1,
             wal_syncs: writes.2,
+            write_rate,
+            write_wait: Duration::from_micros(self.write_wait.load(Ordering::Relaxed)),
         }
     }
 
@@ -887,10 +920,10 @@ impl Engine {
     /// crash keeps all of them or none, and searches see all of them or
     /// none.
     ///
-    /// Waits for room first when flushes or index builds are far behind
-    /// ([`Error::Unavailable`] if that is because they keep failing, or after
-    /// [`OpenOptions::max_write_wait`]). A
-    /// failed flush alone does not fail a write, which is logged and
+    /// Waits first when flushes or index builds are behind (see
+    /// [`OpenOptions::max_unindexed_bytes`]; [`Error::Unavailable`] if that is
+    /// because they keep failing, or after [`OpenOptions::max_write_wait`]).
+    /// A failed flush alone does not fail a write, which is logged and
     /// applied; it is retried (see [`CollectionStats::flush_error`]).
     pub fn write(&self, ops: &[WriteOp]) -> Result<()> {
         self.write_ops(ops).map(|_| ())
@@ -902,7 +935,7 @@ impl Engine {
             return Ok(Vec::new());
         }
         let p = self.prepare(ops)?;
-        self.make_room()?;
+        self.make_room(p.vectors.len() as u64 * 4)?;
         let r = self.enqueue(p);
         if !self.opts.background {
             self.flush_frozen();
@@ -910,16 +943,33 @@ impl Engine {
         r
     }
 
-    /// Waits, or fails, while there is no room for another write.
-    fn make_room(&self) -> Result<()> {
+    /// Waits until there is room for a write of `bytes` of vectors, or fails.
+    fn make_room(&self, bytes: u64) -> Result<()> {
         let deadline = self.opts.max_write_wait.and_then(|w| Instant::now().checked_add(w));
+        let waited = |time: Duration| {
+            self.write_wait.fetch_add(time.as_micros() as u64, Ordering::Relaxed);
+        };
+        let late = |what| Err(Error::Unavailable(format!("{what} are behind")));
+        // (One that only deletes takes none.)
+        if bytes > 0 {
+            match self.line.wait(bytes, deadline, || self.write_rate()) {
+                Ok(time) => waited(time),
+                Err(time) => {
+                    waited(time);
+                    return late("index builds");
+                }
+            }
+        }
         loop {
             match self.room(&self.background.progress()) {
                 Room::Yes => return Ok(()),
                 Room::Wait(what) => {
+                    let start = Instant::now();
                     let more = |p: &_| !matches!(self.room(p), Room::Wait(_));
-                    if self.background.wait_until(deadline, more) == Waited::Late {
-                        return Err(Error::Unavailable(format!("{what} are behind")));
+                    let end = self.background.wait_until(deadline, more);
+                    waited(start.elapsed());
+                    if end == Waited::Late {
+                        return late(what);
                     }
                 }
                 Room::No(why) => {

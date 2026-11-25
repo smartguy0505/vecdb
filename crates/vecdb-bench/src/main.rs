@@ -68,13 +68,17 @@ commands:
                [--seal-mb 32] [--index-mb 64] [--max-ssd 8] [--pq-m M] [--threads 6]
                [--build-mem 2] [--maintain false] [--optimize false] [--secs S] [--limit N]
                [--labels false] [--writers 1] [--rate 0] [--background false]
-               [--unindexed-mb 1024]
+               [--unindexed-mb 1024] [--shards 0] [--builds 1] [--write-wait 0] [--trace FILE]
                create a collection in D and upsert F (ids = row numbers) through the WAL:
                rows/s and batch latency (--writers threads take batches in turn: their
                batches share WAL writes and fsyncs), at --rate rows/s in all (0 = flat out).
                Segments are flushed by the write that fills them, and --maintain runs index
-               builds as they fall due; or with --background, threads do both (writes wait
-               while more than --unindexed-mb wait for a build); --optimize merges everything into one SSD index at the end; then reopen.
+               builds as they fall due; or with --background, threads do both (writes are
+               slowed down, and at --unindexed-mb stopped, while those are behind); --optimize
+               merges everything into one SSD index at the end; then reopen. --shards S makes
+               a database of it, with --builds at once. With --write-wait S, writes that have
+               waited for so long are refused, and sent again after a second. --trace writes
+               what there is, every 0.1 s, and each batch's time.
                --labels adds int fields u (uniform 0..999) and p (bucket of a random
                projection) for coll-filter
   coll-search  --from D0 --dir D --base F --query Q [--k 10] [--l 40,80,160] [--w 4]

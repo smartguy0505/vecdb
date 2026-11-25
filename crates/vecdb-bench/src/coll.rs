@@ -1,6 +1,8 @@
 //! Collection benchmarks: ingest through the WAL, and search with deletes.
 
+use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -8,8 +10,8 @@ use vecdb_core::collection::NO_ATTRS;
 use vecdb_core::disk::IoMode;
 use vecdb_core::rng::SplitMix64;
 use vecdb_core::{
-    Attrs, Collection, CollectionConfig, Durability, Field, Filter, FilterMode, FlatIndex, Metric, OpenOptions,
-    SearchOptions, SearchPool, WriteOp,
+    Attrs, Collection, CollectionConfig, CollectionStats, Database, DatabaseOptions, Durability, Error, Field, Filter,
+    FilterMode, FlatIndex, Metric, Op, OpenOptions, Row, SearchOptions, SearchPool, ShardedCollection, WriteOp,
 };
 
 use super::{AnyResult, Args, load_vectors, memory_usage, parse_list, progress, run_queries};
@@ -26,7 +28,7 @@ fn open_options(a: &Args) -> AnyResult<OpenOptions> {
         durability,
         background: a.num("background", false)?,
         max_unindexed_bytes: (a.num::<f64>("unindexed-mb", 1024.0)? * (1 << 20) as f64) as u64,
-        max_write_wait: None,
+        max_write_wait: Some(a.num("write-wait", 0.0)?).filter(|&s| s > 0.0).map(Duration::from_secs_f64),
         builds: None,
         pool: if pool > 0 { Some(SearchPool::new(pool, a.num("pool-cpus", 0)?)?) } else { None },
         threads: a.num("threads", 6)?,
@@ -42,7 +44,7 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     a.allow(&[
         "base", "dir", "metric", "limit", "batch", "durability", "seal-mb", "index-mb", "max-ssd", "pq-m", "threads",
         "build-mem", "maintain", "optimize", "secs", "direct", "labels", "writers", "background", "unindexed-mb",
-        "rate",
+        "rate", "trace", "shards", "builds", "write-wait",
     ])?;
     let base = load_vectors(&a.req_path("base")?, a.opt_num("limit")?)?;
     let dir = a.req_path("dir")?;
@@ -67,12 +69,28 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     let writers: usize = a.num("writers", 1)?;
     // Rows per second over all writers; 0: as fast as they go.
     let rate: f64 = a.num("rate", 0.0)?;
+    // A file for what there is every 0.1 s, and what batches take.
+    let mut trace = match a.map.get("trace") {
+        Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+        None => None,
+    };
     if writers > 1 && maintain {
         return Err("--maintain runs with one writer only".into());
     }
-    let c = Collection::create(&dir, cfg.clone(), opts.clone())?;
+    // 0: not a database.
+    let shards: usize = a.num("shards", 0)?;
+    let optimize: bool = a.num("optimize", false)?;
+    if shards > 0 && (maintain || optimize || with_labels) {
+        return Err("--shards goes without --maintain, --optimize and --labels".into());
+    }
+    let db_opts = DatabaseOptions { shard: opts.clone(), builds: a.num("builds", 1)?, ..DatabaseOptions::default() };
+    let db = if shards > 0 { Some(Database::open(&dir, &db_opts)?.0) } else { None };
+    let target = match &db {
+        Some(db) => Target::Sharded(db.create_collection("ingest", cfg.clone(), shards)?),
+        None => Target::One(Collection::create(&dir, cfg.clone(), opts.clone())?),
+    };
     println!(
-        "ingest   {} x {} ({}) into {}: batches of {batch}, {writers} writers, {:?}, seal {} MiB, index {} MiB, maintain {maintain}, background {}",
+        "ingest   {} x {} ({}) into {}: batches of {batch}, {writers} writers, {:?}, seal {} MiB, index {} MiB, maintain {maintain}, background {}, shards {shards}, builds at once {}",
         base.len(),
         base.dim,
         cfg.metric.name(),
@@ -81,8 +99,16 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
         cfg.seal_bytes >> 20,
         cfg.index_bytes >> 20,
         opts.background,
+        db_opts.builds,
     );
     let write_rows = |start: usize, end: usize| -> vecdb_core::Result<()> {
+        let c = match &target {
+            Target::One(c) => c,
+            Target::Sharded(c) => {
+                let row = |i: usize| Row { id: i as u64, vector: base.row(i).to_vec(), attrs: Attrs::new() };
+                return c.write((start..end).map(|i| Op::Upsert(row(i))).collect()).map(|_| ());
+            }
+        };
         let attrs: Vec<Attrs> = match &labels {
             Some(lb) => (start..end).map(|i| Attrs::new().int("u", lb.u[i]).int("p", lb.p[i])).collect(),
             None => Vec::new(),
@@ -103,10 +129,36 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
     // is up); one writer goes through them in order.
     let next = AtomicUsize::new(0);
     let written = AtomicUsize::new(0);
+    let ended = AtomicBool::new(false);
+    let peak = AtomicUsize::new(0);
+    let refused = AtomicUsize::new(0);
     let lats = std::thread::scope(|s| {
+        // What is in no SSD index, meanwhile.
+        s.spawn(|| {
+            while !ended.load(Ordering::Relaxed) {
+                let all = target.stats();
+                let sum = |f: &dyn Fn(&CollectionStats) -> usize| all.iter().map(f).sum::<usize>();
+                let flat = sum(&|s| s.segments.iter().filter(|s| s.kind == "flat").map(|s| s.rows).sum());
+                let (frozen, growing) = (sum(&|s| s.frozen_rows), sum(&|s| s.growing_rows));
+                peak.fetch_max(flat + frozen + growing, Ordering::Relaxed);
+                if let Some(t) = &mut trace {
+                    let _ = writeln!(
+                        t,
+                        "at {:.3} rows {} flat {flat} frozen {frozen} growing {growing} rate {:?} wait {:.3} builds {} flushes {}",
+                        t0.elapsed().as_secs_f64(),
+                        written.load(Ordering::Relaxed),
+                        all.iter().map(|s| s.write_rate).collect::<Vec<_>>(),
+                        all.iter().map(|s| s.write_wait.as_secs_f64()).sum::<f64>(),
+                        sum(&|s| s.builds as usize),
+                        sum(&|s| s.flushes as usize),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
         let handles: Vec<_> = (0..writers)
             .map(|_| {
-                s.spawn(|| -> Result<(Vec<f64>, usize, f64), String> {
+                s.spawn(|| -> Result<(Vec<(f64, f64)>, usize, f64), String> {
                     let (mut lat, mut jobs, mut maintain_s) = (Vec::new(), 0, 0.0);
                     while t0.elapsed().as_secs_f64() < secs {
                         let start = next.fetch_add(batch, Ordering::Relaxed);
@@ -119,10 +171,20 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
                             std::thread::sleep(Duration::from_secs_f64(due.max(0.0)));
                         }
                         let tb = Instant::now();
-                        write_rows(start, end).map_err(|e| e.to_string())?;
-                        lat.push(tb.elapsed().as_secs_f64() * 1e3);
+                        loop {
+                            match write_rows(start, end) {
+                                Ok(()) => break,
+                                // As a client does that is told to retry.
+                                Err(Error::Unavailable(_)) if opts.max_write_wait.is_some() => {
+                                    refused.fetch_add(1, Ordering::Relaxed);
+                                    std::thread::sleep(Duration::from_secs(1));
+                                }
+                                Err(e) => return Err(e.to_string()),
+                            }
+                        }
+                        lat.push((tb.duration_since(t0).as_secs_f64(), tb.elapsed().as_secs_f64() * 1e3));
                         written.fetch_add(end - start, Ordering::Relaxed);
-                        if maintain {
+                        if let (true, Target::One(c)) = (maintain, &target) {
                             let tm = Instant::now();
                             jobs += c.maintain().map_err(|e| e.to_string())?.len();
                             maintain_s += tm.elapsed().as_secs_f64();
@@ -132,16 +194,21 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("writer thread")).collect::<Vec<_>>()
+        let lats = handles.into_iter().map(|h| h.join()).collect::<Vec<_>>();
+        ended.store(true, Ordering::Relaxed);
+        lats.into_iter().map(|l| l.expect("writer thread")).collect::<Vec<_>>()
     });
+    let rows = written.load(Ordering::Relaxed);
+    let ingest_s = t0.elapsed().as_secs_f64();
     for l in lats {
         let (l, j, m) = l?;
-        lat.extend(l);
+        if let Some(t) = &mut trace {
+            l.iter().try_for_each(|(at, ms)| writeln!(t, "batch {at:.3} {ms:.3}"))?;
+        }
+        lat.extend(l.into_iter().map(|(_, ms)| ms));
         jobs += j;
         maintain_s += m;
     }
-    let rows = written.load(Ordering::Relaxed);
-    let ingest_s = t0.elapsed().as_secs_f64();
     lat.sort_by(f64::total_cmp);
     let pct = |p: f64| lat[((p / 100.0) * (lat.len() - 1) as f64).round() as usize];
     println!(
@@ -153,54 +220,87 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
         pct(99.9),
         pct(100.0),
     );
+    let over = |ms: f64| lat.len() - lat.partition_point(|&l| l <= ms);
+    println!(
+        "waits    batches over 0.1 / 1 / 10 s: {} / {} / {}; refused {} times; most in no index: {} rows = {:.0} MiB",
+        over(100.0),
+        over(1000.0),
+        over(10_000.0),
+        refused.load(Ordering::Relaxed),
+        peak.load(Ordering::Relaxed),
+        peak.load(Ordering::Relaxed) as f64 * base.dim as f64 * 4.0 / (1 << 20) as f64,
+    );
+    let sum = |f: &dyn Fn(&CollectionStats) -> u64| target.stats().iter().map(f).sum::<u64>();
     if opts.background {
-        let before = c.stats();
+        let (flushes, builds) = (sum(&|s| s.flushes), sum(&|s| s.builds));
         let t = Instant::now();
-        c.wait_idle()?;
+        match &target {
+            Target::One(c) => c.wait_idle()?,
+            Target::Sharded(c) => c.wait_idle()?,
+        }
         println!(
-            "idle     after {:.1} s more; {} flushes and {} builds by the end of the ingest, then {} and {}",
+            "idle     after {:.1} s more; {flushes} flushes and {builds} builds by the end of the ingest, then {} and {}",
             t.elapsed().as_secs_f64(),
-            before.flushes,
-            before.builds,
-            c.stats().flushes - before.flushes,
-            c.stats().builds - before.builds,
+            sum(&|s| s.flushes) - flushes,
+            sum(&|s| s.builds) - builds,
         );
     }
-    let st = c.stats();
+    let (batches, groups) = (sum(&|s| s.write_batches), sum(&|s| s.write_groups));
     println!(
-        "wal      {} batches in {} writes, {} fsyncs: {:.1} batches per write",
-        st.write_batches,
-        st.write_groups,
-        st.wal_syncs,
-        st.write_batches as f64 / st.write_groups.max(1) as f64
+        "wal      {batches} batches in {groups} writes, {} fsyncs: {:.1} batches per write",
+        sum(&|s| s.wal_syncs),
+        batches as f64 / groups.max(1) as f64
     );
     if maintain {
         println!("maintain {jobs} jobs, {maintain_s:.1} s of the ingest time");
     }
-    if a.num("optimize", false)? {
+    if let (true, Target::One(c)) = (optimize, &target) {
         let t = Instant::now();
         let job = c.optimize()?;
         println!("optimize {:.1} s: {job:?}", t.elapsed().as_secs_f64());
     }
-    print_stats(&c);
-    drop(c);
+    target.stats().iter().for_each(print_state);
+    drop((target, db));
     let t = Instant::now();
-    let (c, report) = Collection::open(&dir, opts)?;
-    println!(
-        "reopen   {:.2} s: replayed {} batches ({} writes, {:.1} MB of WAL), removed {:?}",
-        t.elapsed().as_secs_f64(),
-        report.replay.batches,
-        report.replay.ops,
-        report.replay.bytes as f64 / 1e6,
-        report.removed
-    );
-    drop(c);
+    let reports = if shards > 0 {
+        Database::open(&dir, &db_opts)?.1.opened.remove(0).1
+    } else {
+        vec![Collection::open(&dir, opts)?.1]
+    };
+    for report in reports {
+        println!(
+            "reopen   {:.2} s: replayed {} batches ({} writes, {:.1} MB of WAL), removed {:?}",
+            t.elapsed().as_secs_f64(),
+            report.replay.batches,
+            report.replay.ops,
+            report.replay.bytes as f64 / 1e6,
+            report.removed
+        );
+    }
     println!("memory   peak RSS {:.2} GB", memory_usage().1 as f64 / 1e9);
     Ok(())
 }
 
+/// What an ingest goes into.
+enum Target {
+    One(Collection),
+    Sharded(Arc<ShardedCollection>),
+}
+
+impl Target {
+    fn stats(&self) -> Vec<CollectionStats> {
+        match self {
+            Target::One(c) => vec![c.stats()],
+            Target::Sharded(c) => c.stats().expect("not dropped"),
+        }
+    }
+}
+
 fn print_stats(c: &Collection) {
-    let st = c.stats();
+    print_state(&c.stats());
+}
+
+fn print_state(st: &CollectionStats) {
     let segs: Vec<String> = st.segments.iter().map(|s| format!("{} {} ({} deleted)", s.kind, s.rows, s.deleted)).collect();
     println!(
         "state    {} live; growing {} rows; frozen {}; WAL {:.1} MB; segments: {}",

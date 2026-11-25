@@ -174,6 +174,34 @@ pub fn partition_node_bytes(dim: usize, degree: usize) -> u64 {
     (dim * 4 + 8 * degree + 96) as u64
 }
 
+/// Where the steps that take most of a build's time end, if all of it is 1:
+/// a rough guess, for saying how far a build has come.
+struct Shares {
+    train: f32,
+    encode: f32,
+    graphs: f32,
+}
+
+impl Shares {
+    /// For `nodes` rows, `sample` of which PQ is trained on.
+    fn new(dim: usize, nodes: usize, sample: usize, budget_nodes: Option<usize>, p: &PartitionedBuildParams) -> Self {
+        let one = budget_nodes.map_or(p.partitions == 1, |b| nodes <= b);
+        let copies = if one { 1 } else { p.overlap };
+        let degree = if p.partition_degree == 0 { p.graph.max_degree } else { p.partition_degree };
+        let f = |n: usize| n as f64;
+        // In microseconds of one thread: about right, within a factor of
+        // two, at 128 to 8192 dims (i7-8700).
+        let train = f(sample) * f(p.pq.iters) * f(p.pq.m);
+        let encode = f(nodes) * f(p.pq.m);
+        let insert = f(dim) * f(p.graph.build_list) * f(degree) / 1400.0;
+        let graphs = f(nodes) * f(copies) * f(p.graph.passes) * insert;
+        // What is left is for merging and writing.
+        let per_us = 0.96 / (train + encode + graphs).max(1.0);
+        let end = |us: f64| (us * per_us) as f32;
+        Self { train: end(train), encode: end(train + encode), graphs: end(train + encode + graphs) }
+    }
+}
+
 /// Rows to nodes. A row identical to an earlier row shares that row's node.
 struct NodeMap {
     rows: usize,
@@ -712,9 +740,10 @@ pub(crate) fn build(
     };
     let mut sample = Vec::new();
     read_nodes(src, &map, metric, &sample_nodes, threads(), &mut sample)?;
-    drop(sample_nodes);
-    let pq = ProductQuantizer::train_until(dim, &sample, &p.pq, &p.cancel)?;
     let budget_nodes = (p.partitions == 0).then(|| (p.memory_budget / partition_node_bytes(dim, part_r)) as usize);
+    let shares = Shares::new(dim, nodes, sample_nodes.len(), budget_nodes, p);
+    drop(sample_nodes);
+    let pq = ProductQuantizer::train_until(dim, &sample, &p.pq, &p.cancel.part(0.0, shares.train))?;
     if budget_nodes.is_some_and(|b| b < 1000) {
         return Err(Error::InvalidArgument(format!(
             "a memory budget of {} bytes holds under 1000 vectors of dimension {dim}",
@@ -802,6 +831,7 @@ pub(crate) fn build(
                 }
             });
         }
+        p.cancel.part(shares.train, shares.encode).done(v1, nodes);
     }
     let mean: Vec<f32> = mean_sum.iter().map(|&s| (s / nodes as f64) as f32).collect();
     let mean_inv_norm = inv_norm(&mean);
@@ -811,8 +841,9 @@ pub(crate) fn build(
     // 4. Partition graphs. The entry is the node nearest the mean, as in the
     //    in-memory build; each partition checks its own nodes.
     let mut entry: Option<(f32, u32)> = None;
-    let mut largest = 0;
+    let (mut largest, mut members_so_far) = (0, 0);
     let mut part_bytes = 0u64;
+    let graphs = p.cancel.part(shares.encode, shares.graphs);
     let by_distance = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     for s in 0..k {
         p.cancel.check()?;
@@ -832,7 +863,10 @@ pub(crate) fn build(
             read_nodes(src, &map, metric, &members, threads(), &mut buf)?;
             let points = Points::new(&buf, dim, metric, threads());
             let gp = GraphParams { max_degree: part_r, seed: p.graph.seed.wrapping_add(s as u64), ..p.graph.clone() };
-            let (lists, _) = build_graph(&points, &gp, &p.cancel)?;
+            let at = |n: usize| n as f32 / (overlap * nodes) as f32;
+            let part = graphs.part(at(members_so_far), at(members_so_far + members.len()));
+            members_so_far += members.len();
+            let (lists, _) = build_graph(&points, &gp, &part)?;
             let best = par::map_ranges(members.len(), threads(), |range| {
                 let kern = kernels::best();
                 range.map(|i| (points.dist_to(kern, &mean, mean_inv_norm, i as u32), members[i])).min_by(by_distance)

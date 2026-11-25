@@ -5,21 +5,21 @@
 //! may wait for, and a compaction of a large segment can take hours.
 //!
 //! Failures are retried, with growing pauses, and reported by
-//! [`Engine::stats`]. Writes that outrun the threads wait
-//! ([`Engine::room`]), for a flush or an index build but never for a
-//! compaction. Dropping the [`Collection`](super::Collection) stops builds
-//! early, and waits for the flush that is running.
+//! [`Engine::stats`]. Writes that outrun the threads are slowed down to what
+//! index builds keep up with (see `pace`), and wait for flushes
+//! ([`Engine::room`]), but never for a compaction. Dropping the
+//! [`Collection`](super::Collection) stops builds early, and waits for the
+//! flush that is running.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::flush::MAX_FROZEN;
-use super::maintain::Lane;
+use super::maintain::{IndexBuild, IndexingNow, Lane};
 use super::{Collection, Engine};
-use crate::cancel::Cancel;
+use crate::cancel::{Cancel, Done};
 use crate::error::{Error, Result};
 use crate::par;
 
@@ -45,15 +45,24 @@ pub struct BuildLimit {
 #[derive(Debug)]
 struct Places {
     free: usize,
-    /// Tickets of those that wait, in order.
-    waiting: VecDeque<u64>,
+    /// Those that have a place or wait for one, in the order they came.
+    line: Vec<InLine>,
     next: u64,
+}
+
+#[derive(Debug)]
+struct InLine {
+    ticket: u64,
+    waits: bool,
+    /// What it takes in, and how far it is.
+    bytes: u64,
+    done: Arc<Done>,
 }
 
 impl BuildLimit {
     /// `builds` of each kind at once (at least one).
     pub fn new(builds: usize) -> Arc<Self> {
-        let places = || Mutex::new(Places { free: builds.max(1), waiting: VecDeque::new(), next: 0 });
+        let places = || Mutex::new(Places { free: builds.max(1), line: Vec::new(), next: 0 });
         Arc::new(Self { lanes: [places(), places()], running: Arc::default() })
     }
 
@@ -61,13 +70,18 @@ impl BuildLimit {
         self.lanes[lane as usize].lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Lines up for a place.
-    fn line_up(&self, lane: Lane) -> Turn<'_> {
+    /// Lines up for a place, for a build that takes `bytes` in.
+    pub(super) fn line_up(&self, lane: Lane, bytes: u64) -> Turn<'_> {
         let mut p = self.places(lane);
         let ticket = p.next;
         p.next += 1;
-        p.waiting.push_back(ticket);
-        Turn { limit: self, lane, ticket, has: false }
+        let done = Arc::new(Done::default());
+        // It does not wait for any of them if there is a place.
+        let free = p.free > p.line.iter().filter(|b| b.waits).count();
+        let before = if free { Vec::new() } else { p.line.iter().map(Before::new).collect() };
+        p.line.push(InLine { ticket, waits: true, bytes, done: done.clone() });
+        let way = Arc::new(Way { from: 0.0, before, bytes: bytes as f64, done });
+        Turn { limit: self, lane, ticket, has: false, way }
     }
 
     /// Counts a build that runs until the result is dropped.
@@ -78,22 +92,34 @@ impl BuildLimit {
 }
 
 /// A build's place under a limit, or in the line for one.
-struct Turn<'a> {
+pub(super) struct Turn<'a> {
     limit: &'a BuildLimit,
     lane: Lane,
     ticket: u64,
     has: bool,
+    pub way: Arc<Way>,
 }
 
 impl Turn<'_> {
+    /// What it takes in, which can change while it waits: another job is due,
+    /// or it has more to do.
+    pub fn takes(&mut self, bytes: u64) {
+        if self.way.bytes != bytes as f64 {
+            let mut p = self.limit.places(self.lane);
+            p.line.iter_mut().filter(|b| b.ticket == self.ticket).for_each(|b| b.bytes = bytes);
+            let Way { from, before, done, .. } = &*self.way;
+            let (before, done) = (before.clone(), done.clone());
+            self.way = Arc::new(Way { from: *from, before, bytes: bytes as f64, done });
+        }
+    }
+
     /// Takes a place if there is one for each of those before in the line,
     /// and one more.
-    fn come(&mut self) -> bool {
+    pub fn come(&mut self) -> bool {
         let mut p = self.limit.places(self.lane);
-        if let Some(before) = p.waiting.iter().position(|&t| t == self.ticket)
-            && before < p.free
-        {
-            p.waiting.remove(before);
+        let free = p.free;
+        if let Some(b) = p.line.iter_mut().filter(|b| b.waits).take(free).find(|b| b.ticket == self.ticket) {
+            b.waits = false;
             p.free -= 1;
             self.has = true;
         }
@@ -104,11 +130,63 @@ impl Turn<'_> {
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
         let mut p = self.limit.places(self.lane);
+        p.line.retain(|b| b.ticket != self.ticket);
         if self.has {
             p.free += 1;
-        } else {
-            p.waiting.retain(|&t| t != self.ticket);
         }
+        // Those behind need not wait for it any more, whatever came of it.
+        self.way.done.set(1.0);
+    }
+}
+
+/// How far a build has come since it lined up: first through the builds
+/// before it, by their bytes, and then its own work.
+#[derive(Debug, Default)]
+pub(super) struct Way {
+    /// How far it was when its turn came.
+    from: f64,
+    /// Those it waits for, until then.
+    before: Vec<Before>,
+    bytes: f64,
+    /// Its own work.
+    pub done: Arc<Done>,
+}
+
+/// A build that another one waits for.
+#[derive(Clone, Debug)]
+struct Before {
+    /// What was left of it when that one lined up.
+    bytes: f64,
+    from: f64,
+    done: Arc<Done>,
+}
+
+impl Before {
+    fn new(b: &InLine) -> Self {
+        let from = b.done.get() as f64;
+        Self { bytes: b.bytes as f64 * (1.0 - from), from, done: b.done.clone() }
+    }
+
+    fn done(&self) -> f64 {
+        if self.from < 1.0 { (self.done.get() as f64 - self.from) / (1.0 - self.from) } else { 1.0 }
+    }
+}
+
+impl Way {
+    /// How far, from 0 to 1.
+    pub fn far(&self) -> f64 {
+        let sum = |f: &dyn Fn(&Before) -> f64| self.before.iter().map(f).sum::<f64>();
+        let far = if self.before.is_empty() {
+            self.done.get() as f64
+        } else {
+            sum(&|b| b.bytes * b.done()) / (self.bytes + sum(&|b| b.bytes)).max(1.0)
+        };
+        self.from + (1.0 - self.from) * far
+    }
+
+    /// The rest of the way, when its turn has come.
+    fn starts(&self) -> Arc<Self> {
+        Arc::new(Self { from: self.far(), done: self.done.clone(), ..Self::default() })
     }
 }
 
@@ -323,8 +401,25 @@ fn builder(e: &Engine, lane: Lane) {
     };
     let mut retry = RETRY.0;
     while e.background.wait(|_| e.next_job(lane).is_some()) {
-        let mut turn = e.limit.line_up(lane);
-        while !turn.come() && e.next_job(lane).is_some() && e.background.pause(FULL) {}
+        let bytes = e.next_job(lane).map_or(0, |(reason, inputs)| e.index_bytes_of(reason, &inputs));
+        let mut turn = e.limit.line_up(lane, bytes);
+        // What waits for an index, which jobs of the other lane do not change.
+        // (Dropped before its turn is.)
+        let waits = (lane == Lane::Flat).then(|| IndexingNow::new(e, |i| &mut i.waits, None));
+        let wait = |reason: &str, inputs: Vec<u64>, way: &Arc<Way>| {
+            if let Some(w) = &waits {
+                w.set((reason == "index").then(|| IndexBuild::new(inputs, way)));
+            }
+        };
+        while !turn.come() {
+            let Some((reason, inputs)) = e.next_job(lane) else { break };
+            turn.takes(e.index_bytes_of(reason, &inputs));
+            wait(reason, inputs, &turn.way);
+            e.at("build: waits");
+            if !e.background.pause(FULL) {
+                break;
+            }
+        }
         if !turn.has {
             continue;
         }
@@ -332,14 +427,19 @@ fn builder(e: &Engine, lane: Lane) {
         // of `optimize` holds a lane for as long as it takes.
         let one = match e.lanes[lane as usize].try_lock() {
             Err(TryLockError::WouldBlock) => {
-                drop(turn);
+                drop((waits, turn));
                 e.background.pause(FULL);
                 continue;
             }
             one => one.unwrap(),
         };
-        let r = e.next_job(lane).map(|(reason, inputs)| e.rebuild(&inputs, reason, threads));
-        drop((one, turn));
+        let r = e.next_job(lane).map(|(reason, inputs)| {
+            turn.takes(e.index_bytes_of(reason, &inputs));
+            let way = turn.way.starts();
+            wait(reason, inputs.clone(), &way);
+            e.rebuild_on(&inputs, reason, threads, &way)
+        });
+        drop((waits, one, turn));
         e.background.notify();
         match r {
             None => {}
@@ -366,9 +466,8 @@ pub(super) enum Room {
 
 impl Engine {
     /// Whether there is room for another write: the growing segment is not
-    /// full or can be frozen, and `max_unindexed_bytes` is not reached.
-    /// While flushes or index builds fail, up to 4 and 2 times as much is
-    /// let in.
+    /// full or can be frozen. While flushes or index builds fail, it is let
+    /// grow to 4 times its size, and the flat segments to twice the limit.
     pub(super) fn room(&self, p: &Progress) -> Room {
         let view = self.view();
         let seal = self.config.seal_bytes;
@@ -380,22 +479,29 @@ impl Engine {
             }
             _ => {}
         }
-        let limit = self.opts.max_unindexed_bytes;
-        if self.opts.background && limit != 0 {
-            let bytes = self.lane_segments(Lane::Flat).iter().map(|s| s.positions() as u64).sum::<u64>()
-                * self.config.dim as u64
-                * 4;
-            if bytes >= limit && matches!(self.next_job(Lane::Flat), Some(("index" | "shrink", _))) {
-                match &p.build_error[Lane::Flat as usize] {
-                    None => return Room::Wait("index builds"),
-                    Some(e) if bytes >= limit.saturating_mul(2) => {
-                        return Room::No(format!("index builds fail: {e}"));
-                    }
-                    Some(_) => {}
-                }
+        if let (Some(zone), Some(e)) = (&self.zone, &p.build_error[Lane::Flat as usize]) {
+            let rows: usize = self.lane_segments(Lane::Flat).iter().map(|s| s.positions()).sum();
+            if rows as f64 * self.config.dim as f64 * 4.0 >= 2.0 * zone.to && self.room_due() {
+                return Room::No(format!("index builds fail: {e}"));
             }
         }
         Room::Yes
+    }
+
+    /// Whether a job is due that gives back the room of flat segments.
+    fn room_due(&self) -> bool {
+        matches!(self.next_job(Lane::Flat), Some(("index" | "shrink", _)))
+    }
+
+    /// The bytes of vectors per second that may be written now; `None` if any
+    /// number. They are only slowed down as long as a job is due that makes
+    /// room, or may be after a flush, and neither fails.
+    pub(super) fn write_rate(&self) -> Option<f64> {
+        let rate = self.zone.as_ref()?.rate(self.unindexed())?;
+        let p = self.background.progress();
+        let flushing = !self.view().frozen.is_empty() && p.flush_error.is_none();
+        let fails = p.build_error[Lane::Flat as usize].is_some();
+        (!fails && (flushing || self.room_due())).then_some(rate)
     }
 
     /// With background threads: waits until there is nothing for them to
@@ -436,13 +542,13 @@ mod tests {
     #[test]
     fn builds_go_in_the_order_they_line_up() {
         let limit = BuildLimit::new(2);
-        let mut turns: Vec<Turn> = (0..5).map(|_| limit.line_up(Lane::Ssd)).collect();
+        let mut turns: Vec<Turn> = (0..5).map(|_| limit.line_up(Lane::Ssd, 1)).collect();
         // The third has to wait, whoever asks first; the second need not
         // wait for the first to take its place.
         assert!(!turns[2].come() && turns[1].come() && turns[1].come() && !turns[2].come() && turns[0].come());
         assert!(!turns[2].come() && !turns[3].come());
         // The other lane has places of its own.
-        let mut other = limit.line_up(Lane::Flat);
+        let mut other = limit.line_up(Lane::Flat, 1);
         assert!(other.come());
         // One leaves the line, two their places: the next two have them.
         drop(turns.remove(2));
@@ -452,10 +558,108 @@ mod tests {
         drop(turns.remove(0));
         assert!(turns[1].come());
         drop(turns);
-        assert!(limit.lanes.iter().all(|l| l.lock().unwrap().waiting.is_empty()));
+        assert!(limit.places(Lane::Ssd).line.is_empty());
         assert_eq!((limit.places(Lane::Ssd).free, limit.places(Lane::Flat).free), (2, 1));
         drop(other);
         assert_eq!(limit.places(Lane::Flat).free, 2);
+    }
+
+    #[test]
+    fn builds_come_closer_in_the_line() {
+        let near = |x: f64, y: f64| assert!((x - y).abs() < 1e-6, "{x}, not {y}");
+        let limit = BuildLimit::new(1);
+        let mut a = limit.line_up(Lane::Flat, 100);
+        assert!(a.come());
+        let way = a.way.starts();
+        way.done.set(0.25);
+        near(way.far(), 0.25);
+        // 75 are left of the first.
+        let mut b = limit.line_up(Lane::Flat, 300);
+        near(b.way.far(), 0.0);
+        a.way.done.set(0.5);
+        near(b.way.far(), 25.0 / 375.0);
+        let mut c = limit.line_up(Lane::Flat, 125);
+        near(c.way.far(), 0.0);
+        // (Not what is in the other lane.)
+        let other = limit.line_up(Lane::Ssd, 1000);
+        assert!(other.way.before.is_empty());
+        drop((a, other));
+        near(b.way.far(), 75.0 / 375.0);
+        near(c.way.far(), 50.0 / 475.0);
+        assert!(!c.come() && b.come());
+        let way = b.way.starts();
+        near(way.far(), 0.2);
+        way.done.set(0.5);
+        near(way.far(), 0.6);
+        near(c.way.far(), 200.0 / 475.0);
+        // One that leaves without having done all is out of the way as well.
+        drop(b);
+        near(c.way.far(), 350.0 / 475.0);
+        assert!(c.come());
+        let way = c.way.starts();
+        way.done.set(1.0);
+        near(way.far(), 1.0);
+        // Also from the middle of the line. Jobs that build nothing do not
+        // count, nor what is as good as done.
+        let x = limit.line_up(Lane::Flat, 100);
+        let y = limit.line_up(Lane::Flat, 0);
+        let z = limit.line_up(Lane::Flat, 100);
+        near(z.way.far(), 0.0);
+        drop(y);
+        near(z.way.far(), 0.0);
+        drop(x);
+        near(z.way.far(), 0.5);
+        drop(c);
+        near(z.way.far(), 0.5);
+        // Another job, which takes more in.
+        let mut a = limit.line_up(Lane::Flat, 100);
+        assert!(!a.come());
+        z.way.done.set(0.5);
+        near(a.way.far(), 50.0 / 200.0);
+        a.takes(350);
+        near(a.way.far(), 50.0 / 450.0);
+        let b = limit.line_up(Lane::Flat, 100);
+        near(b.way.before[1].bytes, 350.0);
+        drop(b);
+        a.takes(0);
+        near(a.way.far(), 0.5);
+        // It is the same one to those behind it.
+        a.takes(350);
+        let b = limit.line_up(Lane::Flat, 100);
+        a.takes(700);
+        a.way.done.set(0.5);
+        near(b.way.far(), 175.0 / 500.0);
+        drop(a);
+        near(b.way.far(), 350.0 / 500.0);
+        drop(b);
+        // Nothing to go by.
+        let none = limit.line_up(Lane::Flat, 0);
+        drop(z);
+        near(none.way.far(), 1.0);
+        drop(none);
+        let mut idle = limit.line_up(Lane::Flat, 0);
+        assert!(idle.way.before.is_empty() && idle.come());
+        let only = limit.line_up(Lane::Flat, 0);
+        near(only.way.far(), 0.0);
+        assert_eq!(only.way.before.len(), 1);
+    }
+
+    /// Those who need not wait for anybody are not on their way yet.
+    #[test]
+    fn builds_do_not_wait_for_those_beside_them() {
+        let limit = BuildLimit::new(2);
+        let mut a = limit.line_up(Lane::Flat, 100);
+        assert!(a.come());
+        let mut b = limit.line_up(Lane::Flat, 100);
+        a.way.done.set(0.5);
+        assert!(b.way.before.is_empty() && b.way.far() == 0.0);
+        // (As both places will be taken.)
+        let c = limit.line_up(Lane::Flat, 100);
+        assert!(c.way.before.len() == 2 && b.come());
+        drop(a);
+        assert!((c.way.far() - 50.0 / 250.0).abs() < 1e-6);
+        let d = limit.line_up(Lane::Flat, 100);
+        assert_eq!(d.way.before.len(), 2);
     }
 
     #[test]

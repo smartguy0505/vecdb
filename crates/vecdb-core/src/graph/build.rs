@@ -115,6 +115,7 @@ pub(crate) fn build(points: &Points, p: &GraphParams, cancel: &Cancel) -> Result
             let end = (start + size).min(n);
             insert_batch(points, &mut graph, &order[start..end], entry, alpha, pass > 0, p, cancel);
             cancel.check()?;
+            cancel.done(pass * n + end, p.passes * n);
             start = end;
             size = (size * 2).min(max_batch);
         }

@@ -4,11 +4,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::cancel::Cancel;
+use crate::cancel::{Cancel, Done};
 use crate::dataset::Vecs;
 use crate::flat::FlatIndex;
 use crate::graph::GraphParams;
-use crate::quant::PqParams;
+use crate::quant::{PqParams, ProductQuantizer};
 use crate::quant::pq::tests::structured;
 
 /// A test's directory, removed when the test ends.
@@ -362,4 +362,98 @@ fn a_graph_build_is_cancelled_midway() {
         assert!(matches!(crate::graph::build::build(&points, &p, &cancel), Err(Error::Cancelled)));
         assert!(t0.elapsed() < full / 2, "{:?} of {full:?}", t0.elapsed());
     });
+}
+
+thread_local! {
+    /// What a build says it has done, and what it did at each of its
+    /// progress lines.
+    static DONE_AT: std::cell::RefCell<(std::sync::Arc<Done>, Vec<(String, f32)>)> = Default::default();
+}
+
+/// A build says how far it is: by the cost of its steps, up to the end of
+/// the graphs. That does not change what it makes.
+#[test]
+fn builds_say_how_far_they_are() {
+    fn note(line: &str) {
+        DONE_AT.with_borrow_mut(|(done, seen)| {
+            let step = line.split([':', '/']).next().unwrap();
+            seen.push((step.to_string(), done.get()));
+        });
+    }
+    let dir = Dir::new("build-done");
+    let data = Vecs { dim: 8, data: structured(3000, 8, 1) };
+    for partitions in [1, 4] {
+        let p = params(partitions, MergePrune::Pq, 2);
+        let (a, b) = (dir.file("plain.vdx"), dir.file("told.vdx"));
+        DiskIndex::build_partitioned(&data, None, Metric::L2, &a, &p).unwrap();
+        let done = std::sync::Arc::new(Done::default());
+        DONE_AT.set((done.clone(), Vec::new()));
+        let told =
+            PartitionedBuildParams { progress: Some(note), cancel: p.cancel.reporting(&done), ..p.clone() };
+        DiskIndex::build_partitioned(&data, None, Metric::L2, &b, &told).unwrap();
+        assert!(std::fs::read(&a).unwrap() == std::fs::read(&b).unwrap());
+
+        let seen = DONE_AT.take().1;
+        let at = |step: &str| seen.iter().find(|(s, _)| s == step).unwrap_or_else(|| panic!("{step}: {seen:?}")).1;
+        // Thread-microseconds: rows x iterations x code bytes, and so on.
+        let (rows, m) = (3000f64, p.pq.m as f64);
+        let train = rows.min(p.pq.max_train as f64) * p.pq.iters as f64 * m;
+        let encode = rows * m;
+        let copies = if partitions == 1 { 1.0 } else { 2.0 };
+        let insert = 8.0 * p.graph.build_list as f64 * p.graph.max_degree as f64 / 1400.0;
+        let all = train + encode + copies * rows * p.graph.passes as f64 * insert;
+        let near = |x: f32, want: f64| (x as f64 - 0.96 * want).abs() < 1e-5;
+        assert_eq!(at("scan"), 0.0);
+        assert!(near(at("train"), train / all), "{seen:?}");
+        assert!(near(at("encode"), (train + encode) / all), "{seen:?}");
+        let parts: Vec<f32> = seen.iter().filter(|s| s.0.starts_with("partition ")).map(|s| s.1).collect();
+        assert_eq!(parts.len(), partitions);
+        assert!(parts.is_sorted_by(|a, b| a < b) && near(parts[partitions - 1], 1.0), "{seen:?}");
+        // Each by its size.
+        assert!(parts[0] - at("encode") > 0.02 && near(at("merge"), 1.0), "{seen:?}");
+    }
+}
+
+/// Also in the middle of its steps.
+#[test]
+fn steps_say_how_far_they_are() {
+    let data = structured(4000, 8, 1);
+    let done = std::sync::Arc::new(Done::default());
+    let half = Cancel::default().reporting(&done).part(0.5, 1.0);
+    // The values there are while `f` runs.
+    let watch = |f: &(dyn Fn() + Sync)| {
+        done_is(&done, 0.0);
+        let over = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let seen = s.spawn(|| {
+                let mut seen = vec![done.get()];
+                while !over.load(std::sync::atomic::Ordering::Relaxed) {
+                    let x = done.get();
+                    if x != *seen.last().unwrap() {
+                        seen.push(x);
+                    }
+                }
+                seen
+            });
+            f();
+            over.store(true, std::sync::atomic::Ordering::Relaxed);
+            seen.join().unwrap()
+        })
+    };
+    let points = crate::graph::build::Points::new(&data, 8, Metric::L2, 1);
+    let p = GraphParams { max_degree: 32, build_list: 200, passes: 2, ..graph_params(1) };
+    let seen = watch(&|| drop(crate::graph::build::build(&points, &p, &half).unwrap()));
+    // (106 batches; the watching thread may be late.)
+    assert!(seen.len() > 10 && seen.is_sorted_by(|a, b| a < b) && done.get() == 1.0, "{seen:?}");
+    assert!(seen[1..].iter().all(|&x| x > 0.5), "{seen:?}");
+    assert!([(0.5, 0.75), (0.75, 1.0)].iter().all(|&(a, b)| seen.iter().any(|&x| x > a && x < b)), "{seen:?}");
+    let pq = PqParams { iters: 50, ..pq_params(4000) };
+    let seen = watch(&|| drop(ProductQuantizer::train_until(8, &data, &pq, &half).unwrap()));
+    assert!(seen.is_sorted_by(|a, b| a < b) && seen.iter().any(|&x| x > 0.5 && x < 1.0), "{seen:?}");
+    assert_eq!(done.get(), 1.0);
+}
+
+/// Sets what is done.
+fn done_is(done: &std::sync::Arc<Done>, x: f32) {
+    Cancel::default().reporting(done).part(x, x).done(0, 1);
 }

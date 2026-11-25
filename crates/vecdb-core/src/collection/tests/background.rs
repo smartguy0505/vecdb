@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::*;
+use super::background::BuildLimit;
 use super::maintain::Lane;
 use crate::cancel::Cancel;
 
@@ -231,8 +232,15 @@ fn writes_wait_for_a_slow_flush() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Writes wait when `max_unindexed_bytes` of flat segments wait for an
-/// index build; and flushes go on during one.
+/// Bytes of all vectors in no SSD index, whatever becomes of them.
+fn flat_and_growing(c: &Collection) -> f64 {
+    let st = c.stats();
+    let flat: usize = st.segments.iter().filter(|s| s.kind == "flat").map(|s| s.rows).sum();
+    ((flat + st.frozen_rows + st.growing_rows) * c.config().dim * 4) as f64
+}
+
+/// Writes stop when `max_unindexed_bytes` are in no index, less what a
+/// running build has come through; and flushes go on during one.
 #[test]
 fn writes_wait_for_a_slow_build() {
     let dir = test_dir("coll-bg-slowbuild");
@@ -247,21 +255,513 @@ fn writes_wait_for_a_slow_build() {
         s.spawn(|| write_on(&c, &written, &stop));
         until("a build", || blocked.load(Ordering::Relaxed));
         let n = settled(&written);
-        // 4000 in flat segments, with what may be frozen or growing by the
-        // time the last of them is.
-        assert!((4000..=5500).contains(&n), "{n} rows");
+        // The build has taken 2500 (or one more segment, if it began late)
+        // and is through with 96% of them.
+        assert!((6400..=6900).contains(&n), "{n} rows");
+        let left = c.unindexed() / (dim * 4) as f64;
+        assert!((4000.0..4002.0).contains(&left), "{left}");
         let st = c.stats();
         assert!(st.segments.iter().all(|s| s.kind == "flat") && st.builds == 0, "{st:?}");
+        assert!(st.frozen == 0 && st.growing_rows < 500 && st.write_rate == Some(0), "{st:?}");
         go.send(()).unwrap();
         until("more writes", || written.load(Ordering::Relaxed) > n + 2000);
     });
     c.flush().unwrap();
     c.wait_idle().unwrap();
     let st = c.stats();
-    assert_eq!((st.live as u64, st.build_error), (written.load(Ordering::Relaxed), None));
+    assert_eq!((st.live as u64, &st.build_error), (written.load(Ordering::Relaxed), &None));
     assert!(st.builds >= 1 && st.segments.iter().any(|s| s.kind == "ssd"));
+    // Those who waited have been counted, and nobody waits now.
+    assert!(st.write_wait >= Duration::from_secs(1) && st.write_rate.is_none(), "{st:?}");
     drop(c);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// What an index build has come through does not count any more while it
+/// runs, and nothing of what it took once it is done; all of it does again if
+/// it fails.
+#[test]
+fn what_a_build_has_done_does_not_count() {
+    let dir = test_dir("coll-bg-done");
+    let dim = 8;
+    let cfg = CollectionConfig { max_indexed_segments: 1000, ..ssd_config(dim, Metric::L2, 500, 2500) };
+    let opts = OpenOptions { max_unindexed_bytes: 100_000 * dim as u64 * 4, ..opts() };
+    let c = Collection::create(&dir, cfg, opts).unwrap();
+    let mut rng = SplitMix64::new(6);
+    let mut model = Model::default();
+    assert_eq!(c.unindexed(), 0.0);
+    // Growing, frozen and flat rows do, also deleted ones.
+    let (go, blocked) = block_at(&c, "flush: rows written");
+    upsert_batch(&c, &mut model, &mut rng, 0..500);
+    upsert_batch(&c, &mut model, &mut rng, 400..1300);
+    until("a flush", || blocked.load(Ordering::Relaxed));
+    assert_eq!((c.stats().frozen, c.unindexed()), (2, 1400.0 * 32.0));
+    go.send(()).unwrap();
+    c.flush().unwrap();
+    assert_eq!((c.stats().frozen, c.unindexed()), (0, 1400.0 * 32.0));
+
+    let (go, blocked) = block_at(&c, "build: built");
+    for i in 0..30 {
+        upsert_batch(&c, &mut model, &mut rng, 2000 + i * 100..2100 + i * 100);
+    }
+    until("a build", || blocked.load(Ordering::Relaxed));
+    upsert_batch(&c, &mut model, &mut rng, 9000..9010);
+    let inputs = c.indexing.lock().unwrap().runs.as_ref().expect("an index build").inputs.clone();
+    let taken: usize = c.sealed().iter().filter(|s| inputs.contains(&s.id)).map(|s| s.positions()).sum();
+    assert!(taken >= 2500 && inputs.len() < 30, "{taken}");
+    let (all, left) = (flat_and_growing(&c), c.unindexed());
+    let want = all - 0.96 * taken as f64 * 32.0;
+    assert!((left - want).abs() < 2.0 && left < all, "{left} of {all}, not {want}");
+    go.send(()).unwrap();
+    c.wait_idle().unwrap();
+    assert!(c.indexing.lock().unwrap().runs.is_none() && ssd_segments(&c) >= 1);
+    assert_eq!(c.unindexed(), flat_and_growing(&c));
+    assert!(c.unindexed() <= all - taken as f64 * 32.0);
+    drop(c);
+
+    // A build that fails after all.
+    let (c, _) = Collection::open(&dir, OpenOptions { background: false, ..test_opts() }).unwrap();
+    let next = c.manifest.lock().unwrap().next_segment;
+    let blocks: Vec<PathBuf> = (next..next + 50).map(|id| dir.join(disk_name(id)).join("x")).collect();
+    for i in 0..30 {
+        upsert_batch(&c, &mut model, &mut rng, 20_000 + i * 100..20_100 + i * 100);
+    }
+    blocks.iter().for_each(|b| fs::create_dir_all(b).unwrap());
+    assert!(c.maintain().is_err());
+    assert!(c.indexing.lock().unwrap().runs.is_none());
+    assert_eq!(c.unindexed(), flat_and_growing(&c));
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A build that waits for its turn counts for what it has come through of
+/// the line, and goes on from there.
+#[test]
+fn the_way_through_the_line_counts() {
+    let dir = test_dir("coll-bg-line");
+    let cfg = CollectionConfig { max_indexed_segments: 1000, ..ssd_config(8, Metric::L2, 500, 2500) };
+    let builds = BuildLimit::new(1);
+    let opts = OpenOptions { max_unindexed_bytes: 100_000 * 32, builds: Some(builds.clone()), ..opts() };
+    let c = Collection::create(&dir, cfg, opts).unwrap();
+    let mut rng = SplitMix64::new(6);
+    let mut model = Model::default();
+    let waits = |inputs: usize| {
+        until("the line", || c.indexing.lock().unwrap().waits.as_ref().is_some_and(|b| b.inputs.len() == inputs));
+    };
+    let check = |far: f64, rows: f64| {
+        let (all, left) = (flat_and_growing(&c), c.unindexed());
+        assert!((all - left - far * rows * 32.0).abs() < 2.0, "{left} of {all}, {far}");
+    };
+    // Another's build, that has 80,000 bytes to go.
+    let mut other = builds.line_up(Lane::Flat, 100_000);
+    assert!(other.come());
+    other.way.done.set(0.2);
+    for i in 0..25 {
+        upsert_batch(&c, &mut model, &mut rng, i * 100..i * 100 + 100);
+    }
+    c.flush().unwrap();
+    waits(5);
+    check(0.0, 0.0);
+    // (2500 rows are as much.)
+    other.way.done.set(0.6);
+    check(0.25, 2500.0);
+    // More that come count from then on.
+    for i in 25..31 {
+        upsert_batch(&c, &mut model, &mut rng, i * 100..i * 100 + 100);
+    }
+    c.flush().unwrap();
+    waits(7);
+    check(40_000.0 / 179_200.0, 3100.0);
+    other.way.done.set(0.96);
+    check(76_000.0 / 179_200.0, 3100.0);
+    // One that has to line up again starts over, for as long as it takes.
+    let one = c.lanes[Lane::Flat as usize].lock().unwrap();
+    drop(other);
+    until("the lane to be busy", || c.unindexed() == flat_and_growing(&c));
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(2));
+        check(0.0, 0.0);
+    }
+    // Its turn, after another's.
+    let mut other = builds.line_up(Lane::Flat, 99_200);
+    until("a turn", || other.come());
+    drop(one);
+    waits(7);
+    other.way.done.set(0.5);
+    check(0.25, 3100.0);
+    // If it has to be a merge instead, that is not on its way to an index.
+    let deleted: Vec<WriteOp> = (0..1600).map(|id| WriteOp::Delete { id }).collect();
+    c.write(&deleted).unwrap();
+    until("no index build", || c.indexing.lock().unwrap().waits.is_none());
+    check(0.0, 0.0);
+    // (What a build takes in: the live rows of its input.)
+    let ids: Vec<u64> = c.lane_segments(Lane::Flat).iter().map(|s| s.id).collect();
+    let bytes = |segments: &[u64]| c.index_bytes_of("index", segments);
+    assert_eq!((bytes(&ids), bytes(&ids[3..5]), bytes(&ids[..3])), (1500 * 32, 900 * 32, 0));
+    assert_eq!(c.index_bytes_of("shrink", &ids), 0);
+    for i in 0..16 {
+        upsert_batch(&c, &mut model, &mut rng, i * 100..i * 100 + 100);
+    }
+    c.flush().unwrap();
+    waits(11);
+    check(0.25, 4700.0);
+    // It goes on from where the line ends.
+    let (go, blocked) = block_at(&c, "build: built");
+    drop(other);
+    until("a build", || blocked.load(Ordering::Relaxed));
+    check(0.5 + 0.5 * 0.96, 4700.0);
+    go.send(()).unwrap();
+    c.wait_idle().unwrap();
+    let i = c.indexing.lock().unwrap();
+    assert!(i.runs.is_none() && i.waits.is_none());
+    drop(i);
+    assert!(c.stats().builds >= 1 && c.unindexed() == flat_and_growing(&c));
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Jobs of the other lane leave it at that, and so does the end of a wait
+/// for what is not an index build any more.
+#[test]
+fn only_index_builds_change_what_index_builds_have_done() {
+    let dir = test_dir("coll-bg-lanes-done");
+    let cfg = CollectionConfig { max_indexed_segments: 1000, ..ssd_config(8, Metric::L2, 500, 3000) };
+    let builds = BuildLimit::new(1);
+    let opts = OpenOptions { max_unindexed_bytes: 100_000 * 32, builds: Some(builds.clone()), ..opts() };
+    let c = Collection::create(&dir, cfg, opts).unwrap();
+    let mut rng = SplitMix64::new(6);
+    let mut model = Model::default();
+    let mut upsert = |from: u64| {
+        (from..from + 3000).step_by(100).for_each(|i| upsert_batch(&c, &mut model, &mut rng, i..i + 100));
+        c.flush().unwrap();
+    };
+    let delete = |ids: &mut dyn Iterator<Item = u64>| {
+        c.write(&ids.map(|id| WriteOp::Delete { id }).collect::<Vec<_>>()).unwrap();
+    };
+    let ssd = || c.lane_segments(Lane::Ssd).iter().map(|s| s.id).collect::<Vec<_>>();
+    let stays = |far: f64| {
+        for _ in 0..50 {
+            let (is, all) = (c.unindexed(), flat_and_growing(&c));
+            assert!((is - (all - far * 3000.0 * 32.0)).abs() < 2.0, "{is} of {all}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    upsert(0);
+    c.wait_idle().unwrap();
+    assert_eq!(ssd().len(), 1);
+
+    // Both lanes wait for others' builds. That for an index does not look
+    // again.
+    let [mut flat, mut other] = [Lane::Flat, Lane::Ssd].map(|lane| builds.line_up(lane, 96_000));
+    assert!(flat.come() && other.come());
+    let (go, waits) = block_thread_at(&c, Some("vecdb-index"), "build: waits");
+    upsert(4000);
+    until("the line", || waits.load(Ordering::Relaxed));
+    flat.way.done.set(0.5);
+    stays(0.25);
+    // A compaction lines up, runs and is done.
+    let before = ssd();
+    delete(&mut (0..700));
+    until("a compaction", || c.next_job(Lane::Ssd).is_some());
+    stays(0.25);
+    drop(other);
+    until("the compaction", || c.next_job(Lane::Ssd).is_none() && ssd() != before);
+    stays(0.25);
+    // So does one beside an index build, which is called for.
+    let (go_on, built) = block_thread_at(&c, None, "build: built");
+    std::thread::scope(|s| {
+        let call = s.spawn(|| c.maintain().unwrap());
+        until("the build", || built.load(Ordering::Relaxed));
+        stays(0.96);
+        c.rebuild(&ssd(), "test", 1).unwrap();
+        stays(0.96);
+        go_on.send(()).unwrap();
+        assert_eq!(call.join().unwrap().len(), 1);
+    });
+    go.send(()).unwrap();
+    until("the line", || c.indexing.lock().unwrap().waits.is_none());
+    assert_eq!((ssd().len(), c.unindexed()), (2, flat_and_growing(&c)));
+
+    // What waits for an index is merged into a flat segment instead.
+    let (go, waits) = block_thread_at(&c, Some("vecdb-index"), "build: waits");
+    upsert(8000);
+    until("the line", || waits.load(Ordering::Relaxed));
+    flat.way.done.set(0.75);
+    stays(24.0 / 144.0);
+    delete(&mut (8000..11_000).filter(|id| id % 3 != 0));
+    assert_eq!(c.next_job(Lane::Flat).unwrap().0, "shrink");
+    let (go_on, built) = block_thread_at(&c, Some("vecdb-index"), "build: built");
+    drop(flat);
+    go.send(()).unwrap();
+    until("the merge", || built.load(Ordering::Relaxed));
+    stays(0.0);
+    go_on.send(()).unwrap();
+    c.wait_idle().unwrap();
+    assert_eq!((ssd().len(), c.unindexed()), (2, flat_and_growing(&c)));
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// What waits for its turn can be another job by then, which has more to do.
+#[test]
+fn a_build_counts_what_it_takes_in_when_its_turn_comes() {
+    let dir = test_dir("coll-bg-takes");
+    let builds = BuildLimit::new(1);
+    let opts = OpenOptions { max_unindexed_bytes: 100_000 * 32, builds: Some(builds.clone()), ..opts() };
+    let c = Collection::create(&dir, ssd_config(8, Metric::L2, 500, 3000), opts).unwrap();
+    let mut rng = SplitMix64::new(6);
+    let mut model = Model::default();
+    for (n, late) in [(0, false), (1, true)] {
+        let mut other = builds.line_up(Lane::Flat, 96_000);
+        assert!(other.come());
+        // A segment to drop waits.
+        let (go, waits) = block_thread_at(&c, Some("vecdb-index"), "build: waits");
+        let ids = n * 10_000..n * 10_000 + 500;
+        upsert_batch(&c, &mut model, &mut rng, ids.clone());
+        c.flush().unwrap();
+        c.write(&ids.map(|id| WriteOp::Delete { id }).collect::<Vec<_>>()).unwrap();
+        assert_eq!(c.next_job(Lane::Flat).unwrap().0, "drop");
+        until("the line", || waits.load(Ordering::Relaxed));
+        if !late {
+            go.send(()).unwrap();
+        }
+        // It builds an index by now.
+        let from = n * 10_000 + 1000;
+        (from..from + 3000).step_by(100).for_each(|i| upsert_batch(&c, &mut model, &mut rng, i..i + 100));
+        c.flush().unwrap();
+        let (reason, inputs) = c.next_job(Lane::Flat).unwrap();
+        assert_eq!((reason, inputs.len()), ("index", 7));
+        let stays = |far: f64| {
+            for _ in 0..50 {
+                let (is, all) = (c.unindexed(), flat_and_growing(&c));
+                assert!((is - (all - far * 3500.0 * 32.0)).abs() < 2.0, "{is} of {all}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        other.way.done.set(0.5);
+        if !late {
+            until("the line", || c.indexing.lock().unwrap().waits.is_some());
+            stays(0.25);
+        }
+        let (go_on, built) = block_thread_at(&c, Some("vecdb-index"), "build: built");
+        drop(other);
+        if late {
+            go.send(()).unwrap();
+        }
+        until("the build", || built.load(Ordering::Relaxed));
+        stays(0.5 + 0.5 * 0.96);
+        go_on.send(()).unwrap();
+        c.wait_idle().unwrap();
+        assert_eq!((ssd_segments(&c), c.unindexed()), (n as usize + 1, flat_and_growing(&c)));
+    }
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Only index builds free flat segments bit by bit. What `optimize` has taken
+/// does not count at all, as before.
+#[test]
+fn other_jobs_do_not_make_room_early() {
+    let dir = test_dir("coll-bg-done-others");
+    let dim = 8;
+    let cfg = ssd_config(dim, Metric::L2, 500, 2500);
+    let c = Collection::create(&dir, cfg, OpenOptions { background: false, ..opts() }).unwrap();
+    let mut rng = SplitMix64::new(6);
+    let mut model = Model::default();
+    let hook = |point: &'static str, seen: Arc<Mutex<Vec<(bool, f64, f64)>>>| -> Hook {
+        Box::new(move |e, at| {
+            if at == point {
+                let st = e.stats();
+                let flat: usize = st.segments.iter().filter(|s| s.kind == "flat").map(|s| s.rows).sum();
+                let all = ((flat + st.frozen_rows + st.growing_rows) * 8 * 4) as f64;
+                let indexing = e.indexing.lock().unwrap().runs.is_some();
+                seen.lock().unwrap().push((indexing, e.unindexed(), all));
+            }
+        })
+    };
+    // An index build, for comparison.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    upsert_batch(&c, &mut model, &mut rng, 0..4500);
+    *c.hook.lock().unwrap() = Some(hook("build: built", seen.clone()));
+    assert_eq!(c.maintain().unwrap()[0].reason, "index");
+    let (indexing, left, all) = seen.lock().unwrap()[0];
+    assert!(indexing && left < all / 10.0, "{left} of {all}");
+    // A compaction, a shrink, and an optimize.
+    let delete = |ids: &mut dyn Iterator<Item = u64>| {
+        c.write(&ids.map(|id| WriteOp::Delete { id }).collect::<Vec<_>>()).unwrap();
+    };
+    delete(&mut (0..1500));
+    upsert_batch(&c, &mut model, &mut rng, 5000..5400);
+    c.flush().unwrap();
+    assert_eq!(c.maintain().unwrap()[0].reason, "compact");
+    for i in 0..6 {
+        upsert_batch(&c, &mut model, &mut rng, 8000 + i * 500..8500 + i * 500);
+    }
+    delete(&mut (8000..11_000).filter(|id| id % 5 < 3));
+    c.flush().unwrap();
+    let jobs: Vec<&str> = c.maintain().unwrap().iter().map(|j| j.reason).collect();
+    assert_eq!(jobs, ["shrink"]);
+    upsert_batch(&c, &mut model, &mut rng, 7000..7300);
+    c.optimize().unwrap().unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    for (i, (indexing, left, all)) in seen.iter().enumerate().skip(1) {
+        assert!(!indexing, "{i}");
+        let last = i + 1 == seen.len();
+        assert!(if last { *left == 0.0 && *all >= 300.0 * 32.0 } else { left == all }, "{i}: {left} of {all}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Writes are slowed down only as long as something is to come that makes
+/// room; and those that take none never.
+#[test]
+fn writes_are_not_slowed_down_for_nothing() {
+    let dim = 4;
+    let limit = 4000 * dim as u64 * 4;
+    let mut rng = SplitMix64::new(6);
+    let mut fill = |c: &Collection, rows: u64| {
+        for i in 0..rows / 100 {
+            upsert_batch(c, &mut Model::default(), &mut rng, i * 100..(i + 1) * 100);
+        }
+    };
+    // Without a limit, without background threads, and without a job.
+    let never = [
+        (2500, OpenOptions { max_unindexed_bytes: 0, ..opts() }),
+        (2500, OpenOptions { max_unindexed_bytes: limit, background: false, ..opts() }),
+        (1_000_000, OpenOptions { max_unindexed_bytes: limit, ..opts() }),
+    ];
+    for (index_rows, opts) in never {
+        let dir = test_dir("coll-bg-never");
+        let c = Collection::create(&dir, ssd_config(dim, Metric::L2, 500, index_rows), opts).unwrap();
+        let (go, _) = block_at(&c, "build: built");
+        fill(&c, 12_000);
+        let st = c.stats();
+        assert_eq!((st.write_rate, c.write_rate(), st.builds), (None, None, 0));
+        let _ = go.send(());
+        drop(c);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A flush that is to make an index build due; not if it fails.
+    let dir = test_dir("coll-bg-flushfirst");
+    let opts = OpenOptions { max_unindexed_bytes: limit, max_write_wait: Some(Duration::from_millis(100)), ..opts() };
+    let mut cfg = ssd_config(dim, Metric::L2, 1300, 2500);
+    cfg.max_indexed_segments = 1000;
+    let c = Collection::create(&dir, cfg, opts).unwrap();
+    let (go, blocked) = block_at(&c, "flush: rows written");
+    fill(&c, 3800);
+    until("a flush", || blocked.load(Ordering::Relaxed));
+    // (From 3825 rows, to 5100.)
+    assert_eq!((c.stats().frozen, c.write_rate()), (2, None));
+    upsert_batch(&c, &mut Model::default(), &mut SplitMix64::new(1), 5000..5050);
+    let rate = c.write_rate().expect("slowed down");
+    assert!(rate < 256e6 && rate > 4096.0 && c.next_job(Lane::Flat).is_none(), "{rate}");
+    assert_eq!(c.stats().write_rate, Some(rate as u64));
+    c.background.flushed(&Err(Error::Unavailable("made up".into())));
+    assert_eq!(c.write_rate(), None);
+    c.background.flushed(&Ok(true));
+    assert!(c.write_rate().is_some());
+
+    // At the limit writes give up after a while, but deletes do not wait.
+    let (go2, blocked2) = block_at(&c, "build: built");
+    go.send(()).unwrap();
+    until("a build", || blocked2.load(Ordering::Relaxed));
+    let v = [0.5; 4];
+    let upsert = |id: u64, rows: u64| {
+        let ops: Vec<WriteOp> = (id..id + rows).map(|id| WriteOp::Upsert { id, vector: &v, attrs: &NO_ATTRS }).collect();
+        c.write(&ops)
+    };
+    let mut id = 10_000;
+    for rows in [100, 1] {
+        while upsert(id, rows).is_ok() {
+            id += rows;
+        }
+    }
+    let (rows, waited) = (c.len(), c.stats().write_wait);
+    assert!(rows > 7500 && c.unindexed() >= 5100.0 * 16.0 && c.write_rate() == Some(0.0), "{rows}");
+    let mixed = [WriteOp::Delete { id: 300 }, WriteOp::Upsert { id, vector: &v, attrs: &NO_ATTRS }];
+    let refused = c.write(&mixed).unwrap_err();
+    assert!(matches!(&refused, Error::Unavailable(m) if m == "index builds are behind"), "{refused}");
+    assert!(c.contains(300) && !c.contains(id) && c.len() == rows);
+    let waited = c.stats().write_wait - waited;
+    assert!(waited >= Duration::from_millis(99) && waited < Duration::from_secs(2), "{waited:?}");
+    let t0 = Instant::now();
+    (0..200).for_each(|id| assert!(c.delete(id).unwrap()));
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    // A failed build has the same effect as a failed flush.
+    c.background.build_failed(Lane::Flat, &Error::Unavailable("made up".into()));
+    assert_eq!(c.write_rate(), None);
+    upsert(id, 100).unwrap();
+    assert_eq!(c.len(), rows - 200 + 100);
+    go2.send(()).unwrap();
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A writer that is much faster than builds is slowed down to their rate
+/// instead of stopped for each; and they always have something to do. With
+/// several collections (or shards), whose builds go one at a time, each batch
+/// is for all of them.
+fn keeps_pace(name: &str, collections: u64) {
+    let dim = 64;
+    let row = dim as u64 * 4;
+    let builds = BuildLimit::new(1);
+    let all: Vec<_> = (0..collections)
+        .map(|i| {
+            let mut cfg = CollectionConfig { max_indexed_segments: 1000, ..ssd_config(dim, Metric::L2, 1000, 4000) };
+            (cfg.index.build_list, cfg.index.passes, cfg.index.max_degree) = (500, 2, 48);
+            let opts =
+                OpenOptions { max_unindexed_bytes: 8000 * row, threads: 1, builds: Some(builds.clone()), ..opts() };
+            let dir = test_dir(&format!("{name}-{i}"));
+            (Collection::create(&dir, cfg, opts).unwrap(), dir)
+        })
+        .collect();
+    let mut rng = SplitMix64::new(6);
+    let rows: Vec<Vec<f32>> = (0..500).map(|_| float_vector(&mut rng, dim)).collect();
+    let (mut slowest, mut next, mut started) = (Duration::ZERO, 0, None);
+    let least = || all.iter().map(|(c, _)| c.stats().builds).min().unwrap();
+    while least() < 4 {
+        let ops: Vec<WriteOp> = (next..next + 50)
+            .map(|id| WriteOp::Upsert { id, vector: &rows[id as usize % 500], attrs: &NO_ATTRS })
+            .collect();
+        let t0 = Instant::now();
+        all.iter().for_each(|(c, _)| c.write(&ops).unwrap());
+        slowest = slowest.max(t0.elapsed());
+        next += 50;
+        assert!(next < 100_000);
+        if started.is_none() && least() == 1 {
+            started = Some((Instant::now(), next));
+        }
+        for (c, _) in &all {
+            let (u, f) = (c.unindexed() / row as f64, flat_and_growing(c) / row as f64);
+            assert!(u < 8100.0 && f < 12_200.0, "{u} {f}");
+        }
+    }
+    let (at, rows_then) = started.unwrap();
+    // One build of each.
+    let round = at.elapsed() / 3;
+    assert!(slowest < round / 2, "{slowest:?}, a round of builds takes {round:?}");
+    // What was written meanwhile is what was indexed.
+    let per = (next - rows_then) / 3;
+    assert!((2500..6000).contains(&per), "{per} rows per build");
+    let waited: Duration = all.iter().map(|(c, _)| c.stats().write_wait).sum();
+    assert!(waited > round, "{waited:?} of {round:?}");
+    for (c, dir) in all {
+        assert_eq!(c.stats().build_error, None);
+        drop(c);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn writes_keep_pace_with_builds() {
+    keeps_pace("coll-bg-pace", 1);
+}
+
+#[test]
+fn writes_keep_pace_with_the_builds_of_all_shards() {
+    keeps_pace("coll-bg-paces", 4);
 }
 
 /// `wait_idle` also waits for what comes after the view: the old files are

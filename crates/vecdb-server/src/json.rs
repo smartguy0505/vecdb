@@ -647,6 +647,8 @@ pub struct StateOut {
     pub wal_bytes: u64,
     pub flush_error: Option<String>,
     pub build_error: Option<String>,
+    /// As index builds are behind, in a shard or more.
+    pub slowing_writes: bool,
     pub optimizing: bool,
     pub optimize_error: Option<String>,
 }

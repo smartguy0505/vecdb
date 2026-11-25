@@ -663,6 +663,7 @@ impl App {
                 wal_bytes: s.wal_bytes,
                 flush_error: stats.iter().find_map(|s| s.flush_error.clone()),
                 build_error: stats.iter().find_map(|s| s.build_error.clone()),
+                slowing_writes: stats.iter().any(|s| s.write_rate.is_some()),
                 optimizing,
                 optimize_error,
             },
@@ -724,22 +725,24 @@ impl App {
         for (name, stats) in &all {
             let _ = writeln!(out, "vecdb_up{{collection=\"{name}\"}} {}", stats.is_some() as u8);
         }
-        type Of = fn(&[CollectionStats], &Sums) -> u64;
-        let values: [(&str, Of); 14] = [
-            ("rows", |_, s| s.rows as u64),
-            ("unflushed_rows", |_, s| s.unflushed as u64),
-            ("flat_segments", |_, s| s.flat.0 as u64),
-            ("flat_rows", |_, s| s.flat.1 as u64),
-            ("ssd_segments", |_, s| s.ssd.0 as u64),
-            ("ssd_rows", |_, s| s.ssd.1 as u64),
-            ("deleted_rows", |_, s| s.deleted as u64),
-            ("wal_bytes", |_, s| s.wal_bytes),
-            ("shards_failing_flushes", |c, _| c.iter().filter(|s| s.flush_error.is_some()).count() as u64),
-            ("shards_failing_builds", |c, _| c.iter().filter(|s| s.build_error.is_some()).count() as u64),
-            ("flushes_total", |c, _| c.iter().map(|s| s.flushes).sum()),
-            ("builds_total", |c, _| c.iter().map(|s| s.builds).sum()),
-            ("write_batches_total", |c, _| c.iter().map(|s| s.write_batches).sum()),
-            ("wal_syncs_total", |c, _| c.iter().map(|s| s.wal_syncs).sum()),
+        type Of = fn(&[CollectionStats], &Sums) -> f64;
+        let values: [(&str, Of); 16] = [
+            ("rows", |_, s| s.rows as f64),
+            ("unflushed_rows", |_, s| s.unflushed as f64),
+            ("flat_segments", |_, s| s.flat.0 as f64),
+            ("flat_rows", |_, s| s.flat.1 as f64),
+            ("ssd_segments", |_, s| s.ssd.0 as f64),
+            ("ssd_rows", |_, s| s.ssd.1 as f64),
+            ("deleted_rows", |_, s| s.deleted as f64),
+            ("wal_bytes", |_, s| s.wal_bytes as f64),
+            ("shards_failing_flushes", |c, _| c.iter().filter(|s| s.flush_error.is_some()).count() as f64),
+            ("shards_failing_builds", |c, _| c.iter().filter(|s| s.build_error.is_some()).count() as f64),
+            ("shards_slowing_writes", |c, _| c.iter().filter(|s| s.write_rate.is_some()).count() as f64),
+            ("flushes_total", |c, _| c.iter().map(|s| s.flushes).sum::<u64>() as f64),
+            ("builds_total", |c, _| c.iter().map(|s| s.builds).sum::<u64>() as f64),
+            ("write_batches_total", |c, _| c.iter().map(|s| s.write_batches).sum::<u64>() as f64),
+            ("wal_syncs_total", |c, _| c.iter().map(|s| s.wal_syncs).sum::<u64>() as f64),
+            ("write_wait_seconds_total", |c, _| c.iter().map(|s| s.write_wait.as_secs_f64()).sum()),
         ];
         for (what, of) in values {
             let kind = if what.ends_with("_total") { "counter" } else { "gauge" };

@@ -94,6 +94,7 @@ impl ProductQuantizer {
             let km = KMeansParams { k: KSUB, iters: p.iters, seed: p.seed.wrapping_add(i as u64 + 1), threads };
             let centroids = kmeans::train(&sub, dsub, &km)?;
             codebooks[KSUB * lo..KSUB * hi].copy_from_slice(&centroids);
+            cancel.done(i + 1, p.m);
         }
         Ok(Self { dim, offsets, codebooks })
     }

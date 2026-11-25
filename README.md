@@ -16,8 +16,8 @@ recovery and attribute filters. Step 7 is done: a collection is shared
 between threads, with snapshot reads, index builds beside writes and group
 commit (7a); it flushes and builds in the background and searches its
 segments in parallel, and databases hold named collections split into shards
-(7b); a server offers them over HTTP (7c). Step 8, the distributed mode, is
-next.
+(7b); a server offers them over HTTP (7c); writes that outrun index builds are
+slowed down instead of stopped (7d). Step 8, the distributed mode, is next.
 
 ## Goals
 
@@ -1221,9 +1221,10 @@ while writes and searches go on.
 **Builds.** Two more threads per collection run the jobs that are due: one
 those of flat segments (index builds, and merges of flat segments that are
 mostly deleted), the other those of SSD segments (compactions and merges).
-Writes wait while the flat segments take more than `max_unindexed_bytes` (1
-GiB) and an index build is due, or fail with `Unavailable` after
-`max_write_wait` (off by default); see below for what they wait for.
+Writes are slowed down, and at `max_unindexed_bytes` (1 GiB) of vectors in no
+index stopped, while an index build is due (see step 7d; in step 7b they ran
+at full speed until they were stopped). A write that has waited for
+`max_write_wait` (off by default) fails with `Unavailable`.
 Dropping a collection stops its builds early. All collections of a database
 share a limit of builds at once (default 1) per kind, and the builds that run
 share the build threads (half of the CPUs unless told otherwise).
@@ -1483,13 +1484,12 @@ Ingesting 1M rows from scratch, 6 build threads, one run each:
 | 1 GiB | 7b | 0.16 s | 2.4 s | 125 s | 2 | 2.04 GB |
 | | 7c | 0.16 s | 2.3 s | 122 s | 4 | 1.36 GB |
 
-- **Not fixed: a write still waits for the index build of its own rows**
-  (20.7 s at the 128 MiB limit, which is small for this rate), and with
-  `builds` at 1 for those of other shards before it. The writer runs at full
-  speed and then stops. Slowing it down before it reaches the limit is a
-  follow-up (see the roadmap); until then, `max_write_wait` bounds the wait,
-  and the default limit of 1 GiB takes this ingest (0.5 GB of vectors) without
-  one. That limit is per shard, so RAM has to cover it times the shards that
+- **Not fixed in this step: a write waited for the index build of its own
+  rows** (20.7 s at the 128 MiB limit, which is small for this rate), and with
+  `builds` at 1 for those of other shards before it: the writer ran at full
+  speed and then stopped. Step 7d slows it down instead.
+- The default limit of 1 GiB takes this ingest (0.5 GB of vectors) without a
+  wait. That limit is per shard, so RAM has to cover it times the shards that
   are written to.
 
 ### HTTP
@@ -1552,7 +1552,7 @@ or none of those of a shard; across the shards of a collection they are not
 atomic. A request that fails with 5xx, or whose reply is lost, may have been
 applied in part or in whole. Sending it again is safe as long as nobody else
 wrote the same ids meanwhile: upserts replace, and deleting what is gone does
-nothing. A write that has to wait for index builds (see step 7b) gets 503
+nothing. A write that has to wait for index builds (see step 7d) gets 503
 after `--write-wait-secs` (10), without having changed anything in the shard
 that made it wait.
 
@@ -1687,6 +1687,169 @@ $B coll-concurrent --from sift1m-1seg --dir work ... --l 40 --direct false --rea
 $B coll-ingest --base $S/sift_base.fvecs --dir work --threads 6 --background true --unindexed-mb 128
 ```
 
+## Slowing writes down (step 7d)
+
+Up to step 7c a writer that outran the index builds wrote at full speed until
+`max_unindexed_bytes` was reached, and then stood still until a build was done
+(and, with several shards and `builds` at 1, those of the others before it).
+Now it is slowed down to what the builds keep up with:
+
+- **What counts** is the vectors that are in no SSD index: flat segments,
+  those that wait to be flushed, and the growing one.
+- **The rate of writes depends on that alone.** Up to three quarters of the
+  limit they are free. Over the last quarter the rate is halved 16 times, from
+  256 MiB to 4 KiB a second, and at the limit it is 0. The amount settles where
+  writes are as fast as builds, whatever their rate is; nothing is estimated.
+- **Builds give room back little by little.** A build frees what it took in at
+  its end, all at once. So it says how far it is (PQ training, encoding and
+  graphs, by their cost), and that share of its input counts as gone. The same
+  goes for a build that waits for those of other shards: its way through the
+  line of builds and its own work, by bytes, is one.
+- **Writes wait in line**, per shard, in the order they came. Each goes once
+  those before it are paid for at the rate there is: one that comes after a
+  pause does not wait, however large it is. Deletes do not wait.
+- Only while a build that makes room is due (or a flush that may make one due),
+  and as long as builds do not fail. `max_write_wait` counts from when a write
+  comes; one that has waited for longer fails and has changed nothing in that
+  shard.
+- `CollectionStats` has the rate that writes are slowed down to and the time
+  they have waited, the server `vecdb_shards_slowing_writes`,
+  `vecdb_write_wait_seconds_total` and `state.slowing_writes`.
+
+**Memory.** What counts as gone is in RAM until the build ends. So there may be
+the limit and the input of one build (an eighth of the limit, or `index_bytes`
+if that is more), and the limit is taken to be `index_bytes` and a quarter at
+least (or `index_bytes` and two segments): 1,152 MiB with the defaults, where
+it was 1,120 (the limit and three segments), but up to twice as much as it was
+where the limit is not above `index_bytes`. Writes that were let in and are
+under way (one per writer) come on top, as before.
+
+### Results
+
+SIFT1M rows (128-dim, buffered WAL) written from scratch, 6 build threads, on
+the same shared machine, which was loaded throughout (load 13-19 on 12
+threads, other programs at higher priority). Builds took two to three times as
+long as in the 7c tables above, which makes the waits of 7c longer. 7c and 7d
+ran in turns, with the same benchmark program, one or two runs each (7c's
+slowest batch in other runs, at loads up to 30: 54-56 s in the first case, 63-72
+s in the third, 38 s in the fourth):
+
+| what is written | | rows/s | batch p50 | batch p99 | slowest | batches over 1 / 10 s | most in no index | peak memory |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 writer, 1,000 a batch, limit 128 MiB | 7c | 3,713 | 3.0 ms | 0.02 s | **46.4 s** | 6 / 6 | 194 MiB | 0.99 GB |
+| | 7d | 3,787-3,792 | 0.33 s | 0.48 s | **0.66-0.68 s** | 0 / 0 | 175 MiB | 1.00 GB |
+| 8 writers, single rows, limit 128 MiB | 7c | 10,231-10,279 | 0.03 ms | 0.4 ms | **36.2-36.3 s** | 8 / 8 | 143-147 MiB | 0.63-0.64 GB |
+| | 7d | 7,500-7,608 | 0.10-0.11 ms | 5.4-5.5 ms | **0.02 s** | 0 / 0 | 174 MiB | 0.64-0.67 GB |
+| 4 shards, 8 writers, 1,000 a batch, limit 48 MiB a shard | 7c | 4,752 | 11 ms | 61 s | **61.2 s** | 24 / 24 | 261 MiB | 1.05 GB |
+| (`index_bytes` 16, segments 8 MiB) | 7d | 5,050-5,131 | 0.04 s | 4.5-4.6 s | **4.6-4.8 s** | 253-254 / 0 | 191-193 MiB | 1.06-1.08 GB |
+| the same, limit 64 MiB a shard | 7c | 5,074 | 14 ms | 22.1 s | **29.7 s** | 105 / 58 | 301 MiB | 1.56 GB |
+| (`index_bytes` 8, segments 4 MiB) | 7d | 4,141-4,842 | 2.7-2.8 s | 3.5-4.3 s | **3.6-4.5 s** | 532-537 / 0 | 241-242 MiB | 1.50-1.52 GB |
+| 64 writers, 1,000 a batch, limit 128 MiB | 7c | 10,417-11,414 | 0.14-0.15 s | 51-56 s | 51.3-56.2 s | 64 / 64 | 247-253 MiB | 1.09-1.11 GB |
+| (600,000 rows, of which 7c has indexed a quarter when all are written) | 7d | 4,861-4,866 | 16.6-17.0 s | 26-28 s | 27.6-29.5 s | 344-348 / 342-344 | 188-189 MiB | 1.07-1.10 GB |
+| the same, 1M rows, refused after 10 s and sent again a second later | 7c | 4,603 | 0.15 s | 104 s | 104 s | 147 / 147 | 280 MiB | 1.53 GB |
+| (7c: 747 refusals, 7d: 586-587) | 7d | 4,544-4,546 | 9.8 s | 108 s | **185 s** | 756-757 / 247-254 | 196 MiB | 1.37-1.41 GB |
+| 16 writers, 600,000 rows, refused after 10 s (7c: 66 refusals, 7d: none) | 7c | 7,178 | 0.03 s | 39 s | 42.8 s | 22 / 22 | 222 MiB | 0.93 GB |
+| | 7d | 5,619 | 3.6 s | 5.5 s | **5.6 s** | 376 / 0 | 178 MiB | 0.89 GB |
+| 1 writer, 1,000 a batch, limit 1 GiB (never reached) | 7c | 256,293-258,776 | 2.6 ms | 34-44 ms | 0.12-0.13 s | 0 / 0 | 483-484 MiB | 1.36-1.40 GB |
+| | 7d | 251,889-252,989 | 2.5-2.7 ms | 30-47 ms | 0.16-0.18 s | 0 / 0 | 476-481 MiB | 1.37-1.39 GB |
+
+Those 7d numbers are of the code before its last two fixes: jobs on SSD
+segments, while they ran or waited for their turn, took back what an index
+build had given; and a job that became an index build while it waited counted
+as gone all at once when its turn came. They do not show in the fourth case,
+run in turns (7d before, after, 7c, after, before) at a load of 22-33:
+
+| 4 shards, limit 64 MiB a shard | to write | until all is indexed | batch p50 | batch p99 | slowest | batches over 10 s | most in no index |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 7c | 329 s | 896 s | 20 ms | 38 s | **50.1 s** | 105 | 299 MiB |
+| 7d before the fixes | 346-360 s | 859-884 s | 4.3-4.6 s | 6.0-6.3 s | 6.4-6.5 s | 0 | 245-247 MiB |
+| 7d | 348-364 s | 879-902 s | 4.2-4.4 s | 6.0-6.3 s | **6.2-6.6 s** | 0 | 244-245 MiB |
+
+The others once more, at a load of 15-40, which makes everything slower (with
+the first of the fixes; the last pair with both):
+
+| what is written | | rows/s | batch p50 | batch p99 | slowest | batches over 1 / 10 s | most in no index | peak memory |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 writer, 1,000 a batch, limit 128 MiB | 7d | 3,586 | 0.30 s | 0.58 s | **0.60 s** | 0 / 0 | 175 MiB | 0.99 GB |
+| 8 writers, single rows | 7d | 5,249 | 0.11 ms | 7.2 ms | **0.05 s** | 0 / 0 | 174 MiB | 0.64 GB |
+| 4 shards, limit 48 MiB a shard | 7c | 3,710 | 11 ms | 64 s | **64.8 s** | 26 / 26 | 261 MiB | 1.04 GB |
+| | 7d | 3,738 | 0.04 s | 6.8 s | **7.1 s** | 254 / 0 | 194 MiB | 1.04 GB |
+| 64 writers, 600,000 rows | 7d | 4,119 | 18.7 s | 37 s | 38.8 s | 341 / 341 | 189 MiB | 1.07 GB |
+| 16 writers, 600,000 rows, refused after 10 s (none was) | 7d | 5,395 | 3.6 s | 6.1 s | **6.2 s** | 376 / 0 | 179 MiB | 0.87 GB |
+| 64 writers, 1M rows, refused after 10 s and sent again a second later | 7c | 4,896 | 0.20 s | 74 s | 73.6 s | 170 / 170 | 276 MiB | 1.62 GB |
+| (7c: 956 refusals, 7d: 1,028) | 7d | 3,323 | 9.8 s | 252 s | **295 s** | 759 / 268 | 191 MiB | 1.44 GB |
+
+- **Nobody stands still for a build any more.** Single rows wait 21 ms at most,
+  (55 ms at the higher load) and a writer of 1,000-row batches 0.7 s, where 7c
+  had some wait for 36 and 46 s. The price is that every batch waits a little:
+  what 6 batches waited before, 780 of 1,000 share now (0.33 s each).
+- **The rows/s of a long ingest are still those of the builds**: the first case
+  took 314-315 s until all was indexed, against 313 s, and the fourth 879-902 s
+  against 896 s. Where 7c's rows/s are higher, it had more rows left to index
+  when the writers were done.
+- **Shards that share one build place** are where counting the way through the
+  line matters: with the progress of their own builds only, the third case had
+  batches wait for 31.9-37.1 s, and the fourth for 13.0 s (more than the server
+  lets them, 10 s).
+- **Writers wait for each other**, and no pacing changes that: 64 of them with
+  0.5 MiB each, at 2 MB/s, wait 17 s. **If each gives up after 10 s and comes
+  back, 7d is worse than 7c:** the slowest batch took 185 s and 295 s to get
+  through in the two series (7c: 104 s and 74 s), with 586-587 and 1,028
+  refusals (747 and 956), and it took 274 s and 374 s until all was indexed (217
+  s and 274 s). The wait of those who give up is for nothing, and they come back
+  behind the others. And 7c let so much in at once (280 MiB, where the limit is
+  128) that it flushed larger segments, and built 4 indexes where 7d built 7;
+  larger ones probably cost less per row (the training does not grow with
+  them). With 16 writers nobody is refused, where 7c refused 66 times. To
+  refuse at once what would wait too long, so that those who are let in get
+  through, is a follow-up.
+- Not slowed down, writes cost what they did: 8 writers of single rows, no
+  index builds, 109,578-120,066 rows/s (7c: 108,348-121,602), one writer
+  111,838-112,098 (110,536-115,844).
+- **Not covered:** merges of SSD segments, which do not slow writes down; their
+  number grows if they do not keep up. The server has one set of 64 places for
+  writes: writers of a collection that is slowed down can take them all. Not
+  measured: the default limit while builds are behind (SIFT1M is half of it),
+  more dimensions, or a quiet machine.
+
+The curve, and what counts as gone, were chosen by simulating them against
+builds whose speed varies (not in the repository). With one shard and batches
+of 1,000 rows, the slowest write of the simulation waited for 0.1-1.4 s as it
+is now; for 2-11 s where a build did not count until it was done, and 125 s
+where builds were 10 times slower; and for 12-159 s where how far a build is
+was guessed from the time the last ones took, and that changed. For the third
+case of the table it has 86-90 s without slowing down, 34-40 s if only a
+build's own progress counts, and 6-8 s as it is now (measured: 61-72, 32-37 and
+5-7 s). With 12, 16 and 20 halvings the waits were about the same, up to 8
+shards; with 32 that share slow builds, 16 had the shortest.
+
+### Tests
+
+The rate, the line (its order, writes that are late, a panic in it, a rate that
+goes away), the way of a build through the line of builds (with one place and
+two, builds that leave it or fail), and what counts at each step of a build, a
+failed build, a compaction (also one beside the build, or one that waits), a
+merge, an `optimize`, a job that is another one by the time its turn comes; that
+a build says how far it is in the right proportions and makes the same bytes as
+before; writes that keep pace with builds that are much slower than they are,
+also in four collections that share a place; deletes, batches of both, and
+collections where nothing is to come do not wait. 108 mutations of this step's code were run
+against the tests (tests were added for those not caught at first). Not caught:
+two that change nothing, and one that lets a lost turn count for 20 ms longer.
+The tests with timing ran 12 times (those of the server 5 times) on a loaded
+machine without a failure.
+
+Commands (`B`, `S` as above; 7c: the same benchmark, over its core):
+
+```
+$B coll-ingest --base $S/sift_base.fvecs --dir work --threads 6 --background true --unindexed-mb 128
+$B coll-ingest ... --unindexed-mb 128 --writers 8 --batch 1 --limit 400000
+$B coll-ingest ... --shards 4 --seal-mb 8 --index-mb 16 --unindexed-mb 48 --writers 8 --limit 600000
+$B coll-ingest ... --shards 4 --seal-mb 4 --index-mb 8 --unindexed-mb 64 --writers 8
+$B coll-ingest ... --unindexed-mb 128 --writers 64 --limit 600000       # or --write-wait 10, all rows
+$B coll-ingest ... --unindexed-mb 1024 --index-mb 100000 --writers 8 --batch 1         # the cost of looking
+```
+
 ## Designing for billions
 
 Raw `f32` vectors cost `n x dim x 4` bytes:
@@ -1809,11 +1972,16 @@ Within a shard:
    collections split into shards, behind one `Shard` interface.
    Done (7c): writes that no longer wait behind compactions, and whose wait
    can be bounded; an HTTP/JSON server. The shard interface over gRPC is part
-   of step 8.
+   of step 8. Done (7d): writers that are slowed down to what index builds
+   keep up with, instead of stopped for each.
 
    Follow-ups:
-   - writers that are slowed down as the limit comes closer, instead of
-     stopped at it;
+   - faster index builds, which set the rate of a long ingest: PQ training is
+     about 40% of one of 64 MiB;
+   - merges of SSD segments that keep up with a long ingest (nothing slows
+     writes down for those);
+   - places in the server per collection: the writers of one that is slowed
+     down can take all 64; and refusing at once what would wait too long;
    - a limit for all shards of a database, not for each;
    - stopping an `optimize` of a collection that is dropped;
    - server: TLS, a key per collection or user, streamed bulk imports, requests

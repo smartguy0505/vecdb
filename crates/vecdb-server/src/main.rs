@@ -33,7 +33,8 @@ storage
   --build-threads N          threads of index builds, together (0: half of the CPUs)
   --builds N                 1: index builds at once, and compactions at once besides
   --build-memory-mb N        2048: RAM of a build, for one partition
-  --max-unindexed-mb N       1024: vectors per shard that may wait for an index (0: no limit)
+  --max-unindexed-mb N       1024: vectors per shard that may be in no index (writes are slowed
+                             down from 3/4 of it on, and stopped at it; 0: no limit)
   --write-wait-secs N        10: how long a write may wait for that, then it gets 503
 
 requests
