@@ -31,8 +31,9 @@
 //! **Writes** are not atomic across shards (see
 //! [`ShardedCollection::write`](vecdb_core::ShardedCollection::write)). A
 //! write that fails with 5xx, or whose reply is lost, may have been applied
-//! in part or in whole. Sending it again is safe: upserts replace, and
-//! deleting what is gone does nothing.
+//! in part or in whole (not one that is refused as index builds are behind).
+//! Sending it again is safe: upserts replace, and deleting what is gone does
+//! nothing.
 
 #![forbid(unsafe_code)]
 

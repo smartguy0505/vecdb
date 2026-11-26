@@ -705,6 +705,11 @@ mod tests {
             out,
             r#"{"id":18446744073709551615,"distance":0.5,"vector":[1.0],"attrs":{"a":-9223372036854775808,"t":["x","","é"],"b":9223372036854775807}}"#
         );
+        // In the order of the body: a write that is sent again is known by its bytes.
+        let names: Vec<String> = (0..50).map(|i| format!("f{}", i * 37 % 50)).collect();
+        let attrs = names.iter().map(|n| format!("{n:?}: 1")).collect::<Vec<_>>().join(", ");
+        let r = parse::<RowIn>(&format!(r#"{{"id": 1, "vector": [], "attrs": {{{attrs}}}}}"#)).unwrap().row();
+        assert!(r.attrs.entries().iter().map(|e| &e.0).eq(&names));
         let many = |n| parse::<RowIn>(&format!(r#"{{"id": 1, "vector": [], "attrs": {{"a": {:?}}}}}"#, vec![7; n]));
         assert!(many(MAX_VALUES).is_ok() && many(MAX_VALUES + 1).is_err());
         let bare = serde_json::to_string(&RowOut::new(7, None, None, Fetch::NONE)).unwrap();

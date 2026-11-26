@@ -122,6 +122,7 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
             .collect();
         c.write(&ops)
     };
+    let seq_before: u64 = target.stats().iter().map(|s| s.next_seq).sum();
     let t0 = Instant::now();
     let mut lat = Vec::new();
     let (mut maintain_s, mut jobs) = (0.0, 0);
@@ -221,16 +222,17 @@ pub(crate) fn ingest(a: &Args) -> AnyResult<()> {
         pct(100.0),
     );
     let over = |ms: f64| lat.len() - lat.partition_point(|&l| l <= ms);
+    let sum = |f: &dyn Fn(&CollectionStats) -> u64| target.stats().iter().map(f).sum::<u64>();
     println!(
-        "waits    batches over 0.1 / 1 / 10 s: {} / {} / {}; refused {} times; most in no index: {} rows = {:.0} MiB",
+        "waits    batches over 0.1 / 1 / 10 s: {} / {} / {}; refused {} times; most in no index: {} rows = {:.0} MiB; each row applied {:.2} times",
         over(100.0),
         over(1000.0),
         over(10_000.0),
         refused.load(Ordering::Relaxed),
         peak.load(Ordering::Relaxed),
         peak.load(Ordering::Relaxed) as f64 * base.dim as f64 * 4.0 / (1 << 20) as f64,
+        (sum(&|s| s.next_seq) - seq_before) as f64 / rows.max(1) as f64,
     );
-    let sum = |f: &dyn Fn(&CollectionStats) -> u64| target.stats().iter().map(f).sum::<u64>();
     if opts.background {
         let (flushes, builds) = (sum(&|s| s.flushes), sum(&|s| s.builds));
         let t = Instant::now();

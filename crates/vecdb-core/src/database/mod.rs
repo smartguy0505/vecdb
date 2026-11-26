@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 
 use crate::collection::search::{Ask, search_all};
 use crate::collection::{
@@ -60,7 +60,7 @@ use crate::pool::SearchPool;
 use catalog::{CATALOG, Catalog, Entry, check_name};
 
 pub use catalog::{MAX_NAME, MAX_SHARDS};
-pub use shard::{Op, Row, SearchReply, SearchRequest, Shard, shard_of};
+pub use shard::{Op, PendingWrite, Row, SearchReply, SearchRequest, Shard, shard_of};
 use shard::fetch_rows;
 
 /// How this process uses a database (not stored).
@@ -303,6 +303,78 @@ impl Database {
     }
 }
 
+/// What a write has for one shard.
+struct Part<'a> {
+    shard: &'a dyn Shard,
+    /// Where its ops are in those of the write.
+    at: Vec<usize>,
+    ops: Vec<Op>,
+}
+
+impl Part<'_> {
+    /// Writes it once there is room for all parts. `None` if there is none
+    /// for another one.
+    fn write(self, place: Place) -> (Vec<usize>, Result<Option<Vec<bool>>>) {
+        let write = || {
+            let write = self.shard.begin(&self.ops)?;
+            if place.all_ready() { write().map(Some) } else { Ok(None) }
+        };
+        let r = write();
+        (self.at, r)
+    }
+}
+
+/// Where the parts of a write wait for each other.
+struct Meet {
+    state: Mutex<Parts>,
+    change: Condvar,
+}
+
+struct Parts {
+    /// That are not ready yet.
+    left: usize,
+    failed: bool,
+}
+
+/// A part's place there. The part has failed if this is dropped (which does
+/// not matter any more once all are ready).
+struct Place<'a>(&'a Meet);
+
+impl Meet {
+    fn new(parts: usize) -> Self {
+        Self { state: Mutex::new(Parts { left: parts, failed: false }), change: Condvar::new() }
+    }
+
+    fn place(&self) -> Place<'_> {
+        Place(self)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Parts> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Place<'_> {
+    /// Says that this part is ready, and waits for the others. Whether all
+    /// are.
+    fn all_ready(self) -> bool {
+        let mut s = self.0.lock();
+        s.left -= 1;
+        self.0.change.notify_all();
+        while s.left > 0 && !s.failed {
+            s = self.0.change.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        s.left == 0
+    }
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        self.0.lock().failed = true;
+        self.0.change.notify_all();
+    }
+}
+
 fn unknown(name: &str) -> Error {
     Error::NotFound(format!("collection {name:?}"))
 }
@@ -367,8 +439,9 @@ impl ShardedCollection {
     }
 
     /// Applies `ops`, in order for each id; per op, whether its id had a row
-    /// before. All or none within a shard; if a shard fails, others may
-    /// have applied their part. Nothing is applied if any op is invalid.
+    /// before. All or none within a shard; if a shard fails to write, others
+    /// may have applied their part. Nothing is applied if any op is invalid,
+    /// or if a shard has no room (see [`OpenOptions::max_write_wait`]).
     pub fn write(&self, ops: Vec<Op>) -> Result<Vec<bool>> {
         self.check()?;
         let n = self.shards.len();
@@ -380,28 +453,38 @@ impl ShardedCollection {
                 self.config.check_row(&r.vector, &r.attrs)?;
             }
         }
-        let mut parts: Vec<(Vec<usize>, Vec<Op>)> = vec![Default::default(); n];
+        let part = |shard| Part { shard, at: Vec::new(), ops: Vec::new() };
+        let mut parts: Vec<Part> = self.shards.iter().map(|s| part(&**s)).collect();
         let total = ops.len();
         for (i, op) in ops.into_iter().enumerate() {
             let part = &mut parts[shard_of(op.id(), n)];
-            part.0.push(i);
-            part.1.push(op);
+            part.at.push(i);
+            part.ops.push(op);
         }
-        let mut busy: Vec<_> = parts.into_iter().zip(&self.shards).filter(|((at, _), _)| !at.is_empty()).collect();
-        let Some(((at, ops), shard)) = busy.pop() else { return Ok(Vec::new()) };
-        // At once, as each may wait for the disk.
+        parts.retain(|p| !p.at.is_empty());
+        let meet = Meet::new(parts.len());
+        let mut busy: Vec<_> = parts.into_iter().map(|p| (p, meet.place())).collect();
+        let Some((last, place)) = busy.pop() else { return Ok(Vec::new()) };
+        // At once, as each may wait for room and for the disk; and nothing
+        // before there is room for all. Or a shard that has applied its part
+        // would have to do so again when the write is tried again, as a new
+        // one in its line, and be late itself then.
         let results = std::thread::scope(|s| {
-            let others: Vec<_> =
-                busy.into_iter().map(|((at, ops), shard)| (at, s.spawn(move || shard.write(&ops)))).collect();
-            let mut results = vec![(at, shard.write(&ops))];
-            results.extend(others.into_iter().map(|(at, h)| (at, h.join().expect("a write panicked"))));
+            let others: Vec<_> = busy.into_iter().map(|(p, place)| s.spawn(move || p.write(place))).collect();
+            let mut results = vec![last.write(place)];
+            results.extend(others.into_iter().map(|h| h.join().expect("a write panicked")));
             results
         });
         let mut out = vec![false; total];
+        let mut written = true;
         for (at, r) in results {
-            at.into_iter().zip(r?).for_each(|(i, had)| out[i] = had);
+            match r? {
+                Some(had) => at.into_iter().zip(had).for_each(|(i, had)| out[i] = had),
+                None => written = false,
+            }
         }
-        Ok(out)
+        // (One that was not written has another one that failed.)
+        if written { Ok(out) } else { Err(Error::Unavailable("a part of the write has failed".into())) }
     }
 
     /// The `k` nearest live rows over all shards, closest first. Each shard

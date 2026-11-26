@@ -68,11 +68,21 @@ pub struct SearchReply {
     pub stats: SearchStats,
 }
 
+/// A write that there is room for, and its result.
+pub type PendingWrite<'a> = Box<dyn FnOnce() -> Result<Vec<bool>> + 'a>;
+
 /// One shard. Calls come from any number of threads.
 pub trait Shard: Send + Sync {
     /// Applies `ops` in order, all or none. Per op, whether its id had a
     /// row before.
     fn write(&self, ops: &[Op]) -> Result<Vec<bool>>;
+    /// The first half of [`write`](Self::write), which can take long and
+    /// fail: waits until there is room. What it returns does the rest, or
+    /// nothing is written if it is dropped. A shard that cannot tell does all
+    /// in the second half.
+    fn begin<'a>(&'a self, ops: &'a [Op]) -> Result<PendingWrite<'a>> {
+        Ok(Box::new(move || self.write(ops)))
+    }
     fn search(&self, req: &SearchRequest) -> Result<SearchReply>;
     fn get(&self, id: u64) -> Result<Option<Row>>;
     fn stats(&self) -> Result<CollectionStats>;
@@ -91,6 +101,10 @@ pub trait Shard: Send + Sync {
 
 impl Shard for Collection {
     fn write(&self, ops: &[Op]) -> Result<Vec<bool>> {
+        self.begin(ops)?()
+    }
+
+    fn begin<'a>(&'a self, ops: &'a [Op]) -> Result<PendingWrite<'a>> {
         let ops: Vec<WriteOp> = ops
             .iter()
             .map(|op| match op {
@@ -98,7 +112,8 @@ impl Shard for Collection {
                 Op::Delete { id } => WriteOp::Delete { id: *id },
             })
             .collect();
-        self.write_ops(&ops)
+        let begun = (**self).begin(&ops)?;
+        Ok(Box::new(|| begun.finish()))
     }
 
     fn search(&self, req: &SearchRequest) -> Result<SearchReply> {

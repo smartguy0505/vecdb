@@ -17,7 +17,8 @@ between threads, with snapshot reads, index builds beside writes and group
 commit (7a); it flushes and builds in the background and searches its
 segments in parallel, and databases hold named collections split into shards
 (7b); a server offers them over HTTP (7c); writes that outrun index builds are
-slowed down instead of stopped (7d). Step 8, the distributed mode, is next.
+slowed down instead of stopped (7d), and one that gives up and comes back has
+its place in the line again (7e). Step 8, the distributed mode, is next.
 
 ## Goals
 
@@ -1459,7 +1460,8 @@ it was a compaction of a large segment. Now:
   segments to others.
 - `max_write_wait` bounds what is left of the wait: a write that has not got
   room by then fails with `Unavailable` and has changed nothing in the shard
-  that made it wait. (Off by default in the library, 10 s in the server.)
+  that made it wait (in no shard, since step 7e). (Off by default in the
+  library, 10 s in the server.)
 
 One writer upserts the rows of a 1M-row segment (`sift1m-1seg`, buffered, 20
 s, limit 128 MiB, 4 build threads, 4 threads searching; page cache), on the
@@ -1556,8 +1558,8 @@ atomic. A request that fails with 5xx, or whose reply is lost, may have been
 applied in part or in whole. Sending it again is safe as long as nobody else
 wrote the same ids meanwhile: upserts replace, and deleting what is gone does
 nothing. A write that has to wait for index builds (see step 7d) gets 503
-after `--write-wait-secs` (10), without having changed anything in the shard
-that made it wait.
+after `--write-wait-secs` (10), without having changed anything. Sent again as
+it was, within a minute, it goes on from its place in the line (see step 7e).
 
 **Overload.** The engine's calls block, so they run on threads of their own.
 Searches, writes, requests that can take long and requests that only look
@@ -1714,7 +1716,7 @@ Now it is slowed down to what the builds keep up with:
 - Only while a build that makes room is due (or a flush that may make one due),
   and as long as builds do not fail. `max_write_wait` counts from when a write
   comes; one that has waited for longer fails and has changed nothing in that
-  shard.
+  shard (in no shard, since step 7e).
 - `CollectionStats` has the rate that writes are slowed down to and the time
   they have waited, the server `vecdb_shards_slowing_writes`,
   `vecdb_write_wait_seconds_total` and `state.slowing_writes`.
@@ -1803,9 +1805,8 @@ the first of the fixes; the last pair with both):
   behind the others. And 7c let so much in at once (280 MiB, where the limit is
   128) that it flushed larger segments, and built 4 indexes where 7d built 7;
   larger ones probably cost less per row (the training does not grow with
-  them). With 16 writers nobody is refused, where 7c refused 66 times. To
-  refuse at once what would wait too long, so that those who are let in get
-  through, is a follow-up.
+  them). With 16 writers nobody is refused, where 7c refused 66 times. Step
+  7e is about that case.
 - Not slowed down, writes cost what they did: 8 writers of single rows, no
   index builds, 109,578-120,066 rows/s (7c: 108,348-121,602), one writer
   111,838-112,098 (110,536-115,844).
@@ -1851,6 +1852,154 @@ $B coll-ingest ... --shards 4 --seal-mb 8 --index-mb 16 --unindexed-mb 48 --writ
 $B coll-ingest ... --shards 4 --seal-mb 4 --index-mb 8 --unindexed-mb 64 --writers 8
 $B coll-ingest ... --unindexed-mb 128 --writers 64 --limit 600000       # or --write-wait 10, all rows
 $B coll-ingest ... --unindexed-mb 1024 --index-mb 100000 --writers 8 --batch 1         # the cost of looking
+```
+
+## Writes that give up keep their place (step 7e)
+
+Step 7d left one case worse than 7c: many writers that give up after a while
+(in the server, after 10 s) and come back. 64 of them with 0.5 MiB each, where
+builds keep up with 2 MB/s, are a line of 17 s and more. Who gave up was the
+last again when they came back, and everyone who had been let through had lined
+up before them. In a trace of that case the slowest batches were all from its
+first second: about ten were refused time and again until there was nothing
+else left to write, 250-293 s later.
+
+- **A write that gives up keeps its place in the line**, for a minute. If it
+  comes again by then, it goes on from where it was. Nobody waits for it
+  meanwhile.
+- **It is known by what is in it:** the length and the CRC-32C of what the log
+  would have of it. A client has nothing to remember, and nothing to send but
+  the same request again. What differs, or comes later, is a new one, as in 7d.
+  Two writes with the same content (or checksum) may get each other's place,
+  which changes nothing but their order. A shard keeps the last 1,024 places.
+  Nothing is computed while writes are not slowed down.
+- **Nothing is written before all shards have room.** The parts of a write, one
+  for each shard it has rows of, wait for each other once they have been let
+  in. If one is refused, the others go back: they owe nothing, and keep their
+  places. Up to 7d they had been written by then, and were again, from the ends
+  of their lines, when the request was sent again. Now a write that is refused
+  because flushes or builds are behind has changed nothing in any shard. (One
+  that fails later, as it is written, may still have in others.)
+- For that the `Shard` interface has `begin`, the half of a write that can
+  wait; what it returns is the other half. A shard that does not implement it
+  does all in the second half, and may then have refused what others wrote.
+
+**What else was tried**, by simulating the line and the builds (not in the
+repository; 64 writers with batches of 0.5 MiB, 488 MiB in all, one shard, three
+runs each with builds that take 2 and 2.8 times as long as on a quiet machine):
+
+| a write that has waited for 10 s, or would | slowest batch | refusals (mean) |
+|---|---:|---:|
+| gives up, and is the last when it comes back (7d) | 226-228 s, 316-332 s | 633, 1,169 |
+| is refused at once, if the line is as long as it may wait | 97-138 s, 160-216 s | 6,439, 12,062 |
+| is refused at once by chance, the longer the line the likelier | 79-104 s, 112-179 s | 6,900-7,000, 12,400-12,500 |
+| is refused if it loses its place to a new one by chance | 139-182 s, 151-187 s | 6,435, 12,059 |
+| gives up, and keeps its place (7e) | 24-29 s, 34-41 s | 946, 1,518 |
+| waits as long as it takes | 24-29 s, 33-41 s | 0 |
+
+Refusing at once, which 7d had proposed, helps those who are let in and starves
+others: who gets in is luck. With kept places everyone waits as if nobody gave
+up, at about a refusal per batch, also when clients come back after 1-5 s (27-44
+s) or 10-20 s (31-58 s). With several shards the places alone would have made it
+worse. Simulated for 64 writers, 4 shards and the larger factor: 7d has the
+slowest batch after 247-306 s and writes every row 1.4 times; with places, but
+each shard writing its part at once, the shards took turns at refusing, and it
+did not end (13 times, when it was stopped); with both parts of the change it is
+40-49 s and every row once.
+
+### Results
+
+As in 7d: SIFT1M rows from scratch, 6 build threads, buffered WAL, on the same
+shared and loaded machine; 64 writers with batches of 1,000 rows, which give up
+after 10 s and try again a second later. The same benchmark program for all
+(it now counts how often rows are written), in turns (7c, 7d, 7e, 7e, 7d, 7c;
+the last block 7e, 7d, 7d, 7e), two runs each:
+
+| what is written | | to write | until all is indexed | batch p50 | p99 | slowest | batches over 1 / 10 s | refused | each row written | most in no index | peak memory |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 shard, 1M rows, limit 128 MiB | 7c | 259-268 s | 259-268 s | 0.18 s | 118-133 s | **118-133 s** | 164-183 / 164-183 | 1,064-1,260 | 1.00 | 267-284 MiB | 1.49-1.58 GB |
+| (load 16-26) | 7d | 297-303 s | 372-375 s | 9.8-9.9 s | 252-294 s | **292-300 s** | 752-760 / 265-324 | 998-1,038 | 1.00 | 193-199 MiB | 1.35-1.41 GB |
+| | 7e | 301-302 s | 375-377 s | 22.4-22.5 s | 31-33 s | **33.5-33.9 s** | 755-759 / 748-749 | 1,301-1,318 | 1.00 | 193-197 MiB | 1.41-1.43 GB |
+| 4 shards, 600,000 rows, limit 48 MiB a shard | 7c | 120-334 s | 233-335 s | 0.15-0.18 s | 118-333 s | **118-333 s** | 33-44 / 22-44 | 220-1,320 | 1.13-1.98 | 281-286 MiB | 1.38-1.68 GB |
+| (`index_bytes` 16, segments 8 MiB, load 15-22) | 7d | 179-198 s | 258-312 s | 0.23 s | 171-175 s | **174-184 s** | 253-254 / 151-156 | 751-872 | 1.39-1.46 | 234-242 MiB | 1.52-1.62 GB |
+| | 7e | 146-147 s | 335-343 s | 0.24-0.25 s | 41-47 s | **41-51 s** | 228-245 / 220-227 | 617-626 | 1.00 | 192-193 MiB | 1.32-1.33 GB |
+| the same (load 14-16) | 7d | 120-128 s | 207-236 s | 0.19-0.21 s | 114-116 s | **118-125 s** | 251-252 / 114-136 | 429-476 | 1.23-1.30 | 225-237 MiB | 1.48-1.50 GB |
+| | 7e | 106 s | 240-246 s | 0.16-0.25 s | 30-32 s | **31-35 s** | 229-239 / 217-220 | 413-415 | 1.00 | 192-195 MiB | 1.32-1.36 GB |
+
+(The first two blocks are of the code before three simplifications, the last one
+before one of them; the runs over HTTP below are of the final code. One more run
+of the first case at a load of 16-17: 241 s, 303 s, p50 18.3 s, p99 25.0 s,
+slowest 27.5 s, 993 refusals.)
+
+- **Nobody starves any more.** The slowest batch waits about as long as without
+  a deadline (28-39 s in the tables of 7d, which end after 600,000 rows): a
+  quarter to a ninth of what it did in 7d. And what was written twice and more
+  in several shards is written once.
+- **What got worse:** with one shard the typical batch waits longer (22 s, where
+  7d had 9.8 s and 7c 0.2 s), as the wait is the same for all now; and more are
+  refused than in 7d (1.3 times a batch). That is the length of the line: who may
+  wait for 10 s and has to for 22 is refused twice. With `--write-wait 45` the
+  same run (at a load of 16) had no refusals, and its slowest batch took 23.3 s.
+  And with 4 shards it takes longer than in 7d until all is indexed (335-343 s
+  against 258-312 s, 240-246 s against 207-236 s), with 16 builds instead of
+  13-15. The simulation had that the other way round. Why is not verified; it may
+  be that flat segments with rows that were written again have builds take in
+  three of them instead of two.
+- **What did not get better: the time until all is indexed** with one shard,
+  375-377 s where 7c took 259-268 s. It is that of the builds, 7 of 64 MiB or a
+  little more where 7c had 4 larger ones.
+- **Larger builds would help there**, but are not part of this step, as they
+  change the RAM bound of small limits. Tried with builds of up to twice
+  `index_bytes` while the limit allows it, first case, load 15-17, two runs:
+  261-276 s until all is indexed (303 s without), slowest 25.6-29.2 s, 789-793
+  refusals, most in no index 206 MiB (202).
+- **Over HTTP** the same: 64 clients that send a request of 1,000 rows (base64)
+  again a second after a 503, the server with `--max-unindexed-mb 128`, 1M rows,
+  load 6-11, 7d, 7e, 7e, 7d: the slowest batch took 120 and 69 s in 7d, 17.9 and
+  11.7 s in 7e, with 371 and 232, 700 and 257 refusals, and 187 and 160, 179 and
+  120 s to write all (the load changed between runs). 4 shards as above, 600,000
+  rows, load 11-14, 7e, 7d, 7d, 7e: 97 s twice in 7d, 24 s twice in 7e, 324-356
+  and 382-389 refusals, 103-108 and 90 s to write all.
+- **The other cases are as they were** (7d and 7e in turns, one run each, load
+  13-19): 16
+  writers with the deadline 5,244 and 5,124 rows/s, the slowest batch 5.9 and 6.4
+  s, nobody refused; 64 writers without one 5,325 and 5,226 rows/s, 22.7 and 25.1
+  s; 8 writers of single rows, slowed down, 6,909 and 6,787 rows/s, p99 5.6 ms
+  both, slowest 27 and 23 ms; 4 shards, 8 writers, 5,725 and 5,762 rows/s, 4.7
+  and 4.3 s. Not slowed down, two runs each: 8 writers of single rows
+  117,404-118,688 and 117,283-117,435 rows/s; one writer 240,447-257,489 and
+  252,577-272,439; 4 shards, 8 writers with batches of 100, 291,455-320,039 and
+  292,353-306,472.
+- **Not covered:** the 64 places of the server's writes. With more clients than
+  that, the others wait for one of those (10 s at most, 1,024 of them), in no
+  order that is kept. Not measured: clients that change their batches when they
+  are refused (the order of rows or attributes is enough; they wait as in 7d
+  then), writes that wait for flushes, more than 4 shards.
+
+### Tests
+
+The places: that they are kept, used once, in the order they were had, not for
+ever and not too many; that one that is kept is in nobody's way; a write that
+was let in and is not written owes nothing, has its place, and wakes the next.
+A write of a collection is known again by its content and nothing else, also
+one that had to wait for a flush. The shards: none writes before all have room,
+with one that refuses, one that is slow and one that panics, each of three, and
+with real ones where one waits for an index build; shards without `begin`. 49
+mutations of the code as it is now were run against the tests (before that,
+tests were added for three that were not caught, and three others led to simpler
+code). One is not caught, in a line that cannot be reached; seven are only
+noticed as tests that hang. The tests with timing ran 25 times in each profile
+on a loaded machine without a failure; before that, two had failed now and then:
+a new one that did not allow for what the bucket lets be made up for, and one of
+7d (`writes_are_not_slowed_down_for_nothing`) that took a slow flush for the
+limit of index builds.
+
+Commands (`B`, `S` as above; 7c and 7d: the same benchmark, over their cores):
+
+```
+$B coll-ingest --base $S/sift_base.fvecs --dir work --threads 6 --background true --unindexed-mb 128 --writers 64 --write-wait 10
+$B coll-ingest ... --shards 4 --seal-mb 8 --index-mb 16 --unindexed-mb 48 --writers 64 --write-wait 10 --limit 600000
+$B coll-ingest ... --unindexed-mb 1024 --index-mb 100000 --shards 4 --writers 8 --batch 100         # the cost of it
 ```
 
 ## Designing for billions
@@ -1976,15 +2125,19 @@ Within a shard:
    Done (7c): writes that no longer wait behind compactions, and whose wait
    can be bounded; an HTTP/JSON server. The shard interface over gRPC is part
    of step 8. Done (7d): writers that are slowed down to what index builds
-   keep up with, instead of stopped for each.
+   keep up with, instead of stopped for each. Done (7e): writes that give up
+   keep their place, and have changed nothing in any shard.
 
    Follow-ups:
    - faster index builds, which set the rate of a long ingest: PQ training is
-     about 40% of one of 64 MiB;
+     about 40% of one of 64 MiB; and larger ones while writes are slowed down
+     (see 7e);
+   - index builds of fewer than 256 different vectors, which fail (there are
+     too few to train PQ with), again and again;
    - merges of SSD segments that keep up with a long ingest (nothing slows
      writes down for those);
    - places in the server per collection: the writers of one that is slowed
-     down can take all 64; and refusing at once what would wait too long;
+     down can take all 64;
    - a limit for all shards of a database, not for each;
    - stopping an `optimize` of a collection that is dropped;
    - server: TLS, a key per collection or user, streamed bulk imports, requests
@@ -1997,5 +2150,6 @@ Within a shard:
    - growing rows read without a lock (7a measured about 10% of the search
      p99, so it was left out);
    - flush fsyncs in chunks, which share the disk with the logs better
-8. Distributed mode: remote shards, query nodes, metadata service,
-   replication, rebalancing
+8. Distributed mode: remote shards (which need a `begin` of their own: where
+   all is done in the second half, parts of a refused write are written),
+   query nodes, metadata service, replication, rebalancing

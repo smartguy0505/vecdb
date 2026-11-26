@@ -674,10 +674,16 @@ fn writes_are_not_slowed_down_for_nothing() {
     };
     let mut id = 10_000;
     for rows in [100, 1] {
-        while upsert(id, rows).is_ok() {
-            id += rows;
+        loop {
+            match upsert(id, rows) {
+                Ok(()) => id += rows,
+                // (Flushes can be slow.)
+                Err(Error::Unavailable(m)) if m == "flushes are behind" => {}
+                Err(_) => break,
+            }
         }
     }
+    until("flushes", || c.stats().frozen == 0);
     let (rows, waited) = (c.len(), c.stats().write_wait);
     assert!(rows > 7500 && c.unindexed() >= 5100.0 * 16.0 && c.write_rate() == Some(0.0), "{rows}");
     let mixed = [WriteOp::Delete { id: 300 }, WriteOp::Upsert { id, vector: &v, attrs: &NO_ATTRS }];
@@ -1132,4 +1138,99 @@ fn writes_give_up_waiting() {
         drop(c);
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+/// A write that has been refused is known when it comes again, by what is in
+/// it; also one that was let through, but then had to wait for a flush.
+#[test]
+fn a_refused_write_is_known_again() {
+    let dim = 4;
+    let max_write_wait = Some(Duration::from_millis(100));
+    let limit = 4000 * dim as u64 * 4;
+    let opts = OpenOptions { max_unindexed_bytes: limit, max_write_wait, ..opts() };
+    let dir = test_dir("coll-bg-known");
+    let mut cfg = ssd_config(dim, Metric::L2, 1300, 2500);
+    cfg.max_indexed_segments = 1000;
+    let c = Collection::create(&dir, cfg, opts).unwrap();
+    let (go, blocked) = block_at(&c, "flush: rows written");
+    let attrs = NO_ATTRS.clone();
+    let write = |ids: std::ops::Range<u64>, x: f32| {
+        let rows: Vec<(u64, [f32; 4])> = ids.map(|id| (id, [id as f32, (id * 7 % 1000) as f32, 1.0, x])).collect();
+        let ops: Vec<WriteOp> =
+            rows.iter().map(|(id, v)| WriteOp::Upsert { id: *id, vector: v, attrs: &attrs }).collect();
+        match c.write(&ops) {
+            Ok(()) => None,
+            Err(Error::Unavailable(why)) => Some(why),
+            Err(e) => panic!("{e}"),
+        }
+    };
+    // Two segments to flush and one full, and a rate (see
+    // `writes_are_not_slowed_down_for_nothing`).
+    (0..77).for_each(|i| assert_eq!(write(i * 50..(i + 1) * 50, 0.0), None));
+    until("a flush", || blocked.load(Ordering::Relaxed));
+    // What is written is owed: the one after it has to wait for that.
+    assert_eq!(c.line.owed(), 0.0);
+    assert_eq!(write(3850..3900, 0.0), None);
+    assert_eq!(c.line.owed(), 50.0 * 16.0);
+    assert!(c.stats().frozen == 2 && c.write_rate().is_some_and(|r| r > 1e6));
+    let (rows, flushes) = (c.len(), Some("flushes are behind".to_string()));
+    let last = |n: usize| {
+        let (line, kept) = c.line.places();
+        assert!(line.is_empty() && kept.len() >= n, "{line:?} {kept:?}");
+        kept[kept.len() - n..].to_vec()
+    };
+    assert!(c.line.places().1.is_empty());
+    assert_eq!(write(5000..5100, 1.0), flushes);
+    assert_eq!(c.line.owed(), 0.0);
+    assert_eq!(write(5000..5100, 2.0), flushes);
+    let [a, b] = last(2).try_into().unwrap();
+    assert!(a.0 != b.0 && a.1 < b.1, "{a:?} {b:?}");
+    // It has the place that it had.
+    assert_eq!(write(5000..5100, 1.0), flushes);
+    assert_eq!(last(2), [b, a]);
+    // Another one has not: fewer rows, other ids, other numbers.
+    for other in [write(5000..5099, 1.0), write(5001..5101, 1.0), write(5000..5100, 1.5)] {
+        assert_eq!(other, flushes);
+    }
+    let all = last(5);
+    assert!(all[..2] == [b, a] && all[2].1 > b.1 && all[2..].is_sorted_by(|x, y| x.1 < y.1), "{all:?}");
+    assert_eq!(c.len(), rows);
+
+    // The same for those that index builds are to blame for.
+    let (go2, blocked2) = block_at(&c, "build: built");
+    go.send(()).unwrap();
+    until("a build", || blocked2.load(Ordering::Relaxed));
+    let mut id = 10_000;
+    for n in [100, 1] {
+        while write(id..id + n, 3.0).is_none_or(|why| why == flushes.clone().unwrap()) {
+            id += n;
+        }
+    }
+    until("flushes", || c.stats().frozen == 0);
+    assert_eq!(c.write_rate(), Some(0.0));
+    let (rows, builds) = (c.len(), Some("index builds are behind".to_string()));
+    assert_eq!((write(20_000..20_001, 1.0), write(20_000..20_001, 2.0)), (builds.clone(), builds.clone()));
+    let [a, b] = last(2).try_into().unwrap();
+    assert_eq!(write(20_000..20_001, 1.0), builds);
+    assert_eq!(last(2), [b, a]);
+    // Not deletes, which do not wait.
+    let before = c.line.places();
+    assert!(!c.delete(20_000).unwrap());
+    assert_eq!(c.line.places(), before);
+
+    // Nothing is written of one that has begun and is not finished.
+    c.background.build_failed(Lane::Flat, &Error::Unavailable("made up".into()));
+    let v = [0.5; 4];
+    let ops = [WriteOp::Upsert { id: 20_000, vector: &v, attrs: &attrs }, WriteOp::Delete { id: 5 }];
+    let seq = c.stats().next_seq;
+    drop(c.begin(&ops).unwrap());
+    assert!(!c.contains(20_000) && c.contains(5) && (c.len(), c.stats().next_seq) == (rows, seq));
+    assert_eq!(c.begin(&ops).unwrap().finish().unwrap(), [false, true]);
+    assert!(c.contains(20_000) && !c.contains(5) && (c.len(), c.stats().next_seq) == (rows, seq + 2));
+    let batches = c.stats().write_batches;
+    assert_eq!(c.begin(&[]).unwrap().finish().unwrap(), [false; 0]);
+    assert_eq!(c.stats().write_batches, batches);
+    go2.send(()).unwrap();
+    drop(c);
+    let _ = fs::remove_dir_all(&dir);
 }

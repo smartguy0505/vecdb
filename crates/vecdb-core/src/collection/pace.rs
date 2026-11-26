@@ -15,7 +15,11 @@
 //!
 //! Writes go in the order they come ([`Line`]), each once the ones before it
 //! are paid for ([`Bucket`]): a write that comes after a pause does not wait,
-//! however large it is, and those after it do.
+//! however large it is, and those after it do. One that has waited for as long
+//! as it may gives up, and its place is kept for a while: it has that again
+//! if it comes again. Or those at the end of a long line would be late time
+//! and again, as everyone who is let through lines up before they are back.
+//! It is known by what is in it: whoever sends it has nothing to remember.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +42,11 @@ const LOOK: Duration = Duration::from_millis(10);
 /// What was not used of the rate lately still may be, for this long: writes
 /// wake up later than they are due.
 const CREDIT: Duration = Duration::from_millis(2);
+
+/// How long the place of a write that has given up is kept, and of how many:
+/// an order to go in is all they take.
+const KEEP: Duration = Duration::from_secs(60);
+const MOST_KEPT: usize = 1024;
 
 /// The bytes of vectors in no SSD index at which writes are slowed down, and
 /// stopped.
@@ -97,8 +106,42 @@ impl Bucket {
 struct State {
     /// Tickets of those that wait, in order.
     line: VecDeque<(u64, Thread)>,
+    /// The places of those that have given up, the last one last.
+    kept: VecDeque<Kept>,
     next: u64,
     bucket: Bucket,
+}
+
+struct Kept {
+    key: u64,
+    ticket: u64,
+    until: Instant,
+}
+
+impl State {
+    fn keep(&mut self, key: u64, ticket: u64) {
+        let now = Instant::now();
+        while self.kept.len() >= MOST_KEPT || self.kept.front().is_some_and(|k| k.until <= now) {
+            self.kept.pop_front();
+        }
+        self.kept.push_back(Kept { key, ticket, until: now + KEEP });
+    }
+
+    /// Lines up: where it was, or at the end.
+    fn line_up(&mut self, key: u64) -> u64 {
+        let now = Instant::now();
+        let kept = self.kept.iter().position(|k| k.key == key && k.until > now);
+        let ticket = match kept.and_then(|i| self.kept.remove(i)) {
+            Some(k) => k.ticket,
+            None => {
+                self.next += 1;
+                self.next - 1
+            }
+        };
+        let at = self.line.partition_point(|(t, _)| *t < ticket);
+        self.line.insert(at, (ticket, thread::current()));
+        ticket
+    }
 }
 
 /// The line writes wait in.
@@ -114,23 +157,38 @@ impl Line {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The tickets of those that wait, and the places that are kept, of which
+    /// writes.
+    #[cfg(test)]
+    pub fn places(&self) -> (Vec<u64>, Vec<(u64, u64)>) {
+        let s = self.lock();
+        (s.line.iter().map(|(t, _)| *t).collect(), s.kept.iter().map(|k| (k.key, k.ticket)).collect())
+    }
+
+    #[cfg(test)]
+    pub fn owed(&self) -> f64 {
+        self.lock().bucket.owed
+    }
+
     /// Waits for its turn to add `bytes` (which are then owed), at the
     /// `rate` there is along the way. How long it waited; an error if its
-    /// turn had not come by `deadline`.
+    /// turn had not come by `deadline`. It is known by `key` if it comes
+    /// again then.
     pub fn wait(
         &self,
         bytes: u64,
+        key: impl FnOnce() -> u64,
         deadline: Option<Instant>,
         rate: impl Fn() -> Option<f64>,
-    ) -> Result<Duration, Duration> {
+    ) -> Result<(Duration, Pass<'_>), Duration> {
         if rate().is_none() {
             if !self.free.load(Ordering::Relaxed) {
                 self.free.store(true, Ordering::Relaxed);
             }
-            return Ok(Duration::ZERO);
+            return Ok((Duration::ZERO, Pass(None)));
         }
         let start = Instant::now();
-        let place = Place::new(self);
+        let mut place = Place::new(self, key());
         let mut waited = Duration::ZERO;
         loop {
             let rate = rate();
@@ -141,17 +199,19 @@ impl Line {
                 s.bucket = Bucket::default();
             }
             let left = match rate {
-                None => return Ok(waited),
+                None => return Ok((waited, Pass(None))),
                 Some(r) if first => s.bucket.pay(now, r),
                 Some(_) => Duration::MAX,
             };
             if left.is_zero() {
                 s.bucket.owed += bytes as f64;
-                return Ok(waited);
+                let (line, key, ticket) = (self, place.key, place.ticket);
+                return Ok((waited, Pass(Some(Owes { line, key, ticket, bytes }))));
             }
             drop(s);
             let until = deadline.map_or(Duration::MAX, |d| d.saturating_duration_since(now));
             if until.is_zero() {
+                place.keep = true;
                 return Err(waited);
             }
             // (The others are woken when they are the first.)
@@ -165,16 +225,16 @@ impl Line {
 /// A write's place in the line.
 struct Place<'a> {
     line: &'a Line,
+    key: u64,
     ticket: u64,
+    /// Whether it is kept when this is dropped.
+    keep: bool,
 }
 
 impl<'a> Place<'a> {
-    fn new(line: &'a Line) -> Self {
-        let mut s = line.lock();
-        let ticket = s.next;
-        s.next += 1;
-        s.line.push_back((ticket, thread::current()));
-        Self { line, ticket }
+    fn new(line: &'a Line, key: u64) -> Self {
+        let ticket = line.lock().line_up(key);
+        Self { line, key, ticket, keep: false }
     }
 }
 
@@ -182,8 +242,45 @@ impl Drop for Place<'_> {
     fn drop(&mut self) {
         let mut s = self.line.lock();
         s.line.retain(|(t, _)| *t != self.ticket);
+        if self.keep {
+            s.keep(self.key, self.ticket);
+        }
         if let Some((_, first)) = s.line.front() {
             first.unpark();
+        }
+    }
+}
+
+/// That a write may go ahead, and what it owes for it. If it does not after
+/// all (this is dropped, not [`used`](Self::used)), it owes nothing, and its
+/// place is kept.
+#[must_use]
+pub(super) struct Pass<'a>(Option<Owes<'a>>);
+
+struct Owes<'a> {
+    line: &'a Line,
+    key: u64,
+    ticket: u64,
+    bytes: u64,
+}
+
+impl Pass<'_> {
+    /// For a write that takes no room.
+    pub fn free() -> Self {
+        Self(None)
+    }
+
+    pub fn used(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        if let Some(Owes { line, key, ticket, bytes }) = self.0.take() {
+            let mut s = line.lock();
+            s.bucket.owed = (s.bucket.owed - bytes as f64).max(0.0);
+            s.keep(key, ticket);
         }
     }
 }
@@ -307,6 +404,12 @@ mod tests {
         }
     }
 
+    /// The write goes ahead. How long it has waited.
+    fn paid((time, pass): (Duration, Pass)) -> Duration {
+        pass.used();
+        time
+    }
+
     fn waiting(line: &Line) -> usize {
         line.lock().line.len()
     }
@@ -321,7 +424,7 @@ mod tests {
                 let (line, rate, order) = (line.clone(), rate.clone(), order.clone());
                 until("the one before", || waiting(&line) == i);
                 thread::spawn(move || {
-                    let waited = line.wait(1000, None, || rate.get()).unwrap();
+                    let waited = line.wait(1000, || i as u64, None, || rate.get()).map(paid).unwrap();
                     order.lock().unwrap().push((i, Instant::now(), waited));
                 })
             })
@@ -339,7 +442,7 @@ mod tests {
         assert!(order.iter().all(|o| o.2 >= Duration::from_millis(50)), "{order:?}");
         assert_eq!(waiting(&line), 0);
         // The last is still to be paid for.
-        let owed = line.lock().bucket.owed;
+        let owed = line.owed();
         assert!((0.0..=1000.0).contains(&owed), "{owed}");
     }
 
@@ -352,7 +455,7 @@ mod tests {
         thread::scope(|s| {
             let held = asleep.lock().unwrap();
             let first = s.spawn(|| {
-                line.wait(1, None, || match wake.fetch_add(1, Ordering::Relaxed) {
+                line.wait(1, || 1, None, || match wake.fetch_add(1, Ordering::Relaxed) {
                     0 | 1 => Some(0.0),
                     _ => {
                         drop(asleep.lock().unwrap());
@@ -362,12 +465,12 @@ mod tests {
             });
             until("the first to sleep", || wake.load(Ordering::Relaxed) > 2);
             let soon = Instant::now() + Duration::from_millis(50);
-            assert!(line.wait(1, Some(soon), || Some(1e6)).is_err());
+            assert!(line.wait(1, || 2, Some(soon), || Some(1e6)).is_err());
             assert!(!first.is_finished());
             drop(held);
-            first.join().unwrap().unwrap();
+            first.join().unwrap().map(paid).unwrap();
         });
-        assert!(line.wait(1, Some(Instant::now() + Duration::from_secs(5)), || Some(1e6)).is_ok());
+        assert!(line.wait(1, || 3, Some(Instant::now() + Duration::from_secs(5)), || Some(1e6)).map(paid).is_ok());
     }
 
     /// Those that are late go, also from the front and the middle, and have
@@ -382,7 +485,8 @@ mod tests {
                 let (line, rate, through) = (&line, &rate, &through);
                 let h = s.spawn(move || {
                     let t0 = Instant::now();
-                    let r = line.wait(100, ms.map(|ms| t0 + Duration::from_millis(ms)), || rate.get());
+                    let deadline = ms.map(|ms| t0 + Duration::from_millis(ms));
+                    let r = line.wait(100, || before as u64, deadline, || rate.get()).map(paid);
                     through.fetch_add(r.is_ok() as usize, Ordering::Relaxed);
                     (r, t0.elapsed())
                 });
@@ -403,10 +507,109 @@ mod tests {
                 assert!(waited <= took && waited + Duration::from_millis(50) > ms, "{waited:?} of {took:?}");
             }
             assert_eq!((waiting(&line), through.load(Ordering::Relaxed)), (2, 0));
-            assert!(line.lock().bucket.owed <= 0.0);
+            assert!(line.owed() <= 0.0);
             rate.set(1000);
         });
         assert_eq!((waiting(&line), through.load(Ordering::Relaxed)), (0, 2));
+    }
+
+    /// One that has given up is in nobody's way, and has its place again when
+    /// it comes again, however often.
+    #[test]
+    fn a_place_is_kept() {
+        let (line, rate) = (Line::default(), Rate::default());
+        let order = Mutex::new(Vec::new());
+        // Gives up at once.
+        let late = |key: u64| assert!(line.wait(1000, || key, Some(Instant::now()), || rate.get()).is_err());
+        (1..5).for_each(late);
+        assert_eq!(line.places().1, [(1, 0), (2, 1), (3, 2), (4, 3)]);
+        thread::scope(|s| {
+            let write = |key: u64| {
+                let before = waiting(&line);
+                let (line, rate, order) = (&line, &rate, &order);
+                s.spawn(move || {
+                    let soon = Some(Instant::now() + Duration::from_secs(30));
+                    let (_, pass) = line.wait(1000, || key, soon, || rate.get()).unwrap();
+                    order.lock().unwrap().push(key);
+                    pass.used();
+                });
+                until("it to wait", || waiting(line) == before + 1);
+            };
+            // A new one, one from the middle, and the first one, twice.
+            write(5);
+            write(3);
+            late(1);
+            write(1);
+            // Another new one; and one that is known, but has no place.
+            write(6);
+            write(3);
+            assert_eq!(line.places(), (vec![0, 2, 4, 5, 6], vec![(2, 1), (4, 3)]));
+            // (A write every 100 ms.)
+            rate.set(10_000);
+            until("all", || waiting(&line) == 0);
+        });
+        assert_eq!(*order.lock().unwrap(), [1, 3, 5, 6, 3]);
+        assert_eq!(line.places().1, [(2, 1), (4, 3)]);
+    }
+
+    /// Nor are there more than so many.
+    #[test]
+    fn places_are_not_kept_for_ever() {
+        let mut s = State { next: 1 << 20, ..State::default() };
+        for i in 0..MOST_KEPT as u64 + 10 {
+            s.keep(1000 + i, i);
+        }
+        assert_eq!((s.kept.len(), s.kept[0].ticket), (MOST_KEPT, 10));
+        assert_eq!(s.line_up(1009), 1 << 20);
+        assert_eq!(s.line_up(1012), 12);
+        // Once.
+        assert_eq!(s.line_up(1012), (1 << 20) + 1);
+        // Of two that are the same, the one that came first.
+        s.keep(1, 5000);
+        s.keep(1, 4000);
+        assert_eq!((s.line_up(1), s.line_up(1), s.line_up(1)), (5000, 4000, (1 << 20) + 2));
+        assert!(s.line.iter().map(|(t, _)| *t).is_sorted() && s.line.len() == 6);
+        // Not after a while; and then they are removed.
+        let n = s.kept.len();
+        assert!(s.kept.iter().all(|k| k.until > Instant::now() + KEEP / 2 && k.until <= Instant::now() + KEEP));
+        s.kept.iter_mut().for_each(|k| k.until = Instant::now());
+        assert_eq!(s.line_up(1015), (1 << 20) + 3);
+        assert_eq!(s.kept.len(), n);
+        s.keep(7, 7);
+        assert_eq!(s.kept.len(), 1);
+    }
+
+    /// One that was let through and has not gone owes nothing, and has its
+    /// place.
+    #[test]
+    fn a_pass_that_is_not_used() {
+        let line = &Line::default();
+        let go = |key: u64| line.wait(1 << 30, || key, Some(Instant::now()), || Some(1000.0));
+        let (_, pass) = go(1).unwrap();
+        assert!(go(2).is_err());
+        assert!(line.owed() > 1e9);
+        drop(pass);
+        assert_eq!(line.owed(), 0.0);
+        assert_eq!(line.places().1, [(2, 1), (1, 0)]);
+        let (_, pass) = go(3).unwrap();
+        thread::scope(|s| {
+            // Those that wait for it go.
+            let soon = Some(Instant::now() + Duration::from_secs(20));
+            let h = s.spawn(move || line.wait(1, || 2, soon, || Some(1000.0)).map(paid).unwrap());
+            until("it to wait", || waiting(line) == 1);
+            drop(pass);
+            h.join().unwrap();
+        });
+        // One that is used is not given back, one that had nothing to pay
+        // for has nothing to give back.
+        let (_, pass) = line.wait(1 << 30, || 9, None, || Some(1000.0)).unwrap();
+        pass.used();
+        let owed = line.owed();
+        assert!(owed > 1e9 && !line.places().1.iter().any(|k| k.0 == 9));
+        let key = || panic!("not asked for");
+        drop(line.wait(1 << 30, key, None, || None).unwrap());
+        drop(Pass::free());
+        assert_eq!(line.places().1, [(1, 0), (3, 2)]);
     }
 
     /// They need not wait for what is owed, nor for those before them, once
@@ -417,9 +620,10 @@ mod tests {
         let hour = 3_600_000;
         let late = || Some(Instant::now());
         rate.set(1000);
-        assert_eq!(line.wait(hour, None, || rate.get()).unwrap(), Duration::ZERO);
+        assert_eq!(line.wait(hour, || 1, None, || rate.get()).map(paid).unwrap(), Duration::ZERO);
         thread::scope(|s| {
-            let all: Vec<_> = (0..32).map(|_| s.spawn(|| line.wait(1, None, || rate.get()).unwrap())).collect();
+            let write = || line.wait(1, || 2, None, || rate.get()).map(paid).unwrap();
+            let all: Vec<_> = (0..32).map(|_| s.spawn(write)).collect();
             until("all", || waiting(&line) == 32);
             let t0 = Instant::now();
             rate.set(NONE);
@@ -429,17 +633,17 @@ mod tests {
         });
         assert_eq!(waiting(&line), 0);
         // What is owed is forgotten, then: here by those that waited, ...
-        assert_eq!(line.lock().bucket.owed, 0.0);
+        assert_eq!(line.owed(), 0.0);
         // ... here by one that does not come to the line.
         rate.set(1000);
-        assert_eq!(line.wait(hour, late(), || rate.get()), Ok(Duration::ZERO));
-        assert!(line.wait(1, late(), || rate.get()).is_err());
+        assert_eq!(line.wait(hour, || 1, late(), || rate.get()).map(paid), Ok(Duration::ZERO));
+        assert!(line.wait(1, || 3, late(), || rate.get()).map(paid).is_err());
         rate.set(NONE);
-        assert_eq!(line.wait(1, late(), || rate.get()), Ok(Duration::ZERO));
+        assert_eq!(line.wait(1, || 3, late(), || rate.get()).map(paid), Ok(Duration::ZERO));
         assert_eq!(line.lock().next, 35);
         rate.set(1000);
-        assert_eq!(line.wait(hour, late(), || rate.get()), Ok(Duration::ZERO));
-        assert!(line.wait(1, late(), || rate.get()).is_err());
+        assert_eq!(line.wait(hour, || 1, late(), || rate.get()).map(paid), Ok(Duration::ZERO));
+        assert!(line.wait(1, || 3, late(), || rate.get()).map(paid).is_err());
     }
 
     /// Many small writes from many threads get the rate, whatever they take
@@ -454,7 +658,7 @@ mod tests {
             for _ in 0..4 {
                 s.spawn(|| {
                     while t0.elapsed() < Duration::from_millis(500) {
-                        line.wait(100, None, || Some(2e6)).unwrap();
+                        line.wait(100, || 1, None, || Some(2e6)).map(paid).unwrap();
                         bytes.fetch_add(100, Ordering::Relaxed);
                     }
                 });
@@ -475,15 +679,16 @@ mod tests {
         thread::scope(|s| {
             let bad = s.spawn(|| {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    line.wait(1, None, || match calls.fetch_add(1, Ordering::Relaxed) {
+                    line.wait(1, || 1, None, || match calls.fetch_add(1, Ordering::Relaxed) {
                         0..20 => Some(0.0),
                         _ => panic!("on purpose"),
                     })
+                    .map(paid)
                 }));
                 assert!(r.is_err());
             });
             until("the first", || waiting(&line) == 1);
-            line.wait(1, None, || Some(1e6)).unwrap();
+            line.wait(1, || 2, None, || Some(1e6)).map(paid).unwrap();
             bad.join().unwrap();
         });
         assert_eq!(waiting(&line), 0);

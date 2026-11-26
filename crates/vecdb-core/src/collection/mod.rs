@@ -96,6 +96,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::crc32c::crc32c;
 use crate::disk::{DiskIndex, DiskOpenOptions, IoMode, Layout};
 use crate::distance::{Metric, check_finite, normalize};
 use crate::error::{Error, Result};
@@ -108,7 +109,7 @@ use background::{Background, Room, Waited, Workers};
 use columns::{SegmentAttrs, decode_row, encode_row};
 use maintain::Indexing;
 use manifest::{MANIFEST, Manifest, SegmentEntry, SegmentKind};
-use pace::{Line, Zone};
+use pace::{Line, Pass, Zone};
 use segment::{Body, Frozen, Growing, Sealed, Tombstones, attrs_name, del_name, disk_name, flat_name};
 use wal::{Event, LoggedOp, Wal, replay_chain, wal_generation, wal_name};
 
@@ -267,8 +268,10 @@ pub struct OpenOptions {
     /// taken do not count. 0 = no limit.
     pub max_unindexed_bytes: u64,
     /// Longest wait of a write for flushes or index builds to catch up; then
-    /// it fails with [`Error::Unavailable`], and nothing is written. `None`:
-    /// as long as it takes.
+    /// it fails with [`Error::Unavailable`], and nothing is written. Where it
+    /// was in the line of those that are slowed down is kept for a minute: it
+    /// goes on from there if it is tried again (the same ops). `None`: as long
+    /// as it takes.
     pub max_write_wait: Option<Duration>,
     /// Background builds that may run at once, over all collections given
     /// the same limit (so many index builds, and so many compactions and
@@ -494,6 +497,30 @@ struct Prepared {
     row_end: Vec<usize>,
     /// The ops as the WAL records them.
     wal: Vec<u8>,
+}
+
+/// A batch that there is room for. It is written by [`finish`](Self::finish);
+/// nothing of it is if this is dropped.
+pub(crate) struct Begun<'a> {
+    engine: &'a Engine,
+    p: Prepared,
+    pass: Pass<'a>,
+}
+
+impl Begun<'_> {
+    /// Per op, whether its id had a live row.
+    pub fn finish(self) -> Result<Vec<bool>> {
+        let Self { engine, p, pass } = self;
+        if p.ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let r = engine.enqueue(p);
+        pass.used();
+        if !engine.opts.background {
+            engine.flush_frozen();
+        }
+        r
+    }
 }
 
 /// Write batches waiting for the writer lock (group commit).
@@ -931,29 +958,38 @@ impl Engine {
 
     /// As [`write`](Self::write); per op, whether its id had a live row.
     pub fn write_ops(&self, ops: &[WriteOp]) -> Result<Vec<bool>> {
-        if ops.is_empty() {
-            return Ok(Vec::new());
-        }
-        let p = self.prepare(ops)?;
-        self.make_room(p.vectors.len() as u64 * 4)?;
-        let r = self.enqueue(p);
-        if !self.opts.background {
-            self.flush_frozen();
-        }
-        r
+        self.begin(ops)?.finish()
     }
 
-    /// Waits until there is room for a write of `bytes` of vectors, or fails.
-    fn make_room(&self, bytes: u64) -> Result<()> {
+    /// Waits until there is room for `ops`, or fails. They are written by
+    /// [`Begun::finish`], or not at all.
+    pub(crate) fn begin(&self, ops: &[WriteOp]) -> Result<Begun<'_>> {
+        if ops.is_empty() {
+            return Ok(Begun { engine: self, p: Prepared::default(), pass: Pass::free() });
+        }
+        let p = self.prepare(ops)?;
+        let pass = self.make_room(&p)?;
+        Ok(Begun { engine: self, p, pass })
+    }
+
+    /// Waits until there is room for a write, or fails.
+    fn make_room(&self, p: &Prepared) -> Result<Pass<'_>> {
+        let bytes = p.vectors.len() as u64 * 4;
+        let mut pass = Pass::free();
         let deadline = self.opts.max_write_wait.and_then(|w| Instant::now().checked_add(w));
         let waited = |time: Duration| {
             self.write_wait.fetch_add(time.as_micros() as u64, Ordering::Relaxed);
         };
         let late = |what| Err(Error::Unavailable(format!("{what} are behind")));
+        // The same write, if it comes again, is the same bytes.
+        let key = || (p.wal.len() as u64) << 32 | crc32c(&p.wal) as u64;
         // (One that only deletes takes none.)
         if bytes > 0 {
-            match self.line.wait(bytes, deadline, || self.write_rate()) {
-                Ok(time) => waited(time),
+            match self.line.wait(bytes, key, deadline, || self.write_rate()) {
+                Ok((time, got)) => {
+                    waited(time);
+                    pass = got;
+                }
                 Err(time) => {
                     waited(time);
                     return late("index builds");
@@ -962,7 +998,7 @@ impl Engine {
         }
         loop {
             match self.room(&self.background.progress()) {
-                Room::Yes => return Ok(()),
+                Room::Yes => return Ok(pass),
                 Room::Wait(what) => {
                     let start = Instant::now();
                     let more = |p: &_| !matches!(self.room(p), Room::Wait(_));
@@ -986,7 +1022,7 @@ impl Engine {
                     }
                     return match self.room(&self.background.progress()) {
                         Room::No(_) => Err(Error::Unavailable(why)),
-                        _ => Ok(()),
+                        _ => Ok(pass),
                     };
                 }
             }

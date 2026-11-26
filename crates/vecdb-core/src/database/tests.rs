@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::collection::{Attrs, Durability, Fetch, Field, Filter, SearchOptions};
@@ -376,6 +376,224 @@ fn a_bad_op_changes_nothing_on_any_shard() {
     }
     drop(db);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A shard that does something before it looks for room, and something after
+/// that.
+struct Gate {
+    shard: Arc<dyn Shard>,
+    before: Box<dyn Fn() -> Result<()> + Send + Sync>,
+    after: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Shard for Gate {
+    fn write(&self, ops: &[Op]) -> Result<Vec<bool>> {
+        self.begin(ops)?()
+    }
+    fn begin<'a>(&'a self, ops: &'a [Op]) -> Result<PendingWrite<'a>> {
+        (self.before)()?;
+        let r = self.shard.begin(ops)?;
+        (self.after)();
+        Ok(r)
+    }
+    fn search(&self, req: &SearchRequest) -> Result<SearchReply> {
+        self.shard.search(req)
+    }
+    fn get(&self, id: u64) -> Result<Option<Row>> {
+        self.shard.get(id)
+    }
+    fn stats(&self) -> Result<CollectionStats> {
+        self.shard.stats()
+    }
+    fn flush(&self) -> Result<()> {
+        self.shard.flush()
+    }
+    fn optimize(&self) -> Result<()> {
+        self.shard.optimize()
+    }
+    fn wait_idle(&self) -> Result<()> {
+        self.shard.wait_idle()
+    }
+}
+
+/// A write that a shard has no room for changes nothing on the others, which
+/// wait until all have.
+#[test]
+fn nothing_is_written_before_all_shards_have_room() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    let dir = test_dir("db-room");
+    let (db, _) = open(&dir);
+    let real = db.create_collection("c", config(1000), 3).unwrap();
+    let with = |shards: Vec<Arc<dyn Shard>>| ShardedCollection {
+        name: "c".into(),
+        config: real.config.clone(),
+        shards,
+        pool: real.pool.clone(),
+        dir: PathBuf::new(),
+        dropped: false.into(),
+    };
+    let ready = Arc::new(AtomicUsize::new(0));
+    // One of the shards (of the three) is as given.
+    let gated = |at: usize, before: Box<dyn Fn() -> Result<()> + Send + Sync>| {
+        let mut before = Some(before);
+        with(
+            (0..3)
+                .map(|i| {
+                    let ready = ready.clone();
+                    let before = if i == at { before.take().unwrap() } else { Box::new(|| Ok(())) };
+                    let after = Box::new(move || _ = ready.fetch_add(1, Ordering::Relaxed));
+                    Arc::new(Gate { shard: real.shards[i].clone(), before, after }) as Arc<dyn Shard>
+                })
+                .collect(),
+        )
+    };
+    let rows = |from: u64| (from..from + 60).map(|id| upsert(id, vec![1.0; DIM])).collect::<Vec<_>>();
+    // Each shard has some of them.
+    assert!((0..3).all(|s| (0..60).any(|id| shard_of(id, 3) == s)));
+    let written = || real.stats().unwrap().iter().map(|s| s.next_seq).collect::<Vec<_>>();
+    let none = written();
+    for at in 0..3 {
+        let c = gated(at, Box::new(|| Err(Error::Unavailable("no room".into()))));
+        let e = c.write(rows(0)).unwrap_err();
+        assert!(matches!(&e, Error::Unavailable(m) if m == "no room"), "{e}");
+        assert_eq!((real.len().unwrap(), written()), (0, none.clone()));
+        let c = gated(at, Box::new(|| panic!("on purpose")));
+        assert!(catch_unwind(AssertUnwindSafe(|| c.write(rows(0)))).is_err());
+        assert_eq!((real.len().unwrap(), written()), (0, none.clone()));
+    }
+    for at in 0..3 {
+        let (go, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let slow = move || {
+            wait.lock().unwrap().recv_timeout(Duration::from_secs(60)).unwrap();
+            Ok(())
+        };
+        let c = gated(at, Box::new(slow));
+        let before = written();
+        ready.store(0, Ordering::Relaxed);
+        let from = 100 * at as u64;
+        std::thread::scope(|s| {
+            let h = s.spawn(|| c.write(rows(from)));
+            let t0 = Instant::now();
+            while ready.load(Ordering::Relaxed) < 2 {
+                assert!(t0.elapsed() < Duration::from_secs(30));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(written(), before);
+            go.send(()).unwrap();
+            assert_eq!(h.join().unwrap().unwrap(), [false; 60]);
+        });
+        assert_eq!(real.len().unwrap(), 60 * (at + 1));
+        // One that the slow shard has no part of does not wait for it.
+        let id = (1000..).find(|&id| shard_of(id, 3) != at).unwrap();
+        let ops = vec![upsert(id, vec![1.0; DIM]), Op::Delete { id }, Op::Delete { id }];
+        assert_eq!(c.write(ops).unwrap(), [false, true, false]);
+    }
+    // Shards that cannot tell, all and some.
+    for away in [&[0, 1, 2][..], &[1]] {
+        let c = with(
+            (0..3)
+                .map(|i| match away.contains(&i) {
+                    true => Arc::new(Elsewhere(real.shards[i].clone(), false)) as Arc<dyn Shard>,
+                    false => real.shards[i].clone(),
+                })
+                .collect(),
+        );
+        let mut ops = rows(0);
+        ops.extend((1000..1060).map(|id| Op::Delete { id }));
+        let had = c.write(ops).unwrap();
+        assert!(had[..60].iter().all(|&h| h) && !had[60..].iter().any(|&h| h));
+    }
+    assert_eq!((real.len().unwrap(), real.write(Vec::new()).unwrap()), (180, vec![]));
+    drop((real, db));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The same with shards as they are: one of them waits for an index build.
+#[test]
+fn a_shard_without_room_keeps_the_others_from_writing() {
+    static HOLD: AtomicBool = AtomicBool::new(true);
+    fn hold(line: &str) {
+        let t0 = Instant::now();
+        while line.starts_with("scan") && HOLD.load(Ordering::Relaxed) && t0.elapsed().as_secs() < 60 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let dir = test_dir("db-noroom");
+    let mut o = opts();
+    o.shard.progress = Some(hold);
+    o.shard.max_unindexed_bytes = (4000 * DIM * 4) as u64;
+    o.shard.max_write_wait = Some(Duration::from_millis(200));
+    let (db, _) = Database::open(&dir, &o).unwrap();
+    let mut cfg = config(500);
+    cfg.index_bytes = (2500 * DIM * 4) as u64;
+    let c = db.create_collection("c", cfg, 3).unwrap();
+    let mut rng = SplitMix64::new(1);
+    let mut rows = |ids: Vec<u64>| ids.into_iter().map(|id| upsert(id, vector(&mut rng))).collect::<Vec<_>>();
+    // All in one shard, until it has no room.
+    let mut ids = (0..).filter(|&id| shard_of(id, 3) == 1);
+    for n in [50, 1] {
+        let mut refused = false;
+        while !refused {
+            match c.write(rows(ids.by_ref().take(n).collect())) {
+                Ok(_) => {}
+                Err(Error::Unavailable(m)) => refused = m == "index builds are behind",
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+    let written = || c.stats().unwrap().iter().map(|s| s.next_seq).collect::<Vec<_>>();
+    let (n, before) = (c.len().unwrap(), written());
+    assert!(before[1] >= 4000 && before[0] == before[2], "{before:?}");
+    let more = rows((1_000_000..1_000_030).collect());
+    assert!((0..3).all(|s| more.iter().any(|op| shard_of(op.id(), 3) == s)));
+    for _ in 0..2 {
+        let e = c.write(more.clone()).unwrap_err();
+        assert!(matches!(&e, Error::Unavailable(m) if m == "index builds are behind"), "{e}");
+        assert_eq!((c.len().unwrap(), written()), (n, before.clone()));
+    }
+    // The others are not held up by it.
+    let other = (2_000_000..).find(|&id| shard_of(id, 3) == 2).unwrap();
+    c.write(rows(vec![other])).unwrap();
+    HOLD.store(false, Ordering::Relaxed);
+    let t0 = Instant::now();
+    while c.write(more.clone()).is_err() {
+        assert!(t0.elapsed().as_secs() < 60);
+    }
+    assert_eq!(c.len().unwrap(), n + 31);
+    let after: Vec<u64> = written().iter().zip(&before).map(|(a, b)| a - b).collect();
+    assert_eq!(after.iter().sum::<u64>(), 31, "{after:?}");
+    drop((c, db));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Where the parts meet: all are ready, or none writes; also if one has not
+/// got as far as its thread.
+#[test]
+fn parts_meet() {
+    let meet = Meet::new(1);
+    assert!(meet.place().all_ready());
+    for n in [2, 5] {
+        let meet = Meet::new(n);
+        let ready = || meet.place();
+        std::thread::scope(|s| {
+            let all: Vec<_> = (0..n).map(|_| ready()).map(|p| s.spawn(|| p.all_ready())).collect();
+            assert!(all.into_iter().all(|h| h.join().unwrap()));
+        });
+        let meet = Meet::new(n);
+        std::thread::scope(|s| {
+            let mut places: Vec<_> = (0..n).map(|_| meet.place()).collect();
+            let last = places.pop();
+            let all: Vec<_> = places.into_iter().map(|p| s.spawn(|| p.all_ready())).collect();
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(all.iter().all(|h| !h.is_finished()));
+            drop(last);
+            assert!(all.into_iter().all(|h| !h.join().unwrap()));
+        });
+    }
 }
 
 /// Rows are stored by it, so it must never change.
