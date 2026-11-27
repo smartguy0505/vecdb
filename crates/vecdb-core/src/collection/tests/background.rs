@@ -8,6 +8,7 @@ use super::*;
 use super::background::BuildLimit;
 use super::maintain::Lane;
 use crate::cancel::Cancel;
+use crate::disk::partition_node_bytes;
 
 fn opts() -> OpenOptions {
     OpenOptions { background: true, ..test_opts() }
@@ -255,11 +256,14 @@ fn writes_wait_for_a_slow_build() {
         s.spawn(|| write_on(&c, &written, &stop));
         until("a build", || blocked.load(Ordering::Relaxed));
         let n = settled(&written);
-        // The build has taken 2500 (or one more segment, if it began late)
-        // and is through with 96% of them.
-        assert!((6400..=6900).contains(&n), "{n} rows");
+        // The build has taken what there was when it began: 2,500 rows, or
+        // more if it began late (5,000 at most). It is through with 96% of them.
+        let inputs = c.indexing.lock().unwrap().runs.as_ref().expect("an index build").inputs.clone();
+        let taken: usize = c.sealed().iter().filter(|s| inputs.contains(&s.id)).map(|s| s.positions()).sum();
+        assert!((2500..=5000).contains(&taken), "{taken} rows taken");
         let left = c.unindexed() / (dim * 4) as f64;
         assert!((4000.0..4002.0).contains(&left), "{left}");
+        assert!((n as f64 - (left + 0.96 * taken as f64)).abs() < 0.5, "{n} rows");
         let st = c.stats();
         assert!(st.segments.iter().all(|s| s.kind == "flat") && st.builds == 0, "{st:?}");
         assert!(st.frozen == 0 && st.growing_rows < 500 && st.write_rate == Some(0), "{st:?}");
@@ -726,6 +730,7 @@ fn keeps_pace(name: &str, collections: u64) {
     let mut rng = SplitMix64::new(6);
     let rows: Vec<Vec<f32>> = (0..500).map(|_| float_vector(&mut rng, dim)).collect();
     let (mut slowest, mut next, mut started) = (Duration::ZERO, 0, None);
+    let mut times = Vec::new();
     let least = || all.iter().map(|(c, _)| c.stats().builds).min().unwrap();
     while least() < 4 {
         let ops: Vec<WriteOp> = (next..next + 50)
@@ -734,23 +739,32 @@ fn keeps_pace(name: &str, collections: u64) {
         let t0 = Instant::now();
         all.iter().for_each(|(c, _)| c.write(&ops).unwrap());
         slowest = slowest.max(t0.elapsed());
+        if started.is_some() {
+            times.push(t0.elapsed());
+        }
         next += 50;
         assert!(next < 100_000);
         if started.is_none() && least() == 1 {
             started = Some((Instant::now(), next));
         }
+        // At most the limit, and in RAM what one build takes in besides:
+        // twice `index_bytes`.
         for (c, _) in &all {
             let (u, f) = (c.unindexed() / row as f64, flat_and_growing(c) / row as f64);
-            assert!(u < 8100.0 && f < 12_200.0, "{u} {f}");
+            assert!(u < 8100.0 && f < 16_200.0, "{u} {f}");
         }
     }
     let (at, rows_then) = started.unwrap();
-    // One build of each.
+    // One build of each. Writes that were stopped for each would wait for
+    // most of it three times; one that waits for half of it may be a stall
+    // of the machine (a loaded one has them: all tests at once).
     let round = at.elapsed() / 3;
-    assert!(slowest < round / 2, "{slowest:?}, a round of builds takes {round:?}");
-    // What was written meanwhile is what was indexed.
+    let long = times.iter().filter(|&&t| t > round / 2).count();
+    assert!(slowest < round && long <= 1, "{slowest:?}, {long} long; a round of builds takes {round:?}");
+    // What was written meanwhile is what was indexed: builds take 4,000 to
+    // 8,000 rows (and a segment), what there is when they begin.
     let per = (next - rows_then) / 3;
-    assert!((2500..6000).contains(&per), "{per} rows per build");
+    assert!((2500..9000).contains(&per), "{per} rows per build");
     let waited: Duration = all.iter().map(|(c, _)| c.stats().write_wait).sum();
     assert!(waited > round, "{waited:?} of {round:?}");
     for (c, dir) in all {
@@ -898,11 +912,14 @@ fn index_builds_do_not_wait_for_compactions() {
         // Four times the limit, and one that comes next.
         until("writes", || written.iter().all(|n| n.load(Ordering::Relaxed) > 18_000));
     });
-    // The compactions have not come: neither has lost its deleted rows.
+    // The compactions have not come: neither has lost its deleted rows. But
+    // index builds have: in none are more than the limit, what one build
+    // takes in (5,000 rows, twice `index_bytes`) and a segment.
     for (c, before) in [&a, &b].into_iter().zip(before) {
         let st = c.stats();
         assert_eq!((st.segments[0].rows, st.segments[0].deleted), (3600, 1200), "{st:?}");
-        assert!(st.builds >= before + 5 && ssd_segments(c) >= 6, "{st:?}");
+        let left = flat_and_growing(c) / 16.0;
+        assert!(st.builds >= before + 2 && ssd_segments(c) >= 3 && left < 10_000.0, "{left} {st:?}");
     }
     go.send(()).unwrap();
     [&a, &b].iter().for_each(|c| c.wait_idle().unwrap());
@@ -1100,6 +1117,78 @@ fn index_builds_take_a_part_at_a_time() {
     check_approx(&c, &model, &mut rng, 0.9);
     drop(c);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// They take up to twice `index_bytes`, if an eighth of the limit is less, as
+/// long as one partition of a build holds that and the largest segment more.
+/// A build that waits for its turn counts for what it takes in by then.
+#[test]
+fn index_builds_take_up_to_twice_index_bytes() {
+    // Rows of 16 bytes, `index_bytes` 3,000 of them: the limit, the rows the
+    // build memory holds, and the rows a build is to take, by the largest
+    // segment. (Segments are 500 rows or more: some fill while flushes are
+    // behind.)
+    type Rows = fn(usize) -> usize;
+    let cases: [(u64, Option<usize>, Rows); 4] = [
+        (20_000, None, |_| 6000),
+        (20_000, Some(4750), |largest| (4750 - largest).max(3000)),
+        // One does not even hold `index_bytes`: that, in partitions, as before.
+        (20_000, Some(2000), |_| 3000),
+        // An eighth of the limit is more.
+        (64_000, None, |_| 8000),
+    ];
+    for (limit, memory, want) in cases {
+        let dir = test_dir("coll-bg-twice");
+        let cfg = CollectionConfig { max_indexed_segments: 1000, ..ssd_config(4, Metric::L2, 500, 3000) };
+        let builds = BuildLimit::new(1);
+        let mut opts = OpenOptions { max_unindexed_bytes: limit * 16, builds: Some(builds.clone()), ..opts() };
+        if let Some(nodes) = memory {
+            opts.build_memory = nodes as u64 * partition_node_bytes(4, cfg.index.max_degree);
+        }
+        let c = Collection::create(&dir, cfg, opts).unwrap();
+        let mut other = builds.line_up(Lane::Flat, 96_000);
+        assert!(other.come());
+        let mut rng = SplitMix64::new(4);
+        let mut model = Model::default();
+        // One batch of 1,000 rows makes a segment larger than the others,
+        // after 4,000 rows.
+        let mut at = 0;
+        while at < 10_000 {
+            let n = if at == 4000 { 1000 } else { 100 };
+            upsert_batch(&c, &mut model, &mut rng, at..at + n);
+            at += n;
+        }
+        c.flush().unwrap();
+        // The oldest segments, until they have what is wanted.
+        let flat: Vec<(u64, usize)> = c.sealed().iter().map(|s| (s.id, s.live())).collect();
+        let largest = flat.iter().map(|f| f.1).max().unwrap();
+        assert!((1000..1750).contains(&largest), "{flat:?}");
+        let want = want(largest);
+        let (mut rows, mut taken) = (0, Vec::new());
+        for &(id, live) in &flat {
+            if rows >= want {
+                break;
+            }
+            rows += live;
+            taken.push(id);
+        }
+        // There are more, and one partition holds them where it holds `index_bytes`.
+        assert!(rows >= want && rows < 10_000, "{flat:?}");
+        assert!(memory.is_none_or(|nodes| nodes < 3000 || rows <= nodes), "{flat:?}");
+        assert_eq!(c.next_job(Lane::Flat), Some(("index", taken)), "{limit} {memory:?}");
+        // Half of the way through the line, which is the other build and this one.
+        other.way.done.set(0.5);
+        let gone = 0.5 * 96_000.0 / (rows * 16 + 96_000) as f64 * (rows * 16) as f64;
+        until("the build that waits", || (c.unindexed() - (flat_and_growing(&c) - gone)).abs() < 2.0);
+        drop(other);
+        c.wait_idle().unwrap();
+        let st = c.stats();
+        assert_eq!(st.segments[0].kind, "ssd");
+        assert_eq!((st.segments[0].rows, st.live), (rows, 10_000), "{st:?}");
+        check_approx(&c, &model, &mut rng, 0.9);
+        drop(c);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 /// A write gives up after `max_write_wait`, and changes nothing then.

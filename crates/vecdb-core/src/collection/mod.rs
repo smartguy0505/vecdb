@@ -261,11 +261,12 @@ pub struct OpenOptions {
     /// build gets closer to its end (and, before that, to its turn, if it
     /// waits for others: see [`builds`](Self::builds)), so that writes need
     /// not wait for all of it. So there may be that much more than the limit
-    /// in RAM: `index_bytes`, or an eighth of the limit if that is more. And
-    /// the limit is taken to be `index_bytes` and a quarter at least (or
-    /// `index_bytes` and two segments): with less, builds would stand idle,
-    /// or writes stop for them. Segments a running [`Engine::optimize`] has
-    /// taken do not count. 0 = no limit.
+    /// in RAM (and scanned by searches): twice `index_bytes` (or less, if one
+    /// partition of a build holds less), or an eighth of the limit if that is
+    /// more. And the limit is taken to be `index_bytes` and a quarter at least
+    /// (or `index_bytes` and two segments): with less, builds would stand
+    /// idle, or writes stop for them. Segments a running
+    /// [`Engine::optimize`] has taken do not count. 0 = no limit.
     pub max_unindexed_bytes: u64,
     /// Longest wait of a write for flushes or index builds to catch up; then
     /// it fails with [`Error::Unavailable`], and nothing is written. Where it

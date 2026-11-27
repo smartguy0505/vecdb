@@ -18,7 +18,8 @@ commit (7a); it flushes and builds in the background and searches its
 segments in parallel, and databases hold named collections split into shards
 (7b); a server offers them over HTTP (7c); writes that outrun index builds are
 slowed down instead of stopped (7d), and one that gives up and comes back has
-its place in the line again (7e). Step 8, the distributed mode, is next.
+its place in the line again (7e); index builds that are behind take more at
+once (7f). Step 8, the distributed mode, is next.
 
 ## Goals
 
@@ -1453,9 +1454,9 @@ it was a compaction of a large segment. Now:
   compactions of one collection do not keep another from making room either.
   Places are given in the order they were asked for.
 - An index build takes the oldest flat segments, up to `index_bytes` or an
-  eighth of `max_unindexed_bytes`, whichever is more, instead of all there
-  are. The price is more and smaller SSD segments, which merges put together
-  later.
+  eighth of `max_unindexed_bytes`, whichever is more (twice `index_bytes`
+  since step 7f), instead of all there are. The price is more and smaller SSD
+  segments, which merges put together later.
 - `optimize` claims the segments it works on and leaves the lane of flat
   segments to others.
 - `max_write_wait` bounds what is left of the wait: a write that has not got
@@ -1723,11 +1724,12 @@ Now it is slowed down to what the builds keep up with:
 
 **Memory.** What counts as gone is in RAM until the build ends. So there may be
 the limit and the input of one build (an eighth of the limit, or `index_bytes`
-if that is more), and the limit is taken to be `index_bytes` and a quarter at
-least (or `index_bytes` and two segments): 1,152 MiB with the defaults, where
-it was 1,120 (the limit and three segments), but up to twice as much as it was
-where the limit is not above `index_bytes`. Writes that were let in and are
-under way (one per writer) come on top, as before.
+if that is more; twice `index_bytes` since step 7f), and the limit is taken to
+be `index_bytes` and a quarter at least (or `index_bytes` and two segments):
+1,152 MiB with the defaults, where it was 1,120 (the limit and three segments),
+but up to twice as much as it was where the limit is not above `index_bytes`.
+Writes that were let in and are under way (one per writer) come on top, as
+before.
 
 ### Results
 
@@ -1949,10 +1951,10 @@ slowest 27.5 s, 993 refusals.)
   375-377 s where 7c took 259-268 s. It is that of the builds, 7 of 64 MiB or a
   little more where 7c had 4 larger ones.
 - **Larger builds would help there**, but are not part of this step, as they
-  change the RAM bound of small limits. Tried with builds of up to twice
-  `index_bytes` while the limit allows it, first case, load 15-17, two runs:
-  261-276 s until all is indexed (303 s without), slowest 25.6-29.2 s, 789-793
-  refusals, most in no index 206 MiB (202).
+  change the RAM bound of small limits (they are step 7f). Tried with builds of
+  up to twice `index_bytes` while the limit allows it, first case, load 15-17,
+  two runs: 261-276 s until all is indexed (303 s without), slowest 25.6-29.2
+  s, 789-793 refusals, most in no index 206 MiB (202).
 - **Over HTTP** the same: 64 clients that send a request of 1,000 rows (base64)
   again a second after a 503, the server with `--max-unindexed-mb 128`, 1M rows,
   load 6-11, 7d, 7e, 7e, 7d: the slowest batch took 120 and 69 s in 7d, 17.9 and
@@ -2000,6 +2002,170 @@ Commands (`B`, `S` as above; 7c and 7d: the same benchmark, over their cores):
 $B coll-ingest --base $S/sift_base.fvecs --dir work --threads 6 --background true --unindexed-mb 128 --writers 64 --write-wait 10
 $B coll-ingest ... --shards 4 --seal-mb 8 --index-mb 16 --unindexed-mb 48 --writers 64 --write-wait 10 --limit 600000
 $B coll-ingest ... --unindexed-mb 1024 --index-mb 100000 --shards 4 --writers 8 --batch 100         # the cost of it
+```
+
+## Larger index builds (step 7f)
+
+While writes are slowed down, they go as fast as index builds take rows in, so
+a long ingest takes as long as its builds. Up to 7e a build that was behind
+took the oldest flat segments up to `index_bytes`, or an eighth of
+`max_unindexed_bytes` if that is more. Below 16 times `index_bytes` (the
+limits of all tables of 7d and 7e) that is `index_bytes`: 7 builds of 64 MiB
+for SIFT1M. Part of what a build costs does not grow with it: PQ training
+uses 65,536 rows at most, about 45% of a build of 64 MiB of 128-dimensional
+vectors (see below). Now:
+
+- **A build takes up to twice `index_bytes`**, if an eighth of the limit is
+  less. It takes what there is when it starts, so it is larger only when
+  builds are behind.
+- **Not if it would be split into partitions.** A build of a little more
+  than one partition of `build_memory` holds is split into three at least,
+  with each row in two of them. So twice `index_bytes` is taken only as far as
+  one partition holds it and the largest flat segment more (the last segment a
+  build takes may go beyond; segments are `seal_bytes`, or more where they
+  filled while flushes were behind). This comes from reading the build, not
+  from a measurement. With the default 2 GiB, one partition holds about 980 MB
+  of 128-dimensional vectors and 1.85 GB of 960-dimensional ones;
+  `index_bytes` has to be above half of that for this to matter.
+- **Nothing changes with the defaults:** an eighth of 1 GiB is twice 64 MiB.
+- **Memory:** there may be the limit and twice `index_bytes` in RAM (and
+  scanned by searches) where it was the limit and `index_bytes`: 256 MiB
+  instead of 192 MiB for the limit of 128 MiB of the tables.
+
+### Results
+
+**One build by its size**, as the collection builds it (128 dimensions, PQ of
+32 bytes, R 64, L 100, 6 threads, one partition), SIFT1M rows, two runs each in
+turns (`vecdb-bench disk-build`). The two blocks ran at different loads, so
+compare within a block:
+
+| block (load) | rows | build | PQ training | graph | per million rows |
+|---|---:|---:|---:|---:|---:|
+| 1 (17-19) | 32,768 | 15.6-16.2 s | 11.3 s | 3.7-4.3 s | 476-494 s |
+| | 65,536 | 27.9-28.6 s | 18.5-19.0 s | 8.2-8.5 s | 426-436 s |
+| | 131,072 | 41.7-42.9 s | 18.1-19.2 s | 21.4 s | 318-327 s |
+| | 196,608 | 58.1-59.9 s | 18.6-19.1 s | 35.8-37.6 s | 296-305 s |
+| | 262,144 | 74.3-75.1 s | 18.2-18.8 s | 51.8 s | 283-286 s |
+| 2 (11-14) | 262,144 | 55.0-57.3 s | 13.2-13.5 s | 38.3-39.8 s | 210-219 s |
+| | 500,000 | 100.7-101.7 s | 13.2-13.6 s | 80.4-81.9 s | 201-203 s |
+| | 524,288 | 104.1-105.6 s | 13.0-13.3 s | 83.8-85.3 s | 199-201 s |
+| | 1,000,000 | 206.1-206.2 s | 13.0-13.2 s | 179.7-180.1 s | 206 s |
+
+One build of twice the rows costs 11% less than two from 32,768 rows, 25%
+from 65,536, 12% from 131,072 and 7% from 262,144; from 500,000 it costs 1-2%
+more. Training stops growing at 65,536 rows, and the graph costs more per row
+the larger it is: from 0.11-0.13 ms at 32,768 rows to 0.20 ms at 262,144 in
+the first block, and from 0.15 ms to 0.18 ms between 262,144 rows and a
+million in the second. That is why it is twice and not more: with
+`index_bytes` of 256 MiB of 128-dimensional vectors or more, larger builds
+take more memory for nothing.
+
+**In collections**, as in 7d and 7e: SIFT1M rows from scratch, buffered WAL, 6
+build threads, on the same shared and loaded machine; 7e and 7f in turns (7e,
+7f, 7f, 7e), two runs each, with the same benchmark program. One shard, limit
+128 MiB, `index_bytes` 64 MiB (load 10-18):
+
+| what is written | | until all is indexed | to write | batch p50 | p99 | slowest | refused | most in no index | peak memory |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 writers, 1,000 a batch, refused after 10 s, 1M rows | 7e | 223-241 s | 178-191 s | 13.4-14.4 s | 18.1-22.8 s | 19.8-24.8 s | 734-747 | 190-198 MiB | 1.39-1.49 GB |
+| | 7f | **197-211 s** | 170-171 s | 12.6-12.7 s | 16.7-20.0 s | 18.1-22.9 s | 703-713 | 206-207 MiB | 1.53-1.60 GB |
+| 1 writer, 1,000 a batch, 1M rows | 7e | 220-236 s | 186-199 s | 0.23-0.24 s | 0.35-0.40 s | 0.48 s | 0 | 174-175 MiB | 0.99 GB |
+| | 7f | **207-208 s** | 178 s | 0.22 s | 0.38 s | 0.54 s | 0 | 206 MiB | 1.12 GB |
+| 8 writers, single rows, 400,000 | 7e | 93-96 s | 43-44 s | 0.07-0.10 ms | 4.5 ms | 15-20 ms | 0 | 173 MiB | 0.63-0.65 GB |
+| | 7f | **70-71 s** | 41 s | 0.08 ms | 4.3-4.4 ms | 17-79 ms | 0 | 173 MiB | 0.68-0.72 GB |
+| 16 writers, refused after 10 s, 600,000 | 7e | 123-124 s | 84-85 s | 2.9 s | 4.3-4.4 s | 4.4 s | 0 | 179 MiB | 0.84-0.85 GB |
+| | 7f | **116 s** | 82 s | 2.8-2.9 s | 4.4-4.5 s | 4.5-4.6 s | 0 | 206-209 MiB | 0.96-0.97 GB |
+
+Four shards, which share one build place (load 8-25; the first case also the
+other way round, 7f, 7e, 7e, 7f, so four runs each):
+
+| what is written | | until all is indexed | to write | batch p50 | p99 | slowest | refused | most in no index | peak memory |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 writers, limit 48 MiB a shard, `index_bytes` 16, 600,000 rows | 7e | 232-269 s | 109-122 s | 0.04-0.05 s | 4.4-5.1 s | 4.6-5.7 s | 0 | 188-191 MiB | 1.07-1.13 GB |
+| | 7f | 250-268 s | 98-111 s | 0.04-0.05 s | 4.9-5.4 s | 5.0-5.6 s | 0 | 210-211 MiB | 1.15-1.30 GB |
+| 8 writers, limit 64 MiB a shard, `index_bytes` 8, 600,000 rows | 7e | 219-276 s | 54-61 s | 0.02-0.04 s | 3.8-4.3 s | 3.8-4.4 s | 0 | 240-242 MiB | 0.96-0.97 GB |
+| | 7f | **190-259 s** | 41-55 s | 0.02-0.03 s | 3.6-5.0 s | 3.7-5.3 s | 0 | 250-251 MiB | 1.08-1.09 GB |
+| 64 writers, refused after 10 s, as the first | 7e | 258-263 s | 109-115 s | 0.25 s | 31-35 s | 34.8-37.8 s | 421-430 | 191-195 MiB | 1.34 GB |
+| | 7f | **242-247 s** | 98-100 s | 0.23-0.26 s | 33-35 s | 33.5-35.5 s | 394-433 | 211-212 MiB | 1.41-1.45 GB |
+
+(The 4-shard runs are of the code before its last change, which only sets how
+much of a partition a segment may take: the same builds in all of these.)
+
+- **All is indexed 5-18% sooner** with one shard, and 24-27% with 400,000
+  single rows: a million rows took 5 builds of up to 128 MiB instead of 7 of
+  64 MiB. With four shards 4-8% sooner where 64 writers give up after 10 s,
+  and 6-13% with builds of 8 MiB.
+- **With four shards and builds of 16 MiB that take turns, there is no clear
+  effect:** in the first four runs of that case 7f took 9-12% longer (254-259
+  s against 232-234 s); in the four that ran the other way round, 250-268 s
+  against 247-269 s. The first four began at loads of 8.5 and 21.8 (7e), 14.5
+  and 24.5 (7f). Built alone, two builds of 32,768 rows cost 11% more than one
+  of twice that.
+- **What got worse: memory, and the longest waits.** What is in no index, and
+  what every search scans, is up to 18% more where builds are larger (206 MiB
+  against 175 MiB with one writer), and the peak RSS 0.02-0.23 GB more. The
+  slowest batch of one writer took 0.54 s, where it took 0.48 s; one of the runs
+  with single rows had one of 79 ms (the other 17 ms, as in 7e). In a test
+  whose limit is twice `index_bytes`, so that a build takes all there is, the
+  slowest write took more of a round of builds in one of three comparisons on a
+  loaded machine (below). Likely where writes wait at the end of a build, which
+  tells nothing of how far it is (merging and writing): two waits of 61-69 ms
+  were there, but that is all that shows it.
+- **With the defaults nothing changes,** and nothing was measured.
+- **Not covered:** other dimensions (all is 128-dimensional; at more
+  dimensions training is more and the graph also costs more per row, so where
+  doubling stops paying is not known), builds in several partitions, other
+  data, a quiet machine, `index_bytes` above 64 MiB in a collection.
+
+### Tests
+
+The size of a build with an eighth of the limit more, less, with one
+partition that holds twice `index_bytes` and a large segment besides, one
+that holds less, and one that does not even hold `index_bytes`; and that a
+build that waits for its turn counts for what it takes in by then, also when
+that grows. Three tests had the old size in them: the RAM bound of writes that
+keep pace with builds (the limit and `index_bytes`; now the limit and twice
+that), the number of builds while a compaction waits (now a bound on what is
+in no index, as builds are half as many), and what a slow build took in (now
+computed from its inputs). 12 mutations of the new code were run against the
+tests, and all are caught (two were not at first: all segments were about as
+large, so which one was taken did not matter; a test now has one of twice the
+size).
+
+The tests of background work, databases and the server ran 10 times in each
+profile, at once, on the loaded machine (load 14-23), without a failure. In the
+first such loops, before the change below, `writes_keep_pace_with_builds`
+failed 3 times in 10 in release (never in those of 7e): its slowest write took
+51-62% of a round of builds, where it may take half. Those three ran beside
+other work (a build, and other tests), which those of 7e did not. Like for
+like, with one collection whose limit is twice `index_bytes`, the slowest write
+took, of a round:
+
+| | 7e: in the middle | at most | failed | 7f: in the middle | at most | failed |
+|---|---:|---:|---:|---:|---:|---:|
+| in turns (7e, 7f, 7f, 7e), load 8-20, 20 runs each | 0.14 | 0.39 | 0 | 0.15 | 0.69 | 1 |
+| side by side, both profiles of both at once, load 21-32, 10 runs | 0.12 | 0.16 | 0 | 0.19 | 0.37 | 0 |
+| the same, noting how far the build was at slow writes (which slows writes), 8 runs | 0.09 | 0.10 | 0 | 0.08 | 0.08 | 0 |
+
+In the failure (557 ms), the other test of this kind, in the same process, had
+its slowest write of 20 runs (475 ms): more likely a stall of the machine,
+which 7f may leave less room for. So the test now checks what it is about:
+writes that were stopped for each build would wait for most of one, 3 times; at
+most one may wait for half a round, none for a whole one. (A mutation that has
+them stopped is caught, with 3 long waits every time.) Other tests failed under
+that load with 7e as well: `writes_that_wait` of the server (once with 7e,
+twice with 7f) and `writes_are_not_slowed_down_for_nothing` (once each), which
+are not changed, and `index_builds_do_not_wait_for_compactions` as 7e has it
+(twice; 7f's checks a bound instead). They wait 100 ms or count builds, where a
+loaded machine stops a thread for longer.
+
+Commands (`B`, `S` as above; 7e: the same benchmark, over its core):
+
+```
+$B disk-build --base $S/sift_base.fvecs --out work/i --pq-m 32 --iters 25 --threads 6 --build-mem 2 --limit 262144
+$B coll-ingest --base $S/sift_base.fvecs --dir work --threads 6 --background true --unindexed-mb 128 --writers 64 --write-wait 10
+$B coll-ingest ... --shards 4 --seal-mb 8 --index-mb 16 --unindexed-mb 48 --writers 8 --limit 600000
+$B coll-ingest ... --shards 4 --seal-mb 4 --index-mb 8 --unindexed-mb 64 --writers 8 --limit 600000
 ```
 
 ## Designing for billions
@@ -2126,12 +2292,16 @@ Within a shard:
    can be bounded; an HTTP/JSON server. The shard interface over gRPC is part
    of step 8. Done (7d): writers that are slowed down to what index builds
    keep up with, instead of stopped for each. Done (7e): writes that give up
-   keep their place, and have changed nothing in any shard.
+   keep their place, and have changed nothing in any shard. Done (7f): index
+   builds of up to twice `index_bytes` while they are behind.
 
    Follow-ups:
    - faster index builds, which set the rate of a long ingest: PQ training is
-     about 40% of one of 64 MiB; and larger ones while writes are slowed down
-     (see 7e);
+     about 45% of one of 64 MiB, and the graph costs more per row in larger
+     ones (see 7f); where larger builds stop paying at other dimensions;
+   - builds that tell how far they are in all their steps: the scan for
+     identical rows and the end (merging and writing) tell nothing, and writes
+     are likely to wait for them (see 7f);
    - index builds of fewer than 256 different vectors, which fail (there are
      too few to train PQ with), again and again;
    - merges of SSD segments that keep up with a long ingest (nothing slows

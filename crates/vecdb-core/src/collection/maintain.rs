@@ -8,9 +8,14 @@
 //!
 //! 1. **index:** they hold `index_bytes` of live vectors: build an SSD index
 //!    from them. In the background not from all of them if they are far
-//!    behind, but from the oldest, an eighth of `max_unindexed_bytes` (or
-//!    `index_bytes`, if that is more): what a build takes in can be in RAM
-//!    beyond that limit (see `pace`), and is given back at its end only.
+//!    behind, but from the oldest, an eighth of `max_unindexed_bytes`, or
+//!    twice `index_bytes` if that is more: what a build takes in can be in
+//!    RAM beyond that limit (see `pace`), and is given back at its end only.
+//!    Larger builds cost less per row, up to a point (PQ training does not
+//!    grow with them, but the graph costs more per row; see the README), and
+//!    as long as they are not split into partitions: twice `index_bytes` is
+//!    taken only as far as one partition (`build_memory`) holds it and the
+//!    largest of the segments more.
 //! 2. **drop:** one has no live rows left: remove it.
 //! 3. **shrink:** they take `index_bytes`, and at least half of that is
 //!    deleted rows: merge them into one flat segment. (So they never take
@@ -57,7 +62,9 @@ use super::segment::{Body, Sealed, attrs_name, del_name, disk_name, flat_name};
 use super::{CollectionConfig, Engine, OpenOptions, Snapshot, View};
 use crate::cancel::Cancel;
 use crate::dataset::VectorSource;
-use crate::disk::{DiskIndex, DiskOpenOptions, DiskWriteOptions, MergePrune, PartitionedBuildParams};
+use crate::disk::{
+    DiskIndex, DiskOpenOptions, DiskWriteOptions, MergePrune, PartitionedBuildParams, partition_node_bytes,
+};
 use crate::error::Result;
 use crate::format::{sync_parent_dir, write_flat_segment};
 use crate::quant::PqParams;
@@ -202,7 +209,7 @@ impl Engine {
         let live: usize = segs.iter().map(|s| s.live()).sum();
         // Below MIN_SSD_ROWS the output would be flat again: not a job.
         if lane == Lane::Flat && bytes(live) >= cfg.index_bytes && live >= MIN_SSD_ROWS {
-            let (most, mut rows, mut n) = (self.index_batch(), 0, 0);
+            let (most, mut rows, mut n) = (self.index_batch(&segs), 0, 0);
             while n < segs.len() && (bytes(rows) < most || rows < MIN_SSD_ROWS) {
                 rows += segs[n].live();
                 n += 1;
@@ -231,11 +238,19 @@ impl Engine {
         None
     }
 
-    /// The bytes of vectors one index build takes from the flat segments, if
-    /// there are more.
-    fn index_batch(&self) -> u64 {
+    /// The bytes of vectors one index build takes from the flat segments
+    /// `segs`, if there are more: see the module docs.
+    fn index_batch(&self, segs: &[Arc<Sealed>]) -> u64 {
         match self.opts.max_unindexed_bytes {
-            limit if self.opts.background && limit != 0 => (limit / 8).max(self.config.index_bytes),
+            limit if self.opts.background && limit != 0 => {
+                let (cfg, index, row) = (&self.config, self.config.index_bytes, self.config.dim as u64 * 4);
+                // What one partition of a build holds, less the largest
+                // segment: the last one taken may go beyond.
+                let nodes = self.opts.build_memory / partition_node_bytes(cfg.dim, cfg.index.max_degree);
+                let largest = segs.iter().map(|s| s.live() as u64).max().unwrap_or(0);
+                let fits = nodes.saturating_sub(largest).saturating_mul(row);
+                (limit / 8).max(index).max(index.saturating_mul(2).min(fits))
+            }
             _ => u64::MAX,
         }
     }
